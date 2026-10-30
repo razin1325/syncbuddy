@@ -1,8 +1,12 @@
 package com.syncbuddy.bluetooth
 
 import android.Manifest
+import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -16,8 +20,10 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 /**
  * BluetoothStateModule
  *
- * Exposes the Android BluetoothAdapter state to React Native JS layer.
- * 100% crash-safe on Android 12, 13, and 14.
+ * Real-time hardware connection monitoring:
+ * - Checks whether a device is ACTUALLY physically connected in Android OS.
+ * - Listens for physical hardware ACL connect / disconnect events in real-time.
+ * - Never shows inactive / powered-off devices as connected.
  */
 class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -25,7 +31,11 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
     companion object {
         const val MODULE_NAME = "BluetoothState"
         const val EVENT_STATE_CHANGED = "bluetoothStateChanged"
+        const val EVENT_DEVICE_CONNECTION_CHANGED = "deviceConnectionChanged"
     }
+
+    private var a2dpProfile: BluetoothProfile? = null
+    private var headsetProfile: BluetoothProfile? = null
 
     private val bluetoothAdapter: BluetoothAdapter?
         get() {
@@ -41,13 +51,51 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
     private val btStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             try {
-                if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                val action = intent?.action ?: return
+
+                if (action == BluetoothAdapter.ACTION_STATE_CHANGED) {
                     val state = intent.getIntExtra(
                         BluetoothAdapter.EXTRA_STATE,
                         BluetoothAdapter.ERROR
                     )
-                    val stateStr = adapterStateToString(state)
-                    sendEvent(EVENT_STATE_CHANGED, stateStr)
+                    sendEvent(EVENT_STATE_CHANGED, Arguments.createMap().apply {
+                        putString("state", adapterStateToString(state))
+                    })
+                } else if (action == BluetoothDevice.ACTION_ACL_CONNECTED || action == BluetoothDevice.ACTION_ACL_DISCONNECTED) {
+                    val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    if (device != null) {
+                        val isConn = (action == BluetoothDevice.ACTION_ACL_CONNECTED)
+                        val battery = if (isConn) getDeviceBatteryLevel(device) else null
+                        sendEvent(EVENT_DEVICE_CONNECTION_CHANGED, Arguments.createMap().apply {
+                            putString("macAddress", device.address)
+                            putString("name", device.name ?: "Bluetooth Device")
+                            putBoolean("connected", isConn)
+                            if (battery != null) putInt("battery", battery)
+                        })
+                    }
+                } else if (action == BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED || action == BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED) {
+                    val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, BluetoothProfile.STATE_DISCONNECTED)
+                    val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    if (device != null) {
+                        val isConn = (state == BluetoothProfile.STATE_CONNECTED)
+                        val battery = if (isConn) getDeviceBatteryLevel(device) else null
+                        sendEvent(EVENT_DEVICE_CONNECTION_CHANGED, Arguments.createMap().apply {
+                            putString("macAddress", device.address)
+                            putString("name", device.name ?: "Bluetooth Device")
+                            putBoolean("connected", isConn)
+                            if (battery != null) putInt("battery", battery)
+                        })
+                    }
                 }
             } catch (t: Throwable) {}
         }
@@ -58,12 +106,39 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
     override fun initialize() {
         super.initialize()
         try {
-            val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+            val filter = IntentFilter().apply {
+                addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+                addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
+                addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+                addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+                addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 reactContext.registerReceiver(btStateReceiver, filter, Context.RECEIVER_EXPORTED)
             } else {
                 reactContext.registerReceiver(btStateReceiver, filter)
             }
+
+            // Register A2DP profile proxy
+            bluetoothAdapter?.getProfileProxy(reactContext, object : BluetoothProfile.ServiceListener {
+                override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                    if (profile == BluetoothProfile.A2DP) a2dpProfile = proxy
+                }
+                override fun onServiceDisconnected(profile: Int) {
+                    if (profile == BluetoothProfile.A2DP) a2dpProfile = null
+                }
+            }, BluetoothProfile.A2DP)
+
+            // Register Headset profile proxy
+            bluetoothAdapter?.getProfileProxy(reactContext, object : BluetoothProfile.ServiceListener {
+                override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                    if (profile == BluetoothProfile.HEADSET) headsetProfile = proxy
+                }
+                override fun onServiceDisconnected(profile: Int) {
+                    if (profile == BluetoothProfile.HEADSET) headsetProfile = null
+                }
+            }, BluetoothProfile.HEADSET)
+
         } catch (t: Throwable) {}
     }
 
@@ -71,6 +146,14 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         super.invalidate()
         try {
             reactContext.unregisterReceiver(btStateReceiver)
+        } catch (t: Throwable) {}
+        try {
+            if (a2dpProfile != null) {
+                bluetoothAdapter?.closeProfileProxy(BluetoothProfile.A2DP, a2dpProfile)
+            }
+            if (headsetProfile != null) {
+                bluetoothAdapter?.closeProfileProxy(BluetoothProfile.HEADSET, headsetProfile)
+            }
         } catch (t: Throwable) {}
     }
 
@@ -80,6 +163,43 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
             reactContext,
             Manifest.permission.BLUETOOTH_CONNECT
         ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * Accurately checks whether a Bluetooth device is physically connected and active.
+     */
+    private fun checkIsDeviceConnected(device: BluetoothDevice): Boolean {
+        if (!hasConnectPermission()) return false
+        return try {
+            // Check A2DP proxy
+            val a2dpList = a2dpProfile?.connectedDevices
+            if (a2dpList != null && a2dpList.any { it.address.equals(device.address, ignoreCase = true) }) {
+                return true
+            }
+
+            // Check Headset proxy
+            val headsetList = headsetProfile?.connectedDevices
+            if (headsetList != null && headsetList.any { it.address.equals(device.address, ignoreCase = true) }) {
+                return true
+            }
+
+            // Check reflection isConnected()
+            val method = device.javaClass.getMethod("isConnected")
+            (method.invoke(device) as? Boolean) == true
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    private fun getDeviceBatteryLevel(device: BluetoothDevice): Int? {
+        if (!hasConnectPermission()) return null
+        return try {
+            val method = device.javaClass.getMethod("getBatteryLevel")
+            val lvl = method.invoke(device) as? Int
+            if (lvl != null && lvl in 0..100) lvl else null
+        } catch (t: Throwable) {
+            null
+        }
     }
 
     @ReactMethod
@@ -152,6 +272,95 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    /**
+     * Checks if a specific device is physically connected to the phone.
+     */
+    @ReactMethod
+    fun isDeviceConnected(macAddress: String, promise: Promise) {
+        try {
+            val adapter = bluetoothAdapter
+            if (adapter == null || !hasConnectPermission()) {
+                promise.resolve(false)
+                return
+            }
+            val dev = adapter.getRemoteDevice(macAddress)
+            if (dev == null) {
+                promise.resolve(false)
+                return
+            }
+            val connected = checkIsDeviceConnected(dev)
+            promise.resolve(connected)
+        } catch (t: Throwable) {
+            promise.resolve(false)
+        }
+    }
+
+    /**
+     * Triggers hardware connection to a paired device.
+     */
+    @ReactMethod
+    fun connectDevice(macAddress: String, promise: Promise) {
+        try {
+            val adapter = bluetoothAdapter
+            if (adapter == null || !hasConnectPermission()) {
+                promise.resolve(Arguments.createMap().apply {
+                    putBoolean("success", false)
+                    putBoolean("isConnected", false)
+                    putString("message", "Bluetooth permission required")
+                })
+                return
+            }
+            val dev = adapter.getRemoteDevice(macAddress)
+            if (dev == null) {
+                promise.resolve(Arguments.createMap().apply {
+                    putBoolean("success", false)
+                    putBoolean("isConnected", false)
+                    putString("message", "Device not found")
+                })
+                return
+            }
+
+            // If already connected
+            if (checkIsDeviceConnected(dev)) {
+                val battery = getDeviceBatteryLevel(dev)
+                promise.resolve(Arguments.createMap().apply {
+                    putBoolean("success", true)
+                    putBoolean("isConnected", true)
+                    if (battery != null) putInt("battery", battery)
+                    putString("message", "Device is active and connected")
+                })
+                return
+            }
+
+            // Try to trigger A2DP connect via reflection
+            var connectInvoked = false
+            if (a2dpProfile != null) {
+                try {
+                    val method = a2dpProfile?.javaClass?.getMethod("connect", BluetoothDevice::class.java)
+                    method?.isAccessible = true
+                    method?.invoke(a2dpProfile, dev)
+                    connectInvoked = true
+                } catch (t: Throwable) {}
+            }
+
+            promise.resolve(Arguments.createMap().apply {
+                putBoolean("success", connectInvoked)
+                putBoolean("isConnected", checkIsDeviceConnected(dev))
+                putString("message", if (connectInvoked) "Connection requested" else "Headphone is not turned on")
+            })
+        } catch (t: Throwable) {
+            promise.resolve(Arguments.createMap().apply {
+                putBoolean("success", false)
+                putBoolean("isConnected", false)
+                putString("message", t.message ?: "Connect error")
+            })
+        }
+    }
+
+    /**
+     * Returns paired devices with TRUE active connection state.
+     * Inactive devices will have status = "Paired" (never fake "Connected").
+     */
     @ReactMethod
     fun getBondedDevices(promise: Promise) {
         try {
@@ -163,12 +372,17 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
             }
             val bonded = adapter.bondedDevices
             bonded?.forEach { device ->
-                val map = Arguments.createMap()
-                map.putString("id", device.address)
-                map.putString("name", device.name ?: "Bluetooth Device")
-                map.putString("macAddress", device.address)
-                map.putString("type", "Audio")
-                map.putString("status", "Paired")
+                val isConn = checkIsDeviceConnected(device)
+                val battery = if (isConn) getDeviceBatteryLevel(device) else null
+                val map = Arguments.createMap().apply {
+                    putString("id", device.address)
+                    putString("name", device.name ?: "Bluetooth Device")
+                    putString("macAddress", device.address)
+                    putString("type", "Audio")
+                    putString("status", if (isConn) "Connected" else "Paired")
+                    putBoolean("isConnected", isConn)
+                    if (battery != null) putInt("battery", battery)
+                }
                 array.pushMap(map)
             }
             promise.resolve(array)
@@ -201,11 +415,11 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         else                               -> "unavailable"
     }
 
-    private fun sendEvent(eventName: String, state: String) {
+    private fun sendEvent(eventName: String, params: WritableMap) {
         try {
             reactContext
                 .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-                .emit(eventName, Arguments.createMap().apply { putString("state", state) })
+                .emit(eventName, params)
         } catch (t: Throwable) {}
     }
 }

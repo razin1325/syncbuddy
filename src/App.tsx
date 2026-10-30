@@ -336,21 +336,72 @@ export default function App(): React.JSX.Element {
         try {
           const enabled = await NativeBluetooth.isBluetoothEnabled();
           setBtEnabled(enabled);
+
+          // Initial load of bonded devices with real active status
+          const bonded = await NativeBluetooth.getBondedDevices();
+          if (bonded && bonded.length > 0) {
+            const mapped: BluetoothDevice[] = bonded.map(b => ({
+              id: b.id,
+              name: b.name,
+              type: detectDeviceType(b.name),
+              rssi: b.isConnected ? -42 : -85,
+              battery: b.battery,
+              status: b.isConnected ? 'Connected' : 'Paired',
+              macAddress: b.macAddress,
+              leAudioSupport: true,
+              isSelected: b.isConnected,
+              volume: 80,
+            }));
+            setDevices(mapped);
+            persistDevices(mapped);
+          }
         } catch {}
       };
       initAndroidBT();
 
-      let sub: any = null;
+      let subState: any = null;
+      let subConn: any = null;
       try {
-        sub = createBluetoothStateEmitter()?.addListener(BT_EVENTS.STATE_CHANGED, ({ state }) => {
+        const emitter = createBluetoothStateEmitter();
+        subState = emitter?.addListener(BT_EVENTS.STATE_CHANGED, ({ state }) => {
           const on = state === 'on';
           setBtEnabled(on);
         });
+
+        // Listen for real physical ACL Connect / Disconnect events
+        subConn = emitter?.addListener(
+          BT_EVENTS.DEVICE_CONNECTION_CHANGED,
+          ({ macAddress, connected, battery }) => {
+            setDevices(prev => {
+              const updated = prev.map(d => {
+                if (d.macAddress.toLowerCase() === (macAddress || '').toLowerCase()) {
+                  return {
+                    ...d,
+                    status: (connected ? 'Connected' : 'Paired') as DeviceStatus,
+                    battery: battery ?? d.battery,
+                    isSelected: connected,
+                    rssi: connected ? -42 : -85,
+                  };
+                }
+                return d;
+              });
+              persistDevices(updated);
+              return updated;
+            });
+            showToast(
+              connected
+                ? `হেডফোন কানেক্টেড হয়েছে!`
+                : `হেডফোন ডিসকানেক্টেড হয়েছে (বন্ধ বা রেঞ্জের বাইরে)`,
+              connected ? 'success' : 'warn',
+            );
+          },
+        );
       } catch {}
 
       return () => {
         try {
-          sub?.remove();
+          subState?.remove();
+          subConn?.remove();
         } catch {}
       };
     }
@@ -501,11 +552,12 @@ export default function App(): React.JSX.Element {
             id: b.id,
             name: b.name,
             type: detectDeviceType(b.name),
-            rssi: -48,
-            status: 'Paired',
+            rssi: b.isConnected ? -42 : -85,
+            battery: b.battery,
+            status: (b.isConnected ? 'Connected' : 'Paired') as DeviceStatus,
             macAddress: b.macAddress,
             leAudioSupport: true,
-            isSelected: true,
+            isSelected: b.isConnected,
             volume: 80,
           }));
           setDevices(prev => {
@@ -595,19 +647,97 @@ export default function App(): React.JSX.Element {
       }
     }
 
-    // Direct Simulated Connect for remembered/bonded devices
-    setTimeout(() => {
-      setDevices(prev => {
-        const updated = prev.map(d =>
-          d.id === device.id
-            ? { ...d, status: 'Connected' as DeviceStatus, isSelected: true, battery: d.battery ?? 88 }
-            : d,
-        );
-        persistDevices(updated);
-        return updated;
-      });
-      showToast(`${device.name} Connected!`, 'success');
-    }, 600);
+    // Android Native hardware connection & verification
+    if (Platform.OS === 'android') {
+      try {
+        // 1. Check if already active
+        const alreadyConnected = await NativeBluetooth.isDeviceConnected(device.macAddress);
+        if (alreadyConnected) {
+          setDevices(prev => {
+            const updated = prev.map(d =>
+              d.id === device.id
+                ? { ...d, status: 'Connected' as DeviceStatus, isSelected: true, rssi: -42 }
+                : d,
+            );
+            persistDevices(updated);
+            return updated;
+          });
+          showToast(`${device.name} অ্যাক্টিভ এবং কানেক্টেড!`, 'success');
+          return;
+        }
+
+        // 2. Request connection to hardware
+        const res = await NativeBluetooth.connectDevice(device.macAddress);
+        if (res.isConnected) {
+          setDevices(prev => {
+            const updated = prev.map(d =>
+              d.id === device.id
+                ? {
+                    ...d,
+                    status: 'Connected' as DeviceStatus,
+                    isSelected: true,
+                    battery: res.battery ?? d.battery,
+                    rssi: -42,
+                  }
+                : d,
+            );
+            persistDevices(updated);
+            return updated;
+          });
+          showToast(`${device.name} সফলভাবে কানেক্টেড!`, 'success');
+          return;
+        }
+
+        // 3. Poll for up to 3 seconds to check if device is turned on
+        let verifiedConnected = false;
+        for (let i = 0; i < 3; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          const isConn = await NativeBluetooth.isDeviceConnected(device.macAddress);
+          if (isConn) {
+            verifiedConnected = true;
+            break;
+          }
+        }
+
+        if (verifiedConnected) {
+          setDevices(prev => {
+            const updated = prev.map(d =>
+              d.id === device.id
+                ? { ...d, status: 'Connected' as DeviceStatus, isSelected: true, rssi: -42 }
+                : d,
+            );
+            persistDevices(updated);
+            return updated;
+          });
+          showToast(`${device.name} সফলভাবে কানেক্টেড!`, 'success');
+        } else {
+          // Device is NOT active or NOT in range - NEVER fake connected!
+          setDevices(prev => {
+            const updated = prev.map(d =>
+              d.id === device.id
+                ? { ...d, status: 'Paired' as DeviceStatus, isSelected: false, rssi: -85 }
+                : d,
+            );
+            persistDevices(updated);
+            return updated;
+          });
+          showToast(
+            `${device.name} চালু নেই বা ব্লুটুথ রেঞ্জে পাওয়া যায়নি! হেডফোন অন করুন।`,
+            'error',
+          );
+        }
+      } catch (err: any) {
+        setDevices(prev => {
+          const updated = prev.map(d =>
+            d.id === device.id ? { ...d, status: 'Paired' as DeviceStatus, isSelected: false } : d,
+          );
+          persistDevices(updated);
+          return updated;
+        });
+        showToast(`কানেকশন ব্যর্থ: ${err?.message || 'Device unreachable'}`, 'error');
+      }
+      return;
+    }
   };
 
   const handleDisconnectDevice = (device: BluetoothDevice) => {
