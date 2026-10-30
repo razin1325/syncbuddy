@@ -1,4 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Network Permissions for Metro & LAN Dev Server -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -20,7 +21,9 @@
 
     <!-- ── LE Audio / Auracast Broadcast (Android 13+ / API 33+) ── -->
     <!-- Required to start a BIS (Broadcast Isochronous Stream) -->
-    <uses-permission android:name="android.permission.BLUETOOTH_PRIVILEGED" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_PRIVILEGED"
+        tools:ignore="ProtectedPermissions" />
 
     <!-- ── Audio Permissions ── -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
