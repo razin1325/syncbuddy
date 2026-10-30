@@ -14,11 +14,6 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  * BluetoothStateModule
  *
  * Exposes the Android BluetoothAdapter state to React Native JS layer.
- * Provides:
- *   - getBluetoothState()       → Promise<"on"|"off"|"turning_on"|"turning_off"|"unavailable">
- *   - addBluetoothStateListener → JS event "bluetoothStateChanged"
- *
- * Used by App.tsx to show the real BT ON/OFF state instead of a fake toggle.
  */
 class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -34,7 +29,6 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         btManager?.adapter
     }
 
-    /** Broadcast receiver that fires whenever the system BT adapter state changes */
     private val btStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
@@ -53,17 +47,18 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
     override fun initialize() {
         super.initialize()
         val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-        reactContext.registerReceiver(btStateReceiver, filter)
+        try {
+            reactContext.registerReceiver(btStateReceiver, filter)
+        } catch (e: Exception) {}
     }
 
     override fun invalidate() {
         super.invalidate()
         try {
             reactContext.unregisterReceiver(btStateReceiver)
-        } catch (_: Exception) {}
+        } catch (e: Exception) {}
     }
 
-    /** Called from JS: BluetoothState.getBluetoothState() */
     @ReactMethod
     fun getBluetoothState(promise: Promise) {
         try {
@@ -78,7 +73,6 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    /** Called from JS: BluetoothState.isBluetoothEnabled() → Promise<boolean> */
     @ReactMethod
     fun isBluetoothEnabled(promise: Promise) {
         try {
@@ -88,10 +82,6 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    /**
-     * Request system dialog to turn Bluetooth ON.
-     * Launches Android system dialog: "SyncBuddy wants to turn on Bluetooth. [Allow]"
-     */
     @ReactMethod
     fun requestEnableBluetooth(promise: Promise) {
         try {
@@ -113,21 +103,21 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    /** Called from JS to check LE Audio / Auracast hardware support */
     @ReactMethod
     fun isLeAudioSupported(promise: Promise) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) { // API 33 = Android 13
-            val supported = bluetoothAdapter?.isLeAudioSupported == BluetoothAdapter.STATE_CONNECTED
-            promise.resolve(supported)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            try {
+                val method = bluetoothAdapter?.javaClass?.getMethod("isLeAudioSupported")
+                val result = method?.invoke(bluetoothAdapter)
+                promise.resolve(result == 10 || result == true)
+            } catch (e: Exception) {
+                promise.resolve(false)
+            }
         } else {
             promise.resolve(false)
         }
     }
 
-    /**
-     * Get real bonded (paired) devices from the Android system.
-     * Returns list of devices already paired in phone's Settings.
-     */
     @ReactMethod
     fun getBondedDevices(promise: Promise) {
         try {
@@ -153,7 +143,6 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    /** Get user's phone Bluetooth name (e.g. "Redmi Note") */
     @ReactMethod
     fun getDeviceName(promise: Promise) {
         try {
@@ -164,14 +153,11 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    /** JS can call this to add a listener (required boilerplate for RN 0.65+) */
     @ReactMethod
-    fun addListener(eventName: String) { /* required */ }
+    fun addListener(eventName: String) {}
 
     @ReactMethod
-    fun removeListeners(count: Int) { /* required */ }
-
-    // ── helpers ────────────────────────────────────────────────────────────
+    fun removeListeners(count: Int) {}
 
     private fun adapterStateToString(state: Int): String = when (state) {
         BluetoothAdapter.STATE_ON          -> "on"
@@ -181,10 +167,9 @@ class BluetoothStateModule(private val reactContext: ReactApplicationContext) :
         else                               -> "unavailable"
     }
 
-    private fun sendEvent(eventName: String, payload: String) {
+    private fun sendEvent(eventName: String, state: String) {
         reactContext
             .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            .emit(eventName, payload)
+            .emit(eventName, Arguments.createMap().apply { putString("state", state) })
     }
 }
-
