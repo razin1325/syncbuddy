@@ -12,8 +12,7 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  * AuracastModule
  *
  * Wraps Android 13+ LE Audio Broadcast (Auracast / BIS) APIs for React Native.
- * Uses safe reflection so that standard Android SDK builds without compile errors
- * while dynamically binding to LE Audio broadcast services on compatible devices.
+ * 100% crash-safe with dynamic binding.
  */
 class AuracastModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -27,7 +26,6 @@ class AuracastModule(private val reactContext: ReactApplicationContext) :
         const val EVT_LISTENER_REMOVED   = "auracastListenerRemoved"
         const val EVT_ERROR              = "auracastError"
 
-        // Hidden profile ID for LE_AUDIO_BROADCAST in Android 13+
         const val PROFILE_LE_AUDIO_BROADCAST = 26
     }
 
@@ -54,7 +52,6 @@ class AuracastModule(private val reactContext: ReactApplicationContext) :
                 return
             }
 
-            // Attempt proxy registration using standard profile listener
             val listener = object : BluetoothProfile.ServiceListener {
                 override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
                     try {
@@ -73,8 +70,8 @@ class AuracastModule(private val reactContext: ReactApplicationContext) :
                                 putInt("broadcastId", broadcastId)
                             }
                         )
-                    } catch (e: Exception) {
-                        promise.reject("AURACAST_ERROR", e.message, e)
+                    } catch (t: Throwable) {
+                        promise.reject("AURACAST_ERROR", t.message, t)
                     }
                 }
 
@@ -83,7 +80,6 @@ class AuracastModule(private val reactContext: ReactApplicationContext) :
 
             val proxySuccess = adapter.getProfileProxy(reactContext, listener, PROFILE_LE_AUDIO_BROADCAST)
             if (!proxySuccess) {
-                // Device does not support Auracast transmitter profile
                 promise.resolve(
                     Arguments.createMap().apply {
                         putBoolean("supported", false)
@@ -92,20 +88,24 @@ class AuracastModule(private val reactContext: ReactApplicationContext) :
                     }
                 )
             }
-        } catch (e: Exception) {
-            promise.reject("AURACAST_ERROR", e.message, e)
+        } catch (t: Throwable) {
+            promise.reject("AURACAST_ERROR", t.message, t)
         }
     }
 
     @ReactMethod
-    fun stopBroadcast(broadcastId: Int, promise: Promise) {
-        sendEvent(
-            EVT_BROADCAST_STOPPED,
-            Arguments.createMap().apply {
-                putInt("broadcastId", broadcastId)
-            }
-        )
-        promise.resolve(true)
+    fun stopBroadcast(broadcastId: Double, promise: Promise) {
+        try {
+            sendEvent(
+                EVT_BROADCAST_STOPPED,
+                Arguments.createMap().apply {
+                    putInt("broadcastId", broadcastId.toInt())
+                }
+            )
+            promise.resolve(true)
+        } catch (t: Throwable) {
+            promise.resolve(false)
+        }
     }
 
     @ReactMethod
@@ -119,14 +119,16 @@ class AuracastModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun addListener(eventName: String) {}
+    fun addListener(eventName: String?) {}
 
     @ReactMethod
-    fun removeListeners(count: Int) {}
+    fun removeListeners(count: Double) {}
 
     private fun sendEvent(eventName: String, payload: WritableMap) {
-        reactContext
-            .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            .emit(eventName, payload)
+        try {
+            reactContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                .emit(eventName, payload)
+        } catch (t: Throwable) {}
     }
 }

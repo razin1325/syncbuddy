@@ -29,6 +29,7 @@ import {
   Animated,
   Linking,
   NativeEventEmitter,
+  PermissionsAndroid,
 } from 'react-native';
 import {
   NativeBluetooth,
@@ -323,15 +324,34 @@ export default function App(): React.JSX.Element {
         });
       } catch {}
     } else if (Platform.OS === 'android') {
-      NativeBluetooth.isBluetoothEnabled().then(enabled => {
-        setBtEnabled(enabled);
-      });
-      const sub = createBluetoothStateEmitter()?.addListener(BT_EVENTS.STATE_CHANGED, ({ state }) => {
-        const on = state === 'on';
-        setBtEnabled(on);
-      });
+      const initAndroidBT = async () => {
+        try {
+          if (typeof Platform.Version === 'number' && Platform.Version >= 31) {
+            await PermissionsAndroid.requestMultiple([
+              PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+              PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+            ]);
+          }
+        } catch {}
+        try {
+          const enabled = await NativeBluetooth.isBluetoothEnabled();
+          setBtEnabled(enabled);
+        } catch {}
+      };
+      initAndroidBT();
+
+      let sub: any = null;
+      try {
+        sub = createBluetoothStateEmitter()?.addListener(BT_EVENTS.STATE_CHANGED, ({ state }) => {
+          const on = state === 'on';
+          setBtEnabled(on);
+        });
+      } catch {}
+
       return () => {
-        sub?.remove();
+        try {
+          sub?.remove();
+        } catch {}
       };
     }
   }, [isWeb, showToast]);
