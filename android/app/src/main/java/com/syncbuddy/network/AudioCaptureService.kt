@@ -33,7 +33,7 @@ class AudioCaptureService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_DATA = "data"
         const val AUDIO_STREAM_PORT = 8945
-        const val SAMPLE_RATE = 44100
+        const val SAMPLE_RATE = 48000
         const val AUDIO_BUFFER_SIZE = 1024
 
         @Volatile
@@ -129,9 +129,10 @@ class AudioCaptureService : Service() {
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
 
-            // Try stereo first (required by Android 10+ AudioPlaybackCapture HAL), then mono
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val nativeRate = audioManager?.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull() ?: SAMPLE_RATE
+            val candidateRates = intArrayOf(nativeRate, 48000, 44100)
             val channelConfigs = intArrayOf(AudioFormat.CHANNEL_IN_STEREO, AudioFormat.CHANNEL_IN_MONO)
-            val candidateRates = intArrayOf(SAMPLE_RATE, 48000)
             var initializedRecord: AudioRecord? = null
             var isStereoCapture = false
 
@@ -211,15 +212,61 @@ class AudioCaptureService : Service() {
                 packetBuf[2] = 'U'.code.toByte()
                 packetBuf[3] = 'D'.code.toByte()
 
+                var consecutiveSilentFrames = 0
+                var currentRecord = audioRecord
+
                 try {
                     DatagramSocket().use { sendSocket ->
                         sendSocket.broadcast = true
 
-                        while (isCapturing && audioRecord != null) {
-                            val shortsRead = audioRecord?.read(shortBuf, 0, shortBuf.size) ?: -1
+                        while (isCapturing && currentRecord != null) {
+                            val shortsRead = currentRecord?.read(shortBuf, 0, shortBuf.size) ?: -1
                             if (shortsRead <= 0) {
                                 Thread.sleep(15)
                                 continue
+                            }
+
+                            // Check if this frame is pure silence (all zeroes)
+                            var hasSignal = false
+                            for (i in 0 until shortsRead) {
+                                if (shortBuf[i] != 0.toShort()) {
+                                    hasSignal = true
+                                    break
+                                }
+                            }
+
+                            if (!hasSignal) {
+                                consecutiveSilentFrames++
+                                // If 120 consecutive frames (~2.5 seconds) are completely silent zeroes,
+                                // the media player app has blocked AudioPlaybackCapture.
+                                // Auto-fallback to MIC so listeners hear the music!
+                                if (consecutiveSilentFrames == 120) {
+                                    android.util.Log.w("AudioCaptureService", "App blocked AudioPlaybackCapture, auto-switching to MIC fallback")
+                                    try {
+                                        val minBuf = AudioRecord.getMinBufferSize(
+                                            SAMPLE_RATE,
+                                            AudioFormat.CHANNEL_IN_MONO,
+                                            AudioFormat.ENCODING_PCM_16BIT
+                                        )
+                                        val mic = AudioRecord(
+                                            MediaRecorder.AudioSource.MIC,
+                                            SAMPLE_RATE,
+                                            AudioFormat.CHANNEL_IN_MONO,
+                                            AudioFormat.ENCODING_PCM_16BIT,
+                                            Math.max(minBuf, 2048)
+                                        )
+                                        if (mic.state == AudioRecord.STATE_INITIALIZED) {
+                                            mic.startRecording()
+                                            try { currentRecord?.stop(); currentRecord?.release() } catch (e: Exception) {}
+                                            currentRecord = mic
+                                            isStereoCapture = false
+                                        }
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
+                                }
+                            } else {
+                                consecutiveSilentFrames = 0
                             }
 
                             val bytesToSend: Int

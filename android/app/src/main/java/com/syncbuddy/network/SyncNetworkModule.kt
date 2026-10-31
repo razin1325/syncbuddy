@@ -62,7 +62,7 @@ class SyncNetworkModule(
         const val DEFAULT_HTTP_PORT = 8942
         const val DISCOVERY_PORT = 8943
         const val AUDIO_STREAM_PORT = 8945
-        const val SAMPLE_RATE = 44100
+        const val SAMPLE_RATE = 48000
         const val AUDIO_BUFFER_SIZE = 1024
         const val BEACON_PREFIX = "SYNCBUDDY_BEACON|"
 
