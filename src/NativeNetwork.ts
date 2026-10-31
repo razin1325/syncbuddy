@@ -254,6 +254,42 @@ export const NativeNetwork = {
     }
   },
 
+  /**
+   * Pause the offline audio file playback
+   */
+  async pauseAudioFile(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.pauseAudioFile) return false;
+    try {
+      return await SyncNetworkModule.pauseAudioFile();
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Resume the offline audio file playback
+   */
+  async resumeAudioFile(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.resumeAudioFile) return false;
+    try {
+      return await SyncNetworkModule.resumeAudioFile();
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Scan device storage for all music/audio tracks (like VLC / Samsung Music)
+   */
+  async getDeviceAudioFiles(): Promise<Array<{ id: string; title: string; artist: string; duration: number; uri: string }>> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.getDeviceAudioFiles) return [];
+    try {
+      return await SyncNetworkModule.getDeviceAudioFiles();
+    } catch {
+      return [];
+    }
+  },
+
   // ───────────────────────────────────────────────────────────────────────────
   // Client (Listener) HTTP Network Helpers
   // ───────────────────────────────────────────────────────────────────────────

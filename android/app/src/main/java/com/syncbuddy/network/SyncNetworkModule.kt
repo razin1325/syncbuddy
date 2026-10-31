@@ -3,6 +3,7 @@ package com.syncbuddy.network
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
@@ -18,6 +19,7 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
+import android.provider.MediaStore
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import com.facebook.react.bridge.Arguments
@@ -1023,7 +1025,78 @@ class SyncNetworkModule(
     }
 
     private var isFileBroadcasting = false
+    private var isFilePaused = false
     private var fileBroadcasterThread: Thread? = null
+
+    @ReactMethod
+    fun pauseAudioFile(promise: Promise) {
+        isFilePaused = true
+        promise.resolve(true)
+    }
+
+    @ReactMethod
+    fun resumeAudioFile(promise: Promise) {
+        isFilePaused = false
+        promise.resolve(true)
+    }
+
+    @ReactMethod
+    fun getDeviceAudioFiles(promise: Promise) {
+        Executors.newSingleThreadExecutor().execute {
+            try {
+                val list = Arguments.createArray()
+                val projection = arrayOf(
+                    MediaStore.Audio.Media._ID,
+                    MediaStore.Audio.Media.TITLE,
+                    MediaStore.Audio.Media.ARTIST,
+                    MediaStore.Audio.Media.DURATION,
+                    MediaStore.Audio.Media.DATA
+                )
+
+                val uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                val cursor = reactApplicationContext.contentResolver.query(
+                    uri,
+                    projection,
+                    "${MediaStore.Audio.Media.IS_MUSIC} != 0",
+                    null,
+                    "${MediaStore.Audio.Media.TITLE} ASC"
+                )
+
+                cursor?.use {
+                    val idCol = it.getColumnIndex(MediaStore.Audio.Media._ID)
+                    val titleCol = it.getColumnIndex(MediaStore.Audio.Media.TITLE)
+                    val artistCol = it.getColumnIndex(MediaStore.Audio.Media.ARTIST)
+                    val durCol = it.getColumnIndex(MediaStore.Audio.Media.DURATION)
+                    val dataCol = it.getColumnIndex(MediaStore.Audio.Media.DATA)
+
+                    var count = 0
+                    while (it.moveToNext() && count < 100) {
+                        val id = if (idCol != -1) it.getLong(idCol) else 0L
+                        val title = if (titleCol != -1) it.getString(titleCol) ?: "Unknown Song" else "Unknown Song"
+                        val artist = if (artistCol != -1) it.getString(artistCol) ?: "<unknown>" else "<unknown>"
+                        val duration = if (durCol != -1) it.getLong(durCol) else 0L
+                        val path = if (dataCol != -1) it.getString(dataCol) ?: "" else ""
+
+                        val contentUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id).toString()
+                        val finalUri = if (path.isNotEmpty() && java.io.File(path).exists()) "file://$path" else contentUri
+
+                        val map = Arguments.createMap()
+                        map.putString("id", id.toString())
+                        map.putString("title", title)
+                        map.putString("artist", if (artist == "<unknown>") "Local Music" else artist)
+                        map.putDouble("duration", duration.toDouble())
+                        map.putString("uri", finalUri)
+                        list.pushMap(map)
+                        count++
+                    }
+                }
+
+                promise.resolve(list)
+            } catch (e: Exception) {
+                promise.reject("ERR_MEDIASTORE", e.message)
+            }
+        }
+    }
 
     @ReactMethod
     fun pickAudioFile(promise: Promise) {
@@ -1099,6 +1172,9 @@ class SyncNetworkModule(
                         var isEOS = false
 
                         while (isFileBroadcasting && !isEOS) {
+                            while (isFilePaused && isFileBroadcasting) {
+                                Thread.sleep(40)
+                            }
                             val inIdx = codec.dequeueInputBuffer(10000)
                             if (inIdx >= 0) {
                                 val inBuf = codec.getInputBuffer(inIdx)

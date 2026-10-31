@@ -204,6 +204,9 @@ export default function App(): React.JSX.Element {
   const [activeTrack, setActiveTrack] = useState<AudioTrack>(AUDIO_TRACKS[0]);
   const [selectedFileUri, setSelectedFileUri] = useState<string | null>(null);
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
+  const [deviceSongs, setDeviceSongs] = useState<Array<{ id: string; title: string; artist: string; duration: number; uri: string }>>([]);
+  const [songSearch, setSongSearch] = useState<string>('');
+  const [isSongPaused, setIsSongPaused] = useState<boolean>(false);
   const [masterVolume, setMasterVolume] = useState<number>(85);
   const [broadcastElapsed, setBroadcastElapsed] = useState<number>(0);
 
@@ -432,9 +435,15 @@ export default function App(): React.JSX.Element {
             );
           }
           if (typeof Platform.Version === 'number' && Platform.Version >= 33) {
-            reqs.push('android.permission.POST_NOTIFICATIONS');
+            reqs.push('android.permission.POST_NOTIFICATIONS', 'android.permission.READ_MEDIA_AUDIO');
+          } else {
+            reqs.push(PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE);
           }
           await PermissionsAndroid.requestMultiple(reqs);
+        } catch { }
+
+        try {
+          NativeNetwork.getDeviceAudioFiles().then(setDeviceSongs).catch(() => {});
         } catch { }
 
         try {
@@ -1222,6 +1231,143 @@ export default function App(): React.JSX.Element {
                   </Text>
                 </View>
               )}
+            </View>
+
+            {/* ─── VLC In-App Music Player (Auto-detects all device songs) ─── */}
+            <View style={styles.card}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                <View style={{ flex: 1, marginRight: 10 }}>
+                  <Text style={styles.sectionTitle}>🎵 ইন-অ্যাপ VLC মিউজিক প্লেয়ার</Text>
+                  <Text style={styles.cardDesc}>ফোনের ডাউনলোড করা গান সরাসরি চালান (কোনো থার্ড-পার্টি অ্যাপ ছাড়াই)</Text>
+                </View>
+                <TouchableOpacity
+                  style={{ backgroundColor: '#1E293B', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}
+                  onPress={async () => {
+                    const songs = await NativeNetwork.getDeviceAudioFiles();
+                    setDeviceSongs(songs);
+                    showToast(`${songs.length} টি গান পাওয়া গেছে`, 'info');
+                  }}>
+                  <Text style={{ color: '#06B6D4', fontSize: 12, fontWeight: 'bold' }}>🔄 রিফ্রেশ</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Now Playing Mini Player if a song is active */}
+              {selectedFileName && (
+                <View style={{ backgroundColor: '#0F172A', borderColor: '#06B6D4', borderWidth: 1, borderRadius: 12, padding: 12, marginBottom: 14 }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <View style={{ flex: 1, marginRight: 10 }}>
+                      <Text style={{ color: '#06B6D4', fontSize: 11, fontWeight: 'bold' }}>NOW STREAMING TO HEADPHONES</Text>
+                      <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: 'bold', marginTop: 2 }} numberOfLines={1}>{selectedFileName}</Text>
+                    </View>
+                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                      <TouchableOpacity
+                        style={{ backgroundColor: '#06B6D4', width: 36, height: 36, borderRadius: 18, justifyContent: 'center', alignItems: 'center', marginRight: 8 }}
+                        onPress={async () => {
+                          if (isSongPaused) {
+                            await NativeNetwork.resumeAudioFile();
+                            setIsSongPaused(false);
+                            showToast('গান রিজুম হয়েছে', 'info');
+                          } else {
+                            await NativeNetwork.pauseAudioFile();
+                            setIsSongPaused(true);
+                            showToast('গান পজ হয়েছে', 'info');
+                          }
+                        }}>
+                        <Text style={{ color: '#000000', fontSize: 16, fontWeight: 'bold' }}>{isSongPaused ? '▶' : '⏸'}</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={{ backgroundColor: '#EF4444', width: 36, height: 36, borderRadius: 18, justifyContent: 'center', alignItems: 'center' }}
+                        onPress={async () => {
+                          await NativeNetwork.stopAudioFile();
+                          setIsHostBroadcasting(false);
+                          setIsSongPaused(false);
+                          setSelectedFileName(null);
+                          setSelectedFileUri(null);
+                          showToast('গান বন্ধ করা হয়েছে', 'info');
+                        }}>
+                        <Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: 'bold' }}>⏹</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                </View>
+              )}
+
+              {/* Song Search Box */}
+              <TextInput
+                style={{ backgroundColor: '#0F172A', borderColor: '#334155', borderWidth: 1, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, color: '#FFFFFF', fontSize: 13, marginBottom: 10 }}
+                placeholder="গান খুঁজুন... (Search songs)"
+                placeholderTextColor="#64748B"
+                value={songSearch}
+                onChangeText={setSongSearch}
+              />
+
+              {/* Scanned Songs List */}
+              <View style={{ maxHeight: 220 }}>
+                {deviceSongs
+                  .filter(s => s.title.toLowerCase().includes(songSearch.toLowerCase()) || s.artist.toLowerCase().includes(songSearch.toLowerCase()))
+                  .slice(0, 8)
+                  .map(song => (
+                    <TouchableOpacity
+                      key={song.id}
+                      style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomColor: '#1E293B', borderBottomWidth: 1 }}
+                      onPress={async () => {
+                        setSelectedFileUri(song.uri);
+                        setSelectedFileName(song.title);
+                        setActiveTrack({
+                          id: 'song_' + song.id,
+                          title: song.title,
+                          artist: song.artist,
+                          duration: 'Live',
+                          source: 'file',
+                        });
+                        setIsSongPaused(false);
+                        setIsHostBroadcasting(true);
+                        await NativeNetwork.playAudioFile(song.uri);
+                        NativeNetwork.updateBroadcastState(true, song.title, masterVolume).catch(() => {});
+                        showToast(`🎵 ${song.title} সবার হেডফোনে বাজা শুরু হয়েছে!`, 'success');
+                      }}>
+                      <Text style={{ fontSize: 18, marginRight: 10 }}>🎶</Text>
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ color: '#FFFFFF', fontSize: 13, fontWeight: '600' }} numberOfLines={1}>{song.title}</Text>
+                        <Text style={{ color: '#64748B', fontSize: 11 }} numberOfLines={1}>{song.artist}</Text>
+                      </View>
+                      <Text style={{ color: '#06B6D4', fontSize: 12, fontWeight: 'bold' }}>PLAY ▶</Text>
+                    </TouchableOpacity>
+                  ))}
+
+                {deviceSongs.length === 0 && (
+                  <View style={{ paddingVertical: 14, alignItems: 'center' }}>
+                    <Text style={{ color: '#94A3B8', fontSize: 13, textAlign: 'center' }}>
+                      মেমোরির গান লোড করতে ওপরের 🔄 রিফ্রেশ চাপুন অথবা নিচের বাটন দিয়ে সরাসরি ফাইল বেছে নিন
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              {/* Manual File Picker button */}
+              <TouchableOpacity
+                style={{ marginTop: 10, backgroundColor: '#0891B2', paddingVertical: 10, borderRadius: 8, alignItems: 'center' }}
+                onPress={async () => {
+                  const picked = await NativeNetwork.pickAudioFile();
+                  if (picked && picked.uri) {
+                    setSelectedFileUri(picked.uri);
+                    setSelectedFileName(picked.name);
+                    setActiveTrack({
+                      id: 'picked_' + Math.random().toString(36).substring(2, 6),
+                      title: picked.name,
+                      artist: 'Local Audio',
+                      duration: 'Live',
+                      source: 'file',
+                    });
+                    setIsSongPaused(false);
+                    setIsHostBroadcasting(true);
+                    await NativeNetwork.playAudioFile(picked.uri);
+                    NativeNetwork.updateBroadcastState(true, picked.name, masterVolume).catch(() => {});
+                    showToast(`🎵 ${picked.name} বাজতে শুরু করেছে!`, 'success');
+                  }
+                }}>
+                <Text style={{ color: '#FFFFFF', fontWeight: 'bold', fontSize: 13 }}>📂 মেমোরি / ডাউনলোড ফোল্ডার থেকে ফাইল খুলুন</Text>
+              </TouchableOpacity>
             </View>
 
             {/* Audio Stream Source & Animated Visualizer */}
