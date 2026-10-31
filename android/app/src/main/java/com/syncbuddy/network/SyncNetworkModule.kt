@@ -945,9 +945,11 @@ class SyncNetworkModule(
             }
 
             try {
-                audioTrack?.setVolume(1.0f)
+                audioTrack?.setVolume(AudioTrack.getMaxVolume())
             } catch (e: Exception) {}
-            audioTrack?.play()
+            try {
+                audioTrack?.play()
+            } catch (e: Exception) {}
 
             try { audioReceiverSocket?.close() } catch (e: Exception) {}
             audioReceiverSocket = DatagramSocket(null).apply {
@@ -977,6 +979,9 @@ class SyncNetworkModule(
                                 packet.data[2] == 'U'.code.toByte() &&
                                 packet.data[3] == 'D'.code.toByte()
                             ) {
+                                if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                                    try { audioTrack?.play() } catch (e: Exception) {}
+                                }
                                 val pcmLen = packet.length - 4
                                 audioTrack?.write(packet.data, 4, pcmLen)
                             }

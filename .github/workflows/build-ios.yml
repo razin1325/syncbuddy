@@ -57,3 +57,4 @@ jobs:
           name: SyncBuddy-iOS-IPA
           path: ios/build/SyncBuddy-iOS.ipa
           retention-days: 14
+

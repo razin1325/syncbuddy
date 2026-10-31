@@ -203,10 +203,9 @@ class AudioCaptureService : Service() {
             isCapturing = true
 
             captureThread = Thread {
-                val pcmBufferSize = if (isStereoCapture) AUDIO_BUFFER_SIZE * 2 else AUDIO_BUFFER_SIZE
-                val pcm = ByteArray(pcmBufferSize)
-                val monoPcm = ByteArray(AUDIO_BUFFER_SIZE)
-                val packetBuf = ByteArray(AUDIO_BUFFER_SIZE + 4)
+                val shortBufferSize = if (isStereoCapture) 1024 else 512
+                val shortBuf = ShortArray(shortBufferSize)
+                val packetBuf = ByteArray(1024 + 4)
                 packetBuf[0] = 'S'.code.toByte()
                 packetBuf[1] = 'B'.code.toByte()
                 packetBuf[2] = 'U'.code.toByte()
@@ -217,28 +216,30 @@ class AudioCaptureService : Service() {
                         sendSocket.broadcast = true
 
                         while (isCapturing && audioRecord != null) {
-                            val read = audioRecord?.read(pcm, 0, pcm.size) ?: -1
-                            if (read <= 0) {
+                            val shortsRead = audioRecord?.read(shortBuf, 0, shortBuf.size) ?: -1
+                            if (shortsRead <= 0) {
                                 Thread.sleep(15)
                                 continue
                             }
 
                             val bytesToSend: Int
                             if (isStereoCapture) {
-                                // Downmix 16-bit stereo PCM to 16-bit mono PCM
-                                val sampleCount = Math.min(read / 4, AUDIO_BUFFER_SIZE / 2)
-                                for (i in 0 until sampleCount) {
-                                    val left = (pcm[i * 4].toInt() and 0xFF) or (pcm[i * 4 + 1].toInt() shl 8)
-                                    val right = (pcm[i * 4 + 2].toInt() and 0xFF) or (pcm[i * 4 + 3].toInt() shl 8)
-                                    val mono = ((left + right) / 2).coerceIn(-32768, 32767)
-                                    monoPcm[i * 2] = (mono and 0xFF).toByte()
-                                    monoPcm[i * 2 + 1] = ((mono shr 8) and 0xFF).toByte()
+                                val frames = shortsRead / 2
+                                for (i in 0 until frames) {
+                                    val monoSample = ((shortBuf[i * 2].toInt() + shortBuf[i * 2 + 1].toInt()) / 2).toShort()
+                                    val byteIdx = 4 + i * 2
+                                    packetBuf[byteIdx] = (monoSample.toInt() and 0xFF).toByte()
+                                    packetBuf[byteIdx + 1] = ((monoSample.toInt() shr 8) and 0xFF).toByte()
                                 }
-                                bytesToSend = sampleCount * 2
-                                System.arraycopy(monoPcm, 0, packetBuf, 4, bytesToSend)
+                                bytesToSend = frames * 2
                             } else {
-                                bytesToSend = Math.min(read, AUDIO_BUFFER_SIZE)
-                                System.arraycopy(pcm, 0, packetBuf, 4, bytesToSend)
+                                for (i in 0 until shortsRead) {
+                                    val sample = shortBuf[i]
+                                    val byteIdx = 4 + i * 2
+                                    packetBuf[byteIdx] = (sample.toInt() and 0xFF).toByte()
+                                    packetBuf[byteIdx + 1] = ((sample.toInt() shr 8) and 0xFF).toByte()
+                                }
+                                bytesToSend = shortsRead * 2
                             }
 
                             val targets = SyncNetworkModule.getBroadcastTargets()
