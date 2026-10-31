@@ -72,10 +72,8 @@ export interface AudioTrack {
 }
 
 const AUDIO_TRACKS: AudioTrack[] = [
-  { id: 't1', title: 'Cyber Pulse (Live Stream)', artist: 'SyncBuddy Studio', duration: '3:45', source: 'music' },
-  { id: 't2', title: 'Lecture Recording #04', artist: 'Campus Audio Sync', duration: '42:18', source: 'lecture' },
-  { id: 't3', title: 'Live Voice Pass-through', artist: 'Zero Latency Mic', duration: '∞', source: 'mic' },
-  { id: 't4', title: 'Silent Sync Baseline', artist: 'Audio Calibration', duration: '∞', source: 'ambient' },
+  { id: 't1', title: 'System Audio (Spotify / YouTube)', artist: 'ফোনে যে গান বাজবে সেটাই শুনবে', duration: 'Live', source: 'music' },
+  { id: 't2', title: 'Live Mic Pass-through', artist: 'ফোনের মাইক দিয়ে কথা বা সাউন্ড', duration: 'Live', source: 'mic' },
 ];
 
 function detectDeviceType(name: string): DeviceType {
@@ -631,19 +629,34 @@ export default function App(): React.JSX.Element {
     showToast(`নতুন ৪ ডিজিটের রুম নম্বর: #${code}`, 'success');
   };
 
-  const handleToggleHostBroadcast = () => {
+  const handleToggleHostBroadcast = async () => {
     const next = !isHostBroadcasting;
-    setIsHostBroadcasting(next);
-    NativeNetwork.updateBroadcastState(next, activeTrack.title, masterVolume).catch(() => {});
 
     if (next) {
-      // Start transmitting real audio (mic or synth music) to all listeners!
-      NativeNetwork.startAudioBroadcaster(activeTrack.source).catch(() => {});
-      showToast(`রুম #${roomCode} লাইভ ব্রডকাস্ট শুরু হয়েছে!`, 'success');
-      if (Platform.OS === 'android') {
-        NativeAuracast.startBroadcast(roomCode).catch(() => {});
+      try {
+        await NativeNetwork.startAudioBroadcaster(activeTrack.source);
+        setIsHostBroadcasting(true);
+        NativeNetwork.updateBroadcastState(true, activeTrack.title, masterVolume).catch(() => {});
+        showToast(
+          activeTrack.source === 'mic'
+            ? `রুম #${roomCode} মাইক লাইভ ব্রডকাস্ট শুরু হয়েছে!`
+            : `রুম #${roomCode} সিস্টেম অডিও ব্রডকাস্ট শুরু! এবার Spotify/YouTube-এ গান চালান 🎵`,
+          'success',
+        );
+        if (Platform.OS === 'android') {
+          NativeAuracast.startBroadcast(roomCode).catch(() => {});
+        }
+      } catch (err: any) {
+        const msg = err?.message || '';
+        if (msg.includes('DENIED') || msg.includes('অনুমতি')) {
+          showToast('অডিও ক্যাপচার অনুমতি দেওয়া হয়নি', 'warn');
+        } else {
+          showToast('ব্রডকাস্ট শুরু করতে সমস্যা হয়েছে', 'error');
+        }
       }
     } else {
+      setIsHostBroadcasting(false);
+      NativeNetwork.updateBroadcastState(false, activeTrack.title, masterVolume).catch(() => {});
       NativeNetwork.stopAudioBroadcaster().catch(() => {});
       showToast('ব্রডকাস্ট বন্ধ করা হয়েছে', 'info');
     }

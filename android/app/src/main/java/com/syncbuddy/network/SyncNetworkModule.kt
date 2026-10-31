@@ -929,9 +929,10 @@ class SyncNetworkModule(
         try {
             stopAudioBroadcasterInternal()
             acquireMulticastLock()
-            isAudioBroadcasting = true
 
             if (sourceType.equals("mic", ignoreCase = true)) {
+                // Mic mode: record from microphone and broadcast
+                isAudioBroadcasting = true
                 val minBuf = AudioRecord.getMinBufferSize(
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
@@ -985,61 +986,51 @@ class SyncNetworkModule(
                 audioBroadcasterThread?.start()
                 promise.resolve(true)
             } else {
-                // Synthesize electronic rhythm & synth pulse melody for music tracks
-                audioBroadcasterThread = Thread {
-                    val packetBuf = ByteArray(AUDIO_BUFFER_SIZE + 4)
-                    packetBuf[0] = 'S'.code.toByte()
-                    packetBuf[1] = 'B'.code.toByte()
-                    packetBuf[2] = 'U'.code.toByte()
-                    packetBuf[3] = 'D'.code.toByte()
+                // Music/Lecture/Ambient mode: use System Audio Capture (AudioPlaybackCapture)
+                // This captures whatever is playing on the phone (Spotify, YouTube, etc.)
+                // and the AudioCaptureService handles the UDP broadcasting
+                requestSystemAudioCaptureInternal(promise)
+            }
+        } catch (e: Exception) {
+            promise.reject("ERR_AUDIO_BROADCAST", e.message)
+        }
+    }
 
-                    try {
-                        DatagramSocket().use { sendSocket ->
-                            sendSocket.broadcast = true
+    /**
+     * Request system audio capture via MediaProjection.
+     * Shows the Android consent dialog, then starts AudioCaptureService.
+     */
+    @ReactMethod
+    fun requestSystemAudioCapture(promise: Promise) {
+        requestSystemAudioCaptureInternal(promise)
+    }
 
-                            var sampleIndex = 0
-                            val samplesPerBuffer = AUDIO_BUFFER_SIZE / 2
-                            val shortBuffer = ShortArray(samplesPerBuffer)
+    private fun requestSystemAudioCaptureInternal(promise: Promise) {
+        // Share known peer IPs with the AudioCaptureService
+        AudioCaptureService.knownPeerIps.clear()
+        AudioCaptureService.knownPeerIps.addAll(knownPeerIps)
 
-                            while (isAudioBroadcasting) {
-                                val beatPattern = (sampleIndex / (SAMPLE_RATE / 2)) % 4
-                                val baseFreq = when (beatPattern) {
-                                    0 -> 440.0
-                                    1 -> 554.37
-                                    2 -> 659.25
-                                    else -> 880.0
-                                }
+        val activity = currentActivity
+        if (activity is com.syncbuddy.MainActivity) {
+            activity.requestMediaProjection(promise)
+        } else {
+            promise.reject("ERR_ACTIVITY", "MainActivity not available")
+        }
+    }
 
-                                for (i in 0 until samplesPerBuffer) {
-                                    val t = (sampleIndex + i).toDouble() / SAMPLE_RATE
-                                    val envelope = Math.max(0.1, 1.0 - ((sampleIndex + i) % (SAMPLE_RATE / 2)).toDouble() / (SAMPLE_RATE / 2))
-                                    val wave = Math.sin(2.0 * Math.PI * baseFreq * t) * 0.4 +
-                                               Math.sin(2.0 * Math.PI * (baseFreq * 0.5) * t) * 0.3
-                                    shortBuffer[i] = (wave * envelope * 24000.0).toInt().coerceIn(-32768, 32767).toShort()
-                                }
-                                sampleIndex += samplesPerBuffer
-
-                                for (i in 0 until samplesPerBuffer) {
-                                    val s = shortBuffer[i].toInt()
-                                    packetBuf[4 + i * 2] = (s and 0xFF).toByte()
-                                    packetBuf[4 + i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
-                                }
-
-                                val targets = getBroadcastTargets()
-                                for (target in targets) {
-                                    try {
-                                        val packet = DatagramPacket(packetBuf, packetBuf.size, target, AUDIO_STREAM_PORT)
-                                        sendSocket.send(packet)
-                                    } catch (e: Exception) {}
-                                }
-                                Thread.sleep(30)
-                            }
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-                audioBroadcasterThread?.start()
+    /**
+     * Stop system audio capture service
+     */
+    @ReactMethod
+    fun stopSystemAudioCapture(promise: Promise) {
+        try {
+            val context = reactApplicationContext
+            context.stopService(Intent(context, AudioCaptureService::class.java))
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_STOP_CAPTURE", e.message)
+        }
+    }
                 promise.resolve(true)
             }
         } catch (e: Exception) {
@@ -1054,6 +1045,12 @@ class SyncNetworkModule(
             audioRecord?.release()
         } catch (e: Exception) {}
         audioRecord = null
+
+        // Also stop system audio capture service if running
+        try {
+            val context = reactApplicationContext
+            context.stopService(Intent(context, AudioCaptureService::class.java))
+        } catch (e: Exception) {}
     }
 
     @ReactMethod

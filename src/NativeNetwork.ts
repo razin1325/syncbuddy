@@ -182,7 +182,11 @@ export const NativeNetwork = {
   },
 
   /**
-   * Start broadcasting audio stream (source: 'mic' or 'music') to all devices on LAN
+   * Start broadcasting audio stream (source: 'mic' or 'music') to all devices on LAN.
+   * For 'music'/'lecture'/'ambient' sources, this uses Android's AudioPlaybackCapture API
+   * to capture whatever is currently playing on the phone (Spotify, YouTube, etc.)
+   * and stream it to all connected listeners.
+   * The user will see a one-time Android permission dialog asking to allow audio capture.
    */
   async startAudioBroadcaster(sourceType: string = 'mic'): Promise<boolean> {
     if (Platform.OS !== 'android' || !SyncNetworkModule?.startAudioBroadcaster) return true;
@@ -190,11 +194,28 @@ export const NativeNetwork = {
   },
 
   /**
-   * Stop broadcasting audio stream
+   * Stop broadcasting audio stream (also stops system audio capture service if running)
    */
   async stopAudioBroadcaster(): Promise<boolean> {
     if (Platform.OS !== 'android' || !SyncNetworkModule?.stopAudioBroadcaster) return true;
     return await SyncNetworkModule.stopAudioBroadcaster();
+  },
+
+  /**
+   * Request system audio capture permission (MediaProjection).
+   * Shows Android consent dialog, then starts foreground service to capture system audio.
+   */
+  async requestSystemAudioCapture(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.requestSystemAudioCapture) return false;
+    return await SyncNetworkModule.requestSystemAudioCapture();
+  },
+
+  /**
+   * Stop system audio capture foreground service
+   */
+  async stopSystemAudioCapture(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.stopSystemAudioCapture) return true;
+    return await SyncNetworkModule.stopSystemAudioCapture();
   },
 
   // ───────────────────────────────────────────────────────────────────────────

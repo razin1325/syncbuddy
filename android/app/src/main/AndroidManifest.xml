@@ -33,6 +33,11 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
 
+    <!-- ── System Audio Capture (Android 10+) ── -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- ── Camera Permission for QR Code Scanner ── -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -75,6 +80,12 @@
                 <data android:scheme="syncbuddy" />
             </intent-filter>
         </activity>
+
+        <!-- Audio Capture Foreground Service for System Audio Broadcast -->
+        <service
+            android:name="com.syncbuddy.network.AudioCaptureService"
+            android:foregroundServiceType="mediaProjection"
+            android:exported="false" />
 
     </application>
 </manifest>
