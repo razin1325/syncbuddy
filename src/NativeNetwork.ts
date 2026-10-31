@@ -218,6 +218,42 @@ export const NativeNetwork = {
     return await SyncNetworkModule.stopSystemAudioCapture();
   },
 
+  /**
+   * Open native file picker to choose an offline music/audio file from storage
+   */
+  async pickAudioFile(): Promise<{ uri: string; name: string } | null> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.pickAudioFile) return null;
+    try {
+      return await SyncNetworkModule.pickAudioFile();
+    } catch {
+      return null;
+    }
+  },
+
+  /**
+   * Play an offline audio file and stream its decoded PCM frames to all listeners
+   */
+  async playAudioFile(uri: string): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.playAudioFile) return false;
+    try {
+      return await SyncNetworkModule.playAudioFile(uri);
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Stop playing the offline audio file
+   */
+  async stopAudioFile(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.stopAudioFile) return false;
+    try {
+      return await SyncNetworkModule.stopAudioFile();
+    } catch {
+      return false;
+    }
+  },
+
   // ───────────────────────────────────────────────────────────────────────────
   // Client (Listener) HTTP Network Helpers
   // ───────────────────────────────────────────────────────────────────────────

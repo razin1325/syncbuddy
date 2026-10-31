@@ -10,7 +10,11 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaRecorder
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
@@ -1018,13 +1022,239 @@ class SyncNetworkModule(
         }
     }
 
+    private var isFileBroadcasting = false
+    private var fileBroadcasterThread: Thread? = null
+
+    @ReactMethod
+    fun pickAudioFile(promise: Promise) {
+        val activity = currentActivity
+        if (activity is com.syncbuddy.MainActivity) {
+            activity.requestAudioFilePicker(promise)
+        } else {
+            promise.reject("ERR_ACTIVITY", "MainActivity not available")
+        }
+    }
+
+    @ReactMethod
+    fun playAudioFile(uriString: String, promise: Promise) {
+        try {
+            stopAudioBroadcasterInternal()
+            acquireMulticastLock()
+            isFileBroadcasting = true
+
+            fileBroadcasterThread = Thread {
+                var extractor: MediaExtractor? = null
+                var codec: MediaCodec? = null
+                var localTrack: AudioTrack? = null
+
+                try {
+                    val context = reactApplicationContext
+                    val uri = Uri.parse(uriString)
+                    extractor = MediaExtractor()
+                    extractor.setDataSource(context, uri, null)
+
+                    var audioTrackIndex = -1
+                    var format: MediaFormat? = null
+                    for (i in 0 until extractor.trackCount) {
+                        val f = extractor.getTrackFormat(i)
+                        val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
+                        if (mime.startsWith("audio/")) {
+                            audioTrackIndex = i
+                            format = f
+                            break
+                        }
+                    }
+
+                    if (audioTrackIndex == -1 || format == null) {
+                        return@Thread
+                    }
+
+                    extractor.selectTrack(audioTrackIndex)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: "audio/mp4a-latm"
+                    val fileSampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else SAMPLE_RATE
+                    val channelCount = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
+
+                    codec = MediaCodec.createDecoderByType(mime)
+                    codec.configure(format, null, null, 0)
+                    codec.start()
+
+                    val minBuf = AudioTrack.getMinBufferSize(fileSampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                    localTrack = AudioTrack.Builder()
+                        .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                        .setAudioFormat(AudioFormat.Builder().setSampleRate(fileSampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                        .setBufferSizeInBytes(Math.max(minBuf, 8192))
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .build()
+                    localTrack.play()
+
+                    val packetBuf = ByteArray(4200)
+                    packetBuf[0] = 'S'.code.toByte()
+                    packetBuf[1] = 'B'.code.toByte()
+                    packetBuf[2] = 'U'.code.toByte()
+                    packetBuf[3] = 'D'.code.toByte()
+
+                    DatagramSocket().use { sendSocket ->
+                        sendSocket.broadcast = true
+                        val info = MediaCodec.BufferInfo()
+                        var isEOS = false
+
+                        while (isFileBroadcasting && !isEOS) {
+                            val inIdx = codec.dequeueInputBuffer(10000)
+                            if (inIdx >= 0) {
+                                val inBuf = codec.getInputBuffer(inIdx)
+                                if (inBuf != null) {
+                                    val sampleSize = extractor.readSampleData(inBuf, 0)
+                                    if (sampleSize < 0) {
+                                        codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                        isEOS = true
+                                    } else {
+                                        codec.queueInputBuffer(inIdx, 0, sampleSize, extractor.sampleTime, 0)
+                                        extractor.advance()
+                                    }
+                                }
+                            }
+
+                            var outIdx = codec.dequeueOutputBuffer(info, 10000)
+                            while (outIdx >= 0 && isFileBroadcasting) {
+                                val outBuf = codec.getOutputBuffer(outIdx)
+                                if (outBuf != null && info.size > 0) {
+                                    outBuf.position(info.offset)
+                                    outBuf.limit(info.offset + info.size)
+                                    val chunk = ByteArray(info.size)
+                                    outBuf.get(chunk)
+
+                                    val monoBytes: ByteArray
+                                    if (channelCount >= 2) {
+                                        val samples = chunk.size / 4
+                                        monoBytes = ByteArray(samples * 2)
+                                        for (s in 0 until samples) {
+                                            val left = (chunk[s * 4].toInt() and 0xFF) or (chunk[s * 4 + 1].toInt() shl 8)
+                                            val right = (chunk[s * 4 + 2].toInt() and 0xFF) or (chunk[s * 4 + 3].toInt() shl 8)
+                                            val mono = ((left.toShort() + right.toShort()) / 2).toShort()
+                                            monoBytes[s * 2] = (mono.toInt() and 0xFF).toByte()
+                                            monoBytes[s * 2 + 1] = ((mono.toInt() shr 8) and 0xFF).toByte()
+                                        }
+                                    } else {
+                                        monoBytes = chunk
+                                    }
+
+                                    try { localTrack.write(monoBytes, 0, monoBytes.size) } catch (e: Exception) {}
+
+                                    var offset = 0
+                                    while (offset < monoBytes.size && isFileBroadcasting) {
+                                        val toSend = Math.min(1024, monoBytes.size - offset)
+                                        System.arraycopy(monoBytes, offset, packetBuf, 4, toSend)
+                                        val targets = getBroadcastTargets()
+                                        for (target in targets) {
+                                            try {
+                                                val packet = DatagramPacket(packetBuf, toSend + 4, target, AUDIO_STREAM_PORT)
+                                                sendSocket.send(packet)
+                                            } catch (e: Exception) {}
+                                        }
+                                        offset += toSend
+                                        Thread.sleep(10)
+                                    }
+                                }
+                                codec.releaseOutputBuffer(outIdx, false)
+                                outIdx = codec.dequeueOutputBuffer(info, 0)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                } finally {
+                    try { codec?.stop(); codec?.release() } catch (e: Exception) {}
+                    try { extractor?.release() } catch (e: Exception) {}
+                    try { localTrack?.stop(); localTrack?.release() } catch (e: Exception) {}
+                    isFileBroadcasting = false
+                }
+            }
+            fileBroadcasterThread?.start()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_PLAY_FILE", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun stopAudioFile(promise: Promise) {
+        isFileBroadcasting = false
+        fileBroadcasterThread = null
+        promise.resolve(true)
+    }
+
     @ReactMethod
     fun startAudioBroadcaster(sourceType: String, promise: Promise) {
         try {
             stopAudioBroadcasterInternal()
             acquireMulticastLock()
 
-            if (sourceType.equals("mic", ignoreCase = true)) {
+            if (sourceType.equals("synth", ignoreCase = true)) {
+                // Cyber Sync Beat: Synthetic Melodic Groove that plays on Host AND streams to Listeners
+                isAudioBroadcasting = true
+
+                val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                val localTrack = AudioTrack.Builder()
+                    .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                    .setAudioFormat(AudioFormat.Builder().setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                    .setBufferSizeInBytes(Math.max(minBuf, 4096))
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
+                localTrack.play()
+
+                audioBroadcasterThread = Thread {
+                    val pcm = ByteArray(AUDIO_BUFFER_SIZE)
+                    val packetBuf = ByteArray(AUDIO_BUFFER_SIZE + 4)
+                    packetBuf[0] = 'S'.code.toByte()
+                    packetBuf[1] = 'B'.code.toByte()
+                    packetBuf[2] = 'U'.code.toByte()
+                    packetBuf[3] = 'D'.code.toByte()
+
+                    val notes = doubleArrayOf(261.63, 329.63, 392.00, 493.88, 523.25, 392.00, 329.63, 261.63)
+                    var sampleIdx = 0L
+
+                    try {
+                        DatagramSocket().use { sendSocket ->
+                            sendSocket.broadcast = true
+
+                            while (isAudioBroadcasting) {
+                                val samplesPerChunk = AUDIO_BUFFER_SIZE / 2
+                                for (i in 0 until samplesPerChunk) {
+                                    val noteIdx = ((sampleIdx / (SAMPLE_RATE / 4)) % notes.size).toInt()
+                                    val freq = notes[noteIdx]
+                                    val phase = 2.0 * Math.PI * (sampleIdx % SAMPLE_RATE) * freq / SAMPLE_RATE
+                                    val melody = Math.sin(phase) * 0.4
+                                    val beat = if ((sampleIdx % (SAMPLE_RATE / 2)) < (SAMPLE_RATE / 20)) 0.5 * Math.sin(2.0 * Math.PI * (sampleIdx % 200) * 120.0 / SAMPLE_RATE) else 0.0
+                                    val sampleVal = ((melody + beat) * 24000).toInt().coerceIn(-32768, 32767).toShort()
+
+                                    pcm[i * 2] = (sampleVal.toInt() and 0xFF).toByte()
+                                    pcm[i * 2 + 1] = ((sampleVal.toInt() shr 8) and 0xFF).toByte()
+                                    sampleIdx++
+                                }
+
+                                try { localTrack.write(pcm, 0, pcm.size) } catch (e: Exception) {}
+
+                                System.arraycopy(pcm, 0, packetBuf, 4, pcm.size)
+                                val targets = getBroadcastTargets()
+                                for (target in targets) {
+                                    try {
+                                        val packet = DatagramPacket(packetBuf, pcm.size + 4, target, AUDIO_STREAM_PORT)
+                                        sendSocket.send(packet)
+                                    } catch (e: Exception) {}
+                                }
+
+                                Thread.sleep(10)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    } finally {
+                        try { localTrack.stop(); localTrack.release() } catch (e: Exception) {}
+                    }
+                }
+                audioBroadcasterThread?.start()
+                promise.resolve(true)
+            } else if (sourceType.equals("mic", ignoreCase = true)) {
                 // Mic mode: record from microphone and broadcast
                 isAudioBroadcasting = true
                 val minBuf = AudioRecord.getMinBufferSize(
@@ -1126,6 +1356,8 @@ class SyncNetworkModule(
 
     private fun stopAudioBroadcasterInternal() {
         isAudioBroadcasting = false
+        isFileBroadcasting = false
+        fileBroadcasterThread = null
         try {
             audioRecord?.stop()
             audioRecord?.release()

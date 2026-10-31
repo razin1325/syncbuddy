@@ -47,7 +47,7 @@ export type NavigationPage = 'host' | 'join' | 'walkie' | 'devices';
 export type DeviceType = 'Audio' | 'Wearable' | 'Computer' | 'IoT Sensor' | 'Peripheral';
 export type DeviceStatus = 'Broadcasting' | 'Connected' | 'Connecting' | 'Paired' | 'Available';
 export type FilterTab = 'All' | 'Connected' | 'Paired' | 'Audio' | 'Wearables';
-export type AudioSource = 'mic' | 'music' | 'lecture' | 'ambient';
+export type AudioSource = 'mic' | 'music' | 'lecture' | 'ambient' | 'synth' | 'file';
 
 export interface BluetoothDevice {
   id: string;
@@ -72,8 +72,10 @@ export interface AudioTrack {
 }
 
 const AUDIO_TRACKS: AudioTrack[] = [
-  { id: 't1', title: 'System Audio (Spotify / YouTube)', artist: 'ফোনে যে গান বাজবে সেটাই শুনবে', duration: 'Live', source: 'music' },
+  { id: 't0', title: 'Cyber Sync Beat (Auto Melody)', artist: 'টেস্ট ট্র্যাক • কোনো ফাইল ছাড়া সরাসরি টেস্ট করুন', duration: 'Loop', source: 'synth' },
+  { id: 't1', title: 'Local Audio File (ডাউনলোড করা গান)', artist: 'মেমোরি থেকে যেকোনো MP3/গান সিলেক্ট করুন', duration: 'File', source: 'file' },
   { id: 't2', title: 'Live Mic Pass-through', artist: 'ফোনের মাইক দিয়ে কথা বা সাউন্ড', duration: 'Live', source: 'mic' },
+  { id: 't3', title: 'System Audio Loopback (Spotify / YouTube)', artist: 'অন্যান্য অ্যাপের ব্যাকগ্রাউন্ড সাউন্ড', duration: 'Live', source: 'music' },
 ];
 
 function detectDeviceType(name: string): DeviceType {
@@ -200,6 +202,8 @@ export default function App(): React.JSX.Element {
   );
   const [isHostBroadcasting, setIsHostBroadcasting] = useState<boolean>(false);
   const [activeTrack, setActiveTrack] = useState<AudioTrack>(AUDIO_TRACKS[0]);
+  const [selectedFileUri, setSelectedFileUri] = useState<string | null>(null);
+  const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
   const [masterVolume, setMasterVolume] = useState<number>(85);
   const [broadcastElapsed, setBroadcastElapsed] = useState<number>(0);
 
@@ -676,13 +680,33 @@ export default function App(): React.JSX.Element {
 
     if (next) {
       try {
-        await NativeNetwork.startAudioBroadcaster(activeTrack.source);
+        if (activeTrack.source === 'file') {
+          let uriToPlay = selectedFileUri;
+          if (!uriToPlay) {
+            const picked = await NativeNetwork.pickAudioFile();
+            if (!picked || !picked.uri) {
+              showToast('অনুগ্রহ করে একটি গান সিলেক্ট করুন', 'warn');
+              return;
+            }
+            setSelectedFileUri(picked.uri);
+            setSelectedFileName(picked.name);
+            uriToPlay = picked.uri;
+          }
+          await NativeNetwork.playAudioFile(uriToPlay);
+        } else {
+          await NativeNetwork.startAudioBroadcaster(activeTrack.source);
+        }
+
         setIsHostBroadcasting(true);
         NativeNetwork.updateBroadcastState(true, activeTrack.title, masterVolume).catch(() => {});
         showToast(
-          activeTrack.source === 'mic'
-            ? `রুম #${roomCode} মাইক লাইভ ব্রডকাস্ট শুরু হয়েছে!`
-            : `রুম #${roomCode} সিস্টেম অডিও ব্রডকাস্ট শুরু! এবার Spotify/YouTube-এ গান চালান 🎵`,
+          activeTrack.source === 'synth'
+            ? `রুম #${roomCode} সাইবার সিঙ্ক বিট লাইভ বাজা শুরু হয়েছে! ⚡`
+            : activeTrack.source === 'file'
+            ? `রুম #${roomCode} ডাউনলোড করা গান সবার ফোনে বাজা শুরু হয়েছে! 🎵`
+            : activeTrack.source === 'mic'
+            ? `রুম #${roomCode} মাইক লাইভ ব্রডকাস্ট শুরু হয়েছে! 🎙️`
+            : `রুম #${roomCode} সিস্টেম অডিও ব্রডকাস্ট শুরু হয়েছে! 📱`,
           'success',
         );
         if (Platform.OS === 'android') {
@@ -699,6 +723,9 @@ export default function App(): React.JSX.Element {
     } else {
       setIsHostBroadcasting(false);
       NativeNetwork.updateBroadcastState(false, activeTrack.title, masterVolume).catch(() => {});
+      if (activeTrack.source === 'file') {
+        NativeNetwork.stopAudioFile().catch(() => {});
+      }
       NativeNetwork.stopAudioBroadcaster().catch(() => {});
       showToast('ব্রডকাস্ট বন্ধ করা হয়েছে', 'info');
     }
@@ -1214,26 +1241,67 @@ export default function App(): React.JSX.Element {
               {AUDIO_TRACKS.map(t => {
                 const isSelected = activeTrack.id === t.id;
                 return (
-                  <TouchableOpacity
-                    key={t.id}
-                    style={[styles.trackItem, isSelected && styles.trackItemActive]}
-                    onPress={() => {
-                      setActiveTrack(t);
-                      NativeNetwork.updateBroadcastState(isHostBroadcasting, t.title, masterVolume).catch(() => {});
-                      if (isHostBroadcasting) {
-                        NativeNetwork.startAudioBroadcaster(t.source).catch(() => {});
-                      }
-                      showToast(`সোর্স নির্বাচিত: ${t.title}`, 'info');
-                    }}>
-                    <Text style={{ fontSize: 20, marginRight: 10 }}>
-                      {t.source === 'mic' ? '🎤' : t.source === 'music' ? '🎵' : '📻'}
-                    </Text>
-                    <View style={{ flex: 1 }}>
-                      <Text style={[styles.trackTitle, isSelected && { color: '#06B6D4' }]}>{t.title}</Text>
-                      <Text style={styles.trackArtist}>{t.artist}</Text>
-                    </View>
-                    <Text style={styles.trackDuration}>{t.duration}</Text>
-                  </TouchableOpacity>
+                  <View key={t.id} style={{ marginBottom: 10 }}>
+                    <TouchableOpacity
+                      style={[styles.trackItem, isSelected && styles.trackItemActive]}
+                      onPress={async () => {
+                        setActiveTrack(t);
+                        NativeNetwork.updateBroadcastState(isHostBroadcasting, t.title, masterVolume).catch(() => {});
+                        if (isHostBroadcasting) {
+                          if (t.source === 'file') {
+                            if (selectedFileUri) {
+                              NativeNetwork.playAudioFile(selectedFileUri).catch(() => {});
+                            }
+                          } else {
+                            NativeNetwork.startAudioBroadcaster(t.source).catch(() => {});
+                          }
+                        }
+                        showToast(`সোর্স নির্বাচিত: ${t.title}`, 'info');
+                      }}>
+                      <Text style={{ fontSize: 20, marginRight: 10 }}>
+                        {t.source === 'mic' ? '🎤' : t.source === 'synth' ? '⚡' : t.source === 'file' ? '🎵' : '📱'}
+                      </Text>
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.trackTitle, isSelected && { color: '#06B6D4' }]}>{t.title}</Text>
+                        <Text style={styles.trackArtist}>{t.artist}</Text>
+                        {t.source === 'file' && selectedFileName && (
+                          <Text style={{ fontSize: 11, color: '#10B981', marginTop: 3 }}>
+                            ✓ গান সিলেক্টেড: {selectedFileName}
+                          </Text>
+                        )}
+                      </View>
+                      <Text style={styles.trackDuration}>{t.duration}</Text>
+                    </TouchableOpacity>
+
+                    {isSelected && t.source === 'file' && (
+                      <TouchableOpacity
+                        style={{
+                          marginTop: 6,
+                          backgroundColor: '#0E7490',
+                          paddingVertical: 9,
+                          paddingHorizontal: 14,
+                          borderRadius: 8,
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                        onPress={async () => {
+                          const picked = await NativeNetwork.pickAudioFile();
+                          if (picked && picked.uri) {
+                            setSelectedFileUri(picked.uri);
+                            setSelectedFileName(picked.name);
+                            showToast(`গান লোড হয়েছে: ${picked.name}`, 'success');
+                            if (isHostBroadcasting) {
+                              NativeNetwork.playAudioFile(picked.uri).catch(() => {});
+                            }
+                          }
+                        }}>
+                        <Text style={{ color: '#FFFFFF', fontWeight: 'bold', fontSize: 13 }}>
+                          {selectedFileName ? `📂 গান পরিবর্তন করুন (${selectedFileName})` : '📂 মেমোরি থেকে যে কোনো গান সিলেক্ট করুন'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
                 );
               })}
 

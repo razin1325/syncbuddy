@@ -15,9 +15,13 @@ class MainActivity : ReactActivity() {
 
     companion object {
         const val MEDIA_PROJECTION_REQUEST = 9001
+        const val AUDIO_PICKER_REQUEST = 9002
 
         @Volatile
         var pendingProjectionPromise: Promise? = null
+
+        @Volatile
+        var pendingAudioPickerPromise: Promise? = null
 
         @Volatile
         var instance: MainActivity? = null
@@ -52,8 +56,46 @@ class MainActivity : ReactActivity() {
         }
     }
 
+    fun requestAudioFilePicker(promise: Promise) {
+        pendingAudioPickerPromise = promise
+        try {
+            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                type = "audio/*"
+                addCategory(Intent.CATEGORY_OPENABLE)
+            }
+            startActivityForResult(Intent.createChooser(intent, "গান নির্বাচন করুন"), AUDIO_PICKER_REQUEST)
+        } catch (e: Exception) {
+            promise.reject("ERR_PICKER", e.message)
+        }
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == AUDIO_PICKER_REQUEST) {
+            val promise = pendingAudioPickerPromise
+            pendingAudioPickerPromise = null
+            if (resultCode == Activity.RESULT_OK && data?.data != null) {
+                val uri = data.data!!
+                var fileName = "Music File"
+                try {
+                    contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                        val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (nameIndex != -1 && cursor.moveToFirst()) {
+                            fileName = cursor.getString(nameIndex) ?: "Music File"
+                        }
+                    }
+                } catch (e: Exception) {}
+
+                val map = com.facebook.react.bridge.Arguments.createMap()
+                map.putString("uri", uri.toString())
+                map.putString("name", fileName)
+                promise?.resolve(map)
+            } else {
+                promise?.reject("CANCELLED", "কোনো গান নির্বাচন করা হয়নি")
+            }
+            return
+        }
 
         if (requestCode == MEDIA_PROJECTION_REQUEST) {
             val promise = pendingProjectionPromise

@@ -207,9 +207,9 @@ class AudioCaptureService : Service() {
             isCapturing = true
 
             captureThread = Thread {
-                val shortBufferSize = if (isStereoCapture) 1024 else 512
+                val shortBufferSize = 1024
                 val shortBuf = ShortArray(shortBufferSize)
-                val packetBuf = ByteArray(1024 + 4)
+                val packetBuf = ByteArray(4200)
                 packetBuf[0] = 'S'.code.toByte()
                 packetBuf[1] = 'B'.code.toByte()
                 packetBuf[2] = 'U'.code.toByte()
