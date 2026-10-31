@@ -342,6 +342,30 @@ export const NativeNetwork = {
     }
   },
 
+  /**
+   * Show persistent ongoing status notification at the top of the mobile device
+   */
+  async showPersistentNotification(title: string, message: string): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.showPersistentNotification) return false;
+    try {
+      return await SyncNetworkModule.showPersistentNotification(title, message);
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Dismiss the persistent status notification
+   */
+  async dismissPersistentNotification(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.dismissPersistentNotification) return false;
+    try {
+      return await SyncNetworkModule.dismissPersistentNotification();
+    } catch {
+      return false;
+    }
+  },
+
   // ───────────────────────────────────────────────────────────────────────────
   // Native Event Listeners
   // ───────────────────────────────────────────────────────────────────────────

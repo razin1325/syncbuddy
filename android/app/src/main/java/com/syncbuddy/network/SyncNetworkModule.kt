@@ -1,5 +1,8 @@
 package com.syncbuddy.network
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
@@ -12,6 +15,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.core.app.NotificationCompat
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -67,6 +71,10 @@ class SyncNetworkModule(
         const val EVENT_PTT_MESSAGE = "ON_PTT_MESSAGE"
         const val EVENT_ROOM_DISCOVERED = "ON_ROOM_DISCOVERED"
         const val EVENT_BROADCAST_STATE = "ON_BROADCAST_STATE"
+
+        const val STATUS_NOTIFICATION_CHANNEL_ID = "syncbuddy_status_channel"
+        const val STATUS_NOTIFICATION_NAME = "SyncBuddy Service Status"
+        const val STATUS_NOTIFICATION_ID = 89421
 
         val knownPeerIps = ConcurrentHashMap.newKeySet<String>()
         val participantIps = ConcurrentHashMap.newKeySet<String>()
@@ -1132,6 +1140,90 @@ class SyncNetworkModule(
     fun stopAudioBroadcaster(promise: Promise) {
         stopAudioBroadcasterInternal()
         promise.resolve(true)
+    }
+
+    private fun createStatusNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                val channel = NotificationChannel(
+                    STATUS_NOTIFICATION_CHANNEL_ID,
+                    STATUS_NOTIFICATION_NAME,
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "SyncBuddy ব্যাকগ্রাউন্ড রানিং স্ট্যাটাস"
+                    setShowBadge(false)
+                    enableLights(false)
+                    enableVibration(false)
+                }
+                val manager = reactApplicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                manager?.createNotificationChannel(channel)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    private fun showStatusNotificationInternal(title: String, message: String) {
+        try {
+            createStatusNotificationChannel()
+            val context = reactApplicationContext
+            val iconRes = context.applicationInfo.icon.takeIf { it != 0 } ?: android.R.drawable.sym_def_app_icon
+
+            val launchIntent = Intent(context, com.syncbuddy.MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            } else {
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
+            val pendingIntent = PendingIntent.getActivity(context, 0, launchIntent, flags)
+
+            val notification = NotificationCompat.Builder(context, STATUS_NOTIFICATION_CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(message)
+                .setSmallIcon(iconRes)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
+                .setContentIntent(pendingIntent)
+                .setOnlyAlertOnce(true)
+                .build()
+
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            manager?.notify(STATUS_NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun dismissStatusNotificationInternal() {
+        try {
+            val manager = reactApplicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            manager?.cancel(STATUS_NOTIFICATION_ID)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    @ReactMethod
+    fun showPersistentNotification(title: String, message: String, promise: Promise) {
+        try {
+            showStatusNotificationInternal(title, message)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_NOTIFICATION", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun dismissPersistentNotification(promise: Promise) {
+        try {
+            dismissStatusNotificationInternal()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_DISMISS_NOTIFICATION", e.message)
+        }
     }
 
     // Required by React Native for event emitters

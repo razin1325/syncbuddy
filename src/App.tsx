@@ -375,18 +375,60 @@ export default function App(): React.JSX.Element {
   }, [joinedRoom, deviceId]);
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 5. Initial Hardware Setup & Bluetooth Permissions
+  // 5. Real-time Persistent Status Notification (Always visible at top of screen)
+  // ─────────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+
+    let title = 'SyncBuddy • রানিং 🟢';
+    let msg = 'অফলাইন অডিও সিঙ্ক ও ওয়াকি-টকি ব্যাকগ্রাউন্ডে সক্রিয়';
+
+    if (isTalking) {
+      title = 'SyncBuddy • ওয়াকি-টকি কথা বলছেন... 🎙️';
+      msg = 'আপনার ভয়েস লাইভ সম্প্রচার হচ্ছে';
+    } else if (activeSpeaker) {
+      title = `SyncBuddy • ${activeSpeaker} কথা বলছেন 🔊`;
+      msg = 'ওয়াকি-টকি ভয়েস লাইভ শোনা যাচ্ছে';
+    } else if (isHostBroadcasting) {
+      const count = hostParticipants.length;
+      title = `SyncBuddy • ব্রডকাস্ট চলছে 🔴 (রুম #${roomCode})`;
+      msg = `মিউজিক সবার হেডফোনে বাজছে • ${count > 0 ? `${count} জন শুনছেন` : 'লিসেনারদের অপেক্ষা'}`;
+    } else if (activePage === 'host') {
+      const count = hostParticipants.length;
+      title = `SyncBuddy • হোস্ট রুম #${roomCode} 📡`;
+      msg = count > 0 ? `${count} টি ডিভাইস সংযুক্ত • অডিও ব্রডকাস্ট প্রস্তুত` : 'অফলাইন হোস্ট রুম সক্রিয় • ডিভাইসের অপেক্ষা';
+    } else if (joinedRoom) {
+      title = `SyncBuddy • সংযুক্ত 🎧 (রুম #${joinedRoom.code})`;
+      msg = `হোস্ট: ${joinedRoom.hostName} • অডিও সিঙ্ক ও ওয়াকি-টকি অন`;
+    }
+
+    NativeNetwork.showPersistentNotification(title, msg).catch(() => {});
+  }, [
+    activePage,
+    roomCode,
+    isHostBroadcasting,
+    hostParticipants.length,
+    joinedRoom,
+    isTalking,
+    activeSpeaker,
+  ]);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 6. Initial Hardware Setup & Permissions
   // ─────────────────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (Platform.OS === 'android') {
       const initAndroid = async () => {
         try {
-          const reqs = [PermissionsAndroid.PERMISSIONS.RECORD_AUDIO];
+          const reqs: any[] = [PermissionsAndroid.PERMISSIONS.RECORD_AUDIO];
           if (typeof Platform.Version === 'number' && Platform.Version >= 31) {
             reqs.push(
               PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
               PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
             );
+          }
+          if (typeof Platform.Version === 'number' && Platform.Version >= 33) {
+            reqs.push('android.permission.POST_NOTIFICATIONS');
           }
           await PermissionsAndroid.requestMultiple(reqs);
         } catch { }
