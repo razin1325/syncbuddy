@@ -56,7 +56,7 @@ class SyncNetworkModule(
         const val DEFAULT_HTTP_PORT = 8942
         const val DISCOVERY_PORT = 8943
         const val AUDIO_STREAM_PORT = 8945
-        const val SAMPLE_RATE = 16000
+        const val SAMPLE_RATE = 44100
         const val AUDIO_BUFFER_SIZE = 1024
         const val BEACON_PREFIX = "SYNCBUDDY_BEACON|"
 
@@ -65,6 +65,50 @@ class SyncNetworkModule(
         const val EVENT_PTT_MESSAGE = "ON_PTT_MESSAGE"
         const val EVENT_ROOM_DISCOVERED = "ON_ROOM_DISCOVERED"
         const val EVENT_BROADCAST_STATE = "ON_BROADCAST_STATE"
+
+        val knownPeerIps = ConcurrentHashMap.newKeySet<String>()
+        val participantIps = ConcurrentHashMap.newKeySet<String>()
+
+        fun getBroadcastTargets(): List<InetAddress> {
+            val targets = mutableListOf<InetAddress>()
+            try {
+                targets.add(InetAddress.getByName("255.255.255.255"))
+            } catch (e: Exception) {}
+
+            try {
+                val interfaces = NetworkInterface.getNetworkInterfaces()
+                while (interfaces != null && interfaces.hasMoreElements()) {
+                    val iface = interfaces.nextElement()
+                    if (iface.isLoopback || !iface.isUp) continue
+                    for (ia in iface.interfaceAddresses) {
+                        val bcast = ia.broadcast
+                        if (bcast != null && !targets.contains(bcast)) {
+                            targets.add(bcast)
+                        }
+                    }
+                }
+            } catch (e: Exception) {}
+
+            for (peerIp in knownPeerIps) {
+                try {
+                    val addr = InetAddress.getByName(peerIp)
+                    if (!targets.contains(addr)) {
+                        targets.add(addr)
+                    }
+                } catch (e: Exception) {}
+            }
+
+            for (peerIp in participantIps) {
+                try {
+                    val addr = InetAddress.getByName(peerIp)
+                    if (!targets.contains(addr)) {
+                        targets.add(addr)
+                    }
+                } catch (e: Exception) {}
+            }
+
+            return targets
+        }
     }
 
     // Audio Receiver & Player State (Plays incoming stream on phone/headphones)
@@ -142,9 +186,6 @@ class SyncNetworkModule(
         return false
     }
 
-    // Direct peer IP tracking (enables direct UDP delivery bypassing AP router blocks)
-    private val knownPeerIps = ConcurrentHashMap.newKeySet<String>()
-
     // Wi-Fi Multicast Lock to prevent Android hardware filter from dropping UDP packets
     private var multicastLock: WifiManager.MulticastLock? = null
 
@@ -167,41 +208,6 @@ class SyncNetworkModule(
                 multicastLock?.release()
             }
         } catch (e: Exception) {}
-    }
-
-    /**
-     * Resolves all destinations: global broadcast, interface subnet broadcasts, and direct peer IPs
-     */
-    private fun getBroadcastTargets(): List<InetAddress> {
-        val targets = mutableListOf<InetAddress>()
-        try {
-            targets.add(InetAddress.getByName("255.255.255.255"))
-        } catch (e: Exception) {}
-
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces != null && interfaces.hasMoreElements()) {
-                val iface = interfaces.nextElement()
-                if (iface.isLoopback || !iface.isUp) continue
-                for (ia in iface.interfaceAddresses) {
-                    val bcast = ia.broadcast
-                    if (bcast != null && !targets.contains(bcast)) {
-                        targets.add(bcast)
-                    }
-                }
-            }
-        } catch (e: Exception) {}
-
-        for (peerIp in knownPeerIps) {
-            try {
-                val addr = InetAddress.getByName(peerIp)
-                if (!targets.contains(addr)) {
-                    targets.add(addr)
-                }
-            } catch (e: Exception) {}
-        }
-
-        return targets
     }
 
     @ReactMethod
@@ -430,6 +436,11 @@ class SyncNetworkModule(
         try {
             socket.soTimeout = 8000
             val clientIp = socket.inetAddress.hostAddress ?: "Unknown"
+            val cleanClientIp = clientIp.substringBefore('%').trim()
+            if (cleanClientIp.isNotEmpty() && cleanClientIp != "Unknown" && !isSelfIpOrDevice(cleanClientIp, null)) {
+                knownPeerIps.add(cleanClientIp)
+                participantIps.add(cleanClientIp)
+            }
             reader = BufferedReader(InputStreamReader(socket.getInputStream()))
             output = socket.getOutputStream()
 
@@ -849,16 +860,26 @@ class SyncNetworkModule(
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferCapacity = Math.max(minBuf, AUDIO_BUFFER_SIZE * 4)
+            val bufferCapacity = Math.max(minBuf, AUDIO_BUFFER_SIZE * 8)
 
-            audioTrack = AudioTrack(
-                AudioManager.STREAM_MUSIC,
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufferCapacity,
-                AudioTrack.MODE_STREAM
-            )
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+
+            val audioFormat = AudioFormat.Builder()
+                .setSampleRate(SAMPLE_RATE)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .build()
+
+            audioTrack = AudioTrack.Builder()
+                .setAudioAttributes(audioAttributes)
+                .setAudioFormat(audioFormat)
+                .setBufferSizeInBytes(bufferCapacity)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+
             try {
                 audioTrack?.setVolume(1.0f)
             } catch (e: Exception) {}
@@ -869,7 +890,7 @@ class SyncNetworkModule(
             isAudioReceiverRunning = true
 
             audioReceiverThread = Thread {
-                val buffer = ByteArray(AUDIO_BUFFER_SIZE + 32)
+                val buffer = ByteArray(4096)
 
                 while (isAudioReceiverRunning && audioReceiverSocket != null && !audioReceiverSocket!!.isClosed) {
                     try {

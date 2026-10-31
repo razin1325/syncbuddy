@@ -33,7 +33,7 @@ class AudioCaptureService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_DATA = "data"
         const val AUDIO_STREAM_PORT = 8945
-        const val SAMPLE_RATE = 16000
+        const val SAMPLE_RATE = 44100
         const val AUDIO_BUFFER_SIZE = 1024
 
         @Volatile
@@ -45,8 +45,6 @@ class AudioCaptureService : Service() {
 
         @Volatile
         var activeProjectionData: Intent? = null
-
-        val knownPeerIps = mutableSetOf<String>()
     }
 
     private var mediaProjection: MediaProjection? = null
@@ -131,8 +129,8 @@ class AudioCaptureService : Service() {
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
 
-            // Try sample rates: 16000, 44100, 48000
-            val candidateRates = intArrayOf(SAMPLE_RATE, 44100, 48000)
+            // Try native 44100 first, fallback to 48000
+            val candidateRates = intArrayOf(SAMPLE_RATE, 48000)
             var initializedRecord: AudioRecord? = null
 
             for (sr in candidateRates) {
@@ -193,7 +191,7 @@ class AudioCaptureService : Service() {
                             val read = audioRecord?.read(pcm, 0, pcm.size) ?: -1
                             if (read > 0) {
                                 System.arraycopy(pcm, 0, packetBuf, 4, read)
-                                val targets = getBroadcastTargets()
+                                val targets = SyncNetworkModule.getBroadcastTargets()
                                 for (target in targets) {
                                     try {
                                         val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
@@ -212,38 +210,6 @@ class AudioCaptureService : Service() {
             android.util.Log.e("AudioCaptureService", "Error during startCapture", t)
             stopSelf()
         }
-    }
-
-    private fun getBroadcastTargets(): List<InetAddress> {
-        val targets = mutableListOf<InetAddress>()
-        try {
-            targets.add(InetAddress.getByName("255.255.255.255"))
-        } catch (e: Exception) {}
-
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces != null && interfaces.hasMoreElements()) {
-                val iface = interfaces.nextElement()
-                if (iface.isLoopback || !iface.isUp) continue
-                for (ia in iface.interfaceAddresses) {
-                    val bcast = ia.broadcast
-                    if (bcast != null && !targets.contains(bcast)) {
-                        targets.add(bcast)
-                    }
-                }
-            }
-        } catch (e: Exception) {}
-
-        for (peerIp in knownPeerIps) {
-            try {
-                val addr = InetAddress.getByName(peerIp)
-                if (!targets.contains(addr)) {
-                    targets.add(addr)
-                }
-            } catch (e: Exception) {}
-        }
-
-        return targets
     }
 
     override fun onDestroy() {
