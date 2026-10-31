@@ -16,7 +16,6 @@ class MainActivity : ReactActivity() {
     companion object {
         const val MEDIA_PROJECTION_REQUEST = 9001
 
-        // Held by SyncNetworkModule to resolve the JS promise after user allows/denies
         @Volatile
         var pendingProjectionPromise: Promise? = null
 
@@ -39,14 +38,18 @@ class MainActivity : ReactActivity() {
         super.onDestroy()
     }
 
-    /**
-     * Called by SyncNetworkModule to launch the system MediaProjection consent dialog.
-     * The user sees "SyncBuddy will start capturing everything on your screen" → Allow.
-     */
     fun requestMediaProjection(promise: Promise) {
         pendingProjectionPromise = promise
-        val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        startActivityForResult(projectionManager.createScreenCaptureIntent(), MEDIA_PROJECTION_REQUEST)
+        try {
+            val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
+            if (projectionManager != null) {
+                startActivityForResult(projectionManager.createScreenCaptureIntent(), MEDIA_PROJECTION_REQUEST)
+            } else {
+                promise.reject("ERR_PROJECTION", "MediaProjectionManager is unavailable")
+            }
+        } catch (e: Exception) {
+            promise.reject("ERR_PROJECTION_INIT", e.message)
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -57,18 +60,25 @@ class MainActivity : ReactActivity() {
             pendingProjectionPromise = null
 
             if (resultCode == Activity.RESULT_OK && data != null) {
-                // Start the AudioCaptureService foreground service with the projection token
-                val serviceIntent = Intent(this, com.syncbuddy.network.AudioCaptureService::class.java).apply {
-                    putExtra(com.syncbuddy.network.AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
-                    putExtra(com.syncbuddy.network.AudioCaptureService.EXTRA_DATA, data)
-                }
+                // Pass directly to the companion object to bypass Intent parcelable limits on Android 14
+                com.syncbuddy.network.AudioCaptureService.activeProjectionResultCode = resultCode
+                com.syncbuddy.network.AudioCaptureService.activeProjectionData = data
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(serviceIntent)
-                } else {
-                    startService(serviceIntent)
+                try {
+                    val serviceIntent = Intent(this, com.syncbuddy.network.AudioCaptureService::class.java).apply {
+                        putExtra(com.syncbuddy.network.AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(serviceIntent)
+                    } else {
+                        startService(serviceIntent)
+                    }
+                    promise?.resolve(true)
+                } catch (e: Exception) {
+                    android.util.Log.e("MainActivity", "Failed to start AudioCaptureService", e)
+                    promise?.reject("ERR_START_SERVICE", e.message)
                 }
-                promise?.resolve(true)
             } else {
                 promise?.reject("DENIED", "ইউজার অডিও ক্যাপচার অনুমতি দেননি")
             }

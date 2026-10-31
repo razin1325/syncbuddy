@@ -17,21 +17,13 @@ import androidx.core.app.NotificationCompat
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.net.Inet4Address
 import java.net.NetworkInterface
 
 /**
  * AudioCaptureService
  *
- * A foreground service that captures all internal/system audio output
- * (Spotify, YouTube, any music player) using Android 10's AudioPlaybackCapture API,
- * and broadcasts it over LAN via UDP to all connected listeners.
- *
- * Flow:
- * 1. User taps "Start Live Audio Broadcast" in the app
- * 2. Android shows a MediaProjection consent dialog ("Allow SyncBuddy to record?")
- * 3. User taps "Allow" → service starts, captures system audio, streams over UDP
- * 4. All listeners on same Wi-Fi/Hotspot hear the host's music in real time
+ * Foreground service capturing internal audio (Spotify, YouTube, etc.)
+ * using Android 10+ AudioPlaybackCapture API and broadcasting over UDP.
  */
 class AudioCaptureService : Service() {
 
@@ -48,7 +40,12 @@ class AudioCaptureService : Service() {
         var isCapturing = false
             private set
 
-        // Peers to broadcast to (shared with SyncNetworkModule)
+        @Volatile
+        var activeProjectionResultCode: Int = 0
+
+        @Volatile
+        var activeProjectionData: Intent? = null
+
         val knownPeerIps = mutableSetOf<String>()
     }
 
@@ -64,53 +61,64 @@ class AudioCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent == null) {
+        try {
+            // 1. Immediately start as foreground to avoid Android 14 ANR / FGS crash
+            val notification = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+
+            // 2. Retrieve MediaProjection token from memory or intent
+            val resultCode = if (activeProjectionResultCode != 0) activeProjectionResultCode else intent?.getIntExtra(EXTRA_RESULT_CODE, -1) ?: -1
+            val data = activeProjectionData ?: intent?.let {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    it.getParcelableExtra(EXTRA_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    it.getParcelableExtra(EXTRA_DATA)
+                }
+            }
+
+            if (resultCode == -1 || data == null) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+
+            val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
+            if (projectionManager == null) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+
+            mediaProjection = projectionManager.getMediaProjection(resultCode, data)
+            if (mediaProjection == null) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+
+            startCapture()
+            return START_STICKY
+        } catch (t: Throwable) {
+            android.util.Log.e("AudioCaptureService", "Fatal error in onStartCommand", t)
             stopSelf()
             return START_NOT_STICKY
         }
-
-        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
-        val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(EXTRA_DATA)
-        }
-
-        if (resultCode == -1 || data == null) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
-        // Start as foreground immediately (Android requires this within 5 seconds)
-        val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
-
-        // Get MediaProjection from the result
-        val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = projectionManager.getMediaProjection(resultCode, data)
-
-        if (mediaProjection == null) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
-        startCapture()
-        return START_STICKY
     }
 
     private fun startCapture() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            // AudioPlaybackCapture requires Android 10+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || mediaProjection == null) {
             stopSelf()
             return
         }
 
         try {
+            // Register mandatory callback on Android 14+
             mediaProjection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
                     stopSelf()
@@ -123,36 +131,55 @@ class AudioCaptureService : Service() {
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
 
-            val minBuf = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
+            // Try sample rates: 16000, 44100, 48000
+            val candidateRates = intArrayOf(SAMPLE_RATE, 44100, 48000)
+            var initializedRecord: AudioRecord? = null
 
-            audioRecord = AudioRecord.Builder()
-                .setAudioPlaybackCaptureConfig(config)
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setSampleRate(SAMPLE_RATE)
-                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            for (sr in candidateRates) {
+                try {
+                    val minBuf = AudioRecord.getMinBufferSize(
+                        sr,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT
+                    )
+                    if (minBuf <= 0) continue
+
+                    val rec = AudioRecord.Builder()
+                        .setAudioPlaybackCaptureConfig(config)
+                        .setAudioFormat(
+                            AudioFormat.Builder()
+                                .setSampleRate(sr)
+                                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .build()
+                        )
+                        .setBufferSizeInBytes(Math.max(minBuf, AUDIO_BUFFER_SIZE * 4))
                         .build()
-                )
-                .setBufferSizeInBytes(Math.max(minBuf, AUDIO_BUFFER_SIZE * 4))
-                .build()
 
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                    if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                        initializedRecord = rec
+                        break
+                    } else {
+                        rec.release()
+                    }
+                } catch (e: Exception) {
+                    // Try next
+                }
+            }
+
+            if (initializedRecord == null) {
+                android.util.Log.e("AudioCaptureService", "Could not initialize AudioRecord for AudioPlaybackCapture")
                 stopSelf()
                 return
             }
 
+            audioRecord = initializedRecord
             audioRecord?.startRecording()
             isCapturing = true
 
             captureThread = Thread {
                 val pcm = ByteArray(AUDIO_BUFFER_SIZE)
                 val packetBuf = ByteArray(AUDIO_BUFFER_SIZE + 4)
-                // SyncBuddy UDP header: "SBUD"
                 packetBuf[0] = 'S'.code.toByte()
                 packetBuf[1] = 'B'.code.toByte()
                 packetBuf[2] = 'U'.code.toByte()
@@ -163,7 +190,7 @@ class AudioCaptureService : Service() {
                         sendSocket.broadcast = true
 
                         while (isCapturing && audioRecord != null) {
-                            val read = audioRecord!!.read(pcm, 0, pcm.size)
+                            val read = audioRecord?.read(pcm, 0, pcm.size) ?: -1
                             if (read > 0) {
                                 System.arraycopy(pcm, 0, packetBuf, 4, read)
                                 val targets = getBroadcastTargets()
@@ -171,7 +198,7 @@ class AudioCaptureService : Service() {
                                     try {
                                         val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
                                         sendSocket.send(packet)
-                                    } catch (e: Exception) { /* ignore send errors */ }
+                                    } catch (e: Exception) {}
                                 }
                             }
                         }
@@ -181,9 +208,8 @@ class AudioCaptureService : Service() {
                 }
             }
             captureThread?.start()
-
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (t: Throwable) {
+            android.util.Log.e("AudioCaptureService", "Error during startCapture", t)
             stopSelf()
         }
     }
@@ -208,7 +234,6 @@ class AudioCaptureService : Service() {
             }
         } catch (e: Exception) {}
 
-        // Also send directly to known peers (bypasses router AP isolation)
         for (peerIp in knownPeerIps) {
             try {
                 val addr = InetAddress.getByName(peerIp)
@@ -223,6 +248,9 @@ class AudioCaptureService : Service() {
 
     override fun onDestroy() {
         isCapturing = false
+        activeProjectionData = null
+        activeProjectionResultCode = 0
+
         try {
             audioRecord?.stop()
             audioRecord?.release()
@@ -240,28 +268,33 @@ class AudioCaptureService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "SyncBuddy Audio Broadcast",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "লাইভ অডিও ব্রডকাস্ট চলছে"
-                setShowBadge(false)
+            try {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "SyncBuddy Audio Broadcast",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "লাইভ অডিও ব্রডকাস্ট চলছে"
+                    setShowBadge(false)
+                }
+                val manager = getSystemService(NotificationManager::class.java)
+                manager?.createNotificationChannel(channel)
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
         }
     }
 
     private fun buildNotification(): Notification {
+        // Guaranteed valid small icon from applicationInfo to prevent BadForegroundServiceNotificationException
+        val iconRes = applicationInfo.icon.takeIf { it != 0 } ?: android.R.drawable.sym_def_app_icon
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("SyncBuddy • লাইভ অডিও ব্রডকাস্ট")
             .setContentText("আপনার ফোনের মিউজিক সবার হেডফোনে স্ট্রিম হচ্ছে")
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(iconRes)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
     }
 }
-
