@@ -1,11 +1,11 @@
 /**
  * SyncBuddy — Futuristic Offline Audio Sync & Walkie-Talkie Suite
  *
- * Architecture:
- *   ├── Page 1: 📱 Devices (BLE Hardware Manager, On-Demand 10s Scan, Real Battery)
- *   ├── Page 2: 📡 Host Room (Create Room, 6-digit Code, Vector QR, Music Visualizer)
- *   ├── Page 3: 🎧 Join Room (Enter Code, QR Scan, Synced Headphone Audio)
- *   └── Page 4: 📻 Walkie-Talkie (Push-To-Talk PTT, Ultra-low Latency Voice)
+ * Real Offline LAN Peer-to-Peer System (Zero Internet Needed):
+ *   ├── Page 1: 📡 Host Room (Local HTTP/TCP Server, ISO QR Code, Live Participants Sync)
+ *   ├── Page 2: 🎧 Join Room (LAN Auto-Discovery, One-Tap Join, Real-Time Audio Sync)
+ *   ├── Page 3: 📻 Walkie-Talkie (Real-time PTT Voice & Channel Relay)
+ *   └── Page 4: 📱 Devices (BLE Hardware Manager, On-Demand 10s Scan, Real Battery)
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -22,8 +22,6 @@ import {
   Platform,
   Modal,
   Animated,
-  Linking,
-  NativeEventEmitter,
   PermissionsAndroid,
 } from 'react-native';
 import {
@@ -32,10 +30,20 @@ import {
   createBluetoothStateEmitter,
   BT_EVENTS,
 } from './NativeBluetooth';
+import {
+  NativeNetwork,
+  NetworkInfo,
+  Participant,
+  DiscoveredRoom,
+  ListenerJoinedEvent,
+  ListenerLeftEvent,
+  PttMessageEvent,
+} from './NativeNetwork';
+import { generateQRMatrix } from './QRCodeGenerator';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type NavigationPage = 'devices' | 'host' | 'join' | 'walkie';
+export type NavigationPage = 'host' | 'join' | 'walkie' | 'devices';
 export type DeviceType = 'Audio' | 'Wearable' | 'Computer' | 'IoT Sensor' | 'Peripheral';
 export type DeviceStatus = 'Broadcasting' | 'Connected' | 'Connecting' | 'Paired' | 'Available';
 export type FilterTab = 'All' | 'Connected' | 'Paired' | 'Audio' | 'Wearables';
@@ -106,54 +114,44 @@ function getSignalInfo(rssi: number) {
   return { label: 'Weak', color: '#EF4444', dots: '•○○○' };
 }
 
-// ─── Pure Vector Futuristic QR Code Generator ─────────────────────────────────
-// Generates a crisp, deterministic 15x15 vector QR matrix for any room code
-// Uses 100% native <View> components - 0 extra packages, 100% EAS build safe!
+// ─── Real Scannable ISO QR Code Matrix Component ─────────────────────────────
+// Generates a true ISO/IEC 18004 QR bitmap using standard pure TypeScript engine.
+// Readable by any camera, Google Lens, or barcode scanner!
 
-const QRMatrix: React.FC<{ code: string; size?: number }> = ({ code, size = 180 }) => {
-  // Deterministic 15x15 pseudo QR matrix based on hash of code
+const RealQRMatrix: React.FC<{ value: string; size?: number }> = ({ value, size = 200 }) => {
   const matrix = React.useMemo(() => {
-    let hash = 0;
-    for (let i = 0; i < code.length; i++) {
-      hash = (hash << 5) - hash + code.charCodeAt(i);
-      hash |= 0;
+    try {
+      return generateQRMatrix(value);
+    } catch {
+      return [];
     }
-    const grid: boolean[][] = [];
-    for (let r = 0; r < 15; r++) {
-      grid[r] = [];
-      for (let c = 0; c < 15; c++) {
-        // Corner alignment boxes (standard QR pattern)
-        const inTopLeft = r <= 4 && c <= 4;
-        const inTopRight = r <= 4 && c >= 10;
-        const inBottomLeft = r >= 10 && c <= 4;
-        if (inTopLeft || inTopRight || inBottomLeft) {
-          const isBorder = r === 0 || r === 4 || c === 0 || c === 4 || r === 10 || r === 14 || c === 10 || c === 14;
-          const isCenter = (r === 2 && (c === 2 || c === 12)) || (r === 12 && c === 2);
-          grid[r][c] = isBorder || isCenter;
-        } else {
-          // Inner data pattern
-          const bit = Math.abs((hash ^ (r * 31 + c * 17)) % 7);
-          grid[r][c] = bit === 0 || bit === 2 || bit === 4;
-        }
-      }
-    }
-    return grid;
-  }, [code]);
+  }, [value]);
 
-  const cellSize = size / 15;
+  if (!matrix.length) {
+    return (
+      <View style={[qrS.box, { width: size + 20, height: size + 20 }]}>
+        <ActivityIndicator color="#06B6D4" />
+      </View>
+    );
+  }
+
+  const count = matrix.length;
+  // Use integer module sizing to prevent any subpixel seams or gaps!
+  const cellSize = Math.max(3, Math.floor(size / count));
+  const actualSize = cellSize * count;
 
   return (
-    <View style={[qrS.box, { width: size + 20, height: size + 20 }]}>
-      <View style={{ width: size, height: size, backgroundColor: '#FFFFFF', padding: 2, borderRadius: 8 }}>
+    <View style={[qrS.box, { width: actualSize + 20, height: actualSize + 20 }]}>
+      <View style={{ width: actualSize, height: actualSize, backgroundColor: '#FFFFFF' }}>
         {matrix.map((row, rIdx) => (
-          <View key={rIdx} style={{ flexDirection: 'row' }}>
+          <View key={rIdx} style={{ flexDirection: 'row', height: cellSize }}>
             {row.map((cell, cIdx) => (
               <View
                 key={cIdx}
                 style={{
                   width: cellSize,
                   height: cellSize,
-                  backgroundColor: cell ? '#050811' : '#FFFFFF',
+                  backgroundColor: cell ? '#000000' : '#FFFFFF',
                 }}
               />
             ))}
@@ -166,9 +164,9 @@ const QRMatrix: React.FC<{ code: string; size?: number }> = ({ code, size = 180 
 
 const qrS = StyleSheet.create({
   box: {
-    backgroundColor: '#0E1726',
-    borderRadius: 16,
-    borderWidth: 1.5,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    borderWidth: 2,
     borderColor: '#06B6D4',
     padding: 10,
     alignItems: 'center',
@@ -180,8 +178,14 @@ const qrS = StyleSheet.create({
 // ─── Main Application ─────────────────────────────────────────────────────────
 
 export default function App(): React.JSX.Element {
-  // Navigation State (4 Dedicated Pages)
+  // Navigation State
   const [activePage, setActivePage] = useState<NavigationPage>('host');
+
+  // Network & LAN Peer-to-Peer State
+  const [networkInfo, setNetworkInfo] = useState<NetworkInfo | null>(null);
+  const [hostParticipants, setHostParticipants] = useState<Participant[]>([]);
+  const [discoveredRooms, setDiscoveredRooms] = useState<DiscoveredRoom[]>([]);
+  const [deviceId] = useState<string>(() => 'dev_' + Math.random().toString(36).substring(2, 8));
 
   // Bluetooth & Hardware State
   const [btEnabled, setBtEnabled] = useState<boolean>(true);
@@ -192,28 +196,39 @@ export default function App(): React.JSX.Element {
   const [selectedFilter, setSelectedFilter] = useState<FilterTab>('All');
   const [toast, setToast] = useState<{ msg: string; type: 'info' | 'success' | 'warn' | 'error' } | null>(null);
 
-  // Host Room State
-  const [roomCode, setRoomCode] = useState<string>('SYNC-8942');
+  // Host Room State (Pure 4-digit Room Number, no letters)
+  const [roomCode, setRoomCode] = useState<string>(() =>
+    Math.floor(1000 + Math.random() * 9000).toString(),
+  );
   const [isHostBroadcasting, setIsHostBroadcasting] = useState<boolean>(false);
   const [activeTrack, setActiveTrack] = useState<AudioTrack>(AUDIO_TRACKS[0]);
   const [masterVolume, setMasterVolume] = useState<number>(85);
   const [broadcastElapsed, setBroadcastElapsed] = useState<number>(0);
 
-  // Join Room State
+  // Join Room State (Listener)
   const [inputRoomCode, setInputRoomCode] = useState<string>('');
-  const [joinedRoom, setJoinedRoom] = useState<string | null>(null);
+  const [inputHostIp, setInputHostIp] = useState<string>('');
+  const [joinedRoom, setJoinedRoom] = useState<{ code: string; hostName: string; hostIp: string; participantsCount: number } | null>(null);
   const [listenerVolume, setListenerVolume] = useState<number>(80);
   const [showQRScanner, setShowQRScanner] = useState<boolean>(false);
+  const [isJoining, setIsJoining] = useState<boolean>(false);
+  const [joinFeedback, setJoinFeedback] = useState<{
+    type: 'warn' | 'error';
+    message: string;
+    suggestedRoom?: DiscoveredRoom;
+  } | null>(null);
 
-  // Walkie-Talkie (PTT) State
+  // Walkie-Talkie (PTT) State (Unified Room Voice, No Channels)
   const [isTalking, setIsTalking] = useState<boolean>(false);
-  const [talkChannel, setTalkChannel] = useState<number>(1);
   const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
 
   // Refs & Timers
   const toastTimer = useRef<any>(null);
   const scanTimer = useRef<any>(null);
   const hostTimer = useRef<any>(null);
+  const heartbeatTimer = useRef<any>(null);
+  const netPollTimer = useRef<any>(null);
+
   const pttPulse = useRef(new Animated.Value(1)).current;
   const waveAnim1 = useRef(new Animated.Value(0.3)).current;
   const waveAnim2 = useRef(new Animated.Value(0.7)).current;
@@ -224,26 +239,154 @@ export default function App(): React.JSX.Element {
     (msg: string, type: 'info' | 'success' | 'warn' | 'error' = 'info') => {
       if (toastTimer.current) clearTimeout(toastTimer.current);
       setToast({ msg, type });
-      toastTimer.current = setTimeout(() => setToast(null), 3500);
+      toastTimer.current = setTimeout(() => setToast(null), 3800);
     },
     [],
   );
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 1. Initial Hardware Setup & Permissions
+  // 1. Network Detection & Periodic Poller
+  // ─────────────────────────────────────────────────────────────────────────────
+  const refreshNetworkInfo = useCallback(async () => {
+    try {
+      const info = await NativeNetwork.getNetworkInfo();
+      setNetworkInfo(info);
+    } catch { }
+  }, []);
+
+  useEffect(() => {
+    refreshNetworkInfo();
+    netPollTimer.current = setInterval(refreshNetworkInfo, 4000);
+    return () => {
+      if (netPollTimer.current) clearInterval(netPollTimer.current);
+    };
+  }, [refreshNetworkInfo]);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 2. Host Local Server Management (Real Port 8942)
+  // ─────────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (activePage === 'host') {
+      // Start Host Server on port 8942
+      NativeNetwork.startRoomServer(roomCode, 8942)
+        .then(() => {
+          NativeNetwork.getParticipants().then(setHostParticipants).catch(() => { });
+        })
+        .catch(() => { });
+    }
+  }, [activePage, roomCode]);
+
+  // Listen to Host Events (Listener Joined / Left / PTT)
+  useEffect(() => {
+    const subJoined = NativeNetwork.onListenerJoined((e: ListenerJoinedEvent) => {
+      showToast(`🔔 ${e.name} (${e.ip}) রুমে যুক্ত হয়েছে!`, 'success');
+      NativeNetwork.getParticipants().then(setHostParticipants).catch(() => { });
+    });
+
+    const subLeft = NativeNetwork.onListenerLeft((e: ListenerLeftEvent) => {
+      showToast(`ℹ️ ${e.name} রুম থেকে বের হয়েছে`, 'info');
+      NativeNetwork.getParticipants().then(setHostParticipants).catch(() => { });
+    });
+
+    const subPtt = NativeNetwork.onPttMessage((e: PttMessageEvent) => {
+      if (e.isTalking) {
+        setActiveSpeaker(e.speakerName);
+      } else {
+        setActiveSpeaker(null);
+      }
+    });
+
+    return () => {
+      subJoined?.remove();
+      subLeft?.remove();
+      subPtt?.remove();
+    };
+  }, [showToast]);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 3. Listener LAN Auto-Discovery (Port 8943 UDP Beacons)
+  // ─────────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (activePage === 'join') {
+      NativeNetwork.startDiscovery().catch(() => { });
+
+      const subDiscover = NativeNetwork.onRoomDiscovered((r: DiscoveredRoom) => {
+        // Never discover self: check deviceId, IP, roomCode, and deviceName
+        if (r.deviceId && r.deviceId === deviceId) {
+          return;
+        }
+        if (networkInfo?.ipAddress && r.hostIp === networkInfo.ipAddress) {
+          return;
+        }
+        if (r.roomCode === roomCode) {
+          return;
+        }
+        if (networkInfo?.deviceName && r.hostName === networkInfo.deviceName) {
+          return;
+        }
+
+        setDiscoveredRooms(prev => {
+          const exists = prev.some(item => item.hostIp === r.hostIp && item.roomCode === r.roomCode);
+          if (exists) return prev;
+          showToast(`🌟 লোকাল রুমে পাওয়া গেছে: ${r.hostName} (#${r.roomCode})!`, 'info');
+          return [...prev, { ...r, lastDiscovered: Date.now() }];
+        });
+      });
+
+      return () => {
+        subDiscover?.remove();
+        NativeNetwork.stopDiscovery().catch(() => { });
+      };
+    }
+  }, [activePage, showToast]);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 4. Unified Audio Receiver (Runs for Host & Listener whenever in room or on Walkie-Talkie)
+  // ─────────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const shouldReceiveAudio = !!joinedRoom || isHostBroadcasting || activePage === 'walkie' || hostParticipants.length > 0;
+    if (shouldReceiveAudio) {
+      NativeNetwork.startAudioReceiver().catch(() => {});
+    } else {
+      NativeNetwork.stopAudioReceiver().catch(() => {});
+    }
+  }, [joinedRoom, isHostBroadcasting, activePage, hostParticipants.length]);
+
+  // Listener Heartbeat Polling Loop
+  useEffect(() => {
+    if (joinedRoom && joinedRoom.hostIp) {
+      heartbeatTimer.current = setInterval(async () => {
+        try {
+          const res = await NativeNetwork.sendHeartbeat(joinedRoom.hostIp, 8942, deviceId);
+          setJoinedRoom(prev => (prev ? { ...prev, participantsCount: res.participantsCount } : null));
+        } catch {
+          // Host unreachable
+        }
+      }, 2500);
+    } else {
+      if (heartbeatTimer.current) clearInterval(heartbeatTimer.current);
+    }
+    return () => {
+      if (heartbeatTimer.current) clearInterval(heartbeatTimer.current);
+    };
+  }, [joinedRoom, deviceId]);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 5. Initial Hardware Setup & Bluetooth Permissions
   // ─────────────────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (Platform.OS === 'android') {
       const initAndroid = async () => {
         try {
+          const reqs = [PermissionsAndroid.PERMISSIONS.RECORD_AUDIO];
           if (typeof Platform.Version === 'number' && Platform.Version >= 31) {
-            await PermissionsAndroid.requestMultiple([
+            reqs.push(
               PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
               PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-              PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-            ]);
+            );
           }
-        } catch {}
+          await PermissionsAndroid.requestMultiple(reqs);
+        } catch { }
 
         try {
           const enabled = await NativeBluetooth.isBluetoothEnabled();
@@ -265,7 +408,7 @@ export default function App(): React.JSX.Element {
             }));
             setDevices(mapped);
           }
-        } catch {}
+        } catch { }
       };
 
       initAndroid();
@@ -301,13 +444,13 @@ export default function App(): React.JSX.Element {
             );
           },
         );
-      } catch {}
+      } catch { }
 
       return () => {
         try {
           subState?.remove();
           subConn?.remove();
-        } catch {}
+        } catch { }
       };
     }
   }, [showToast]);
@@ -325,7 +468,7 @@ export default function App(): React.JSX.Element {
     };
   }, [isHostBroadcasting]);
 
-  // PTT Waveform Loop
+  // PTT Waveform Animation
   useEffect(() => {
     if (isTalking) {
       Animated.loop(
@@ -357,7 +500,7 @@ export default function App(): React.JSX.Element {
   }, [isTalking, pttPulse, waveAnim1, waveAnim2, waveAnim3, waveAnim4]);
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 2. Battery-Safe On-Demand Bluetooth Scanner (10s Auto-Stop)
+  // 6. Bluetooth Scanner & Hardware Actions
   // ─────────────────────────────────────────────────────────────────────────────
   const handleStartScan = async () => {
     if (!btEnabled) {
@@ -370,7 +513,6 @@ export default function App(): React.JSX.Element {
     setScanCountdown(10);
     showToast('১০ সেকেন্ডের জন্য স্ক্যান চলছে (ব্যাটারি সেভিং মোড)...', 'info');
 
-    // Countdown interval
     if (scanTimer.current) clearInterval(scanTimer.current);
     scanTimer.current = setInterval(() => {
       setScanCountdown(prev => {
@@ -384,7 +526,6 @@ export default function App(): React.JSX.Element {
       });
     }, 1000);
 
-    // Hardware query on Android
     if (Platform.OS === 'android') {
       try {
         const bonded = await NativeBluetooth.getBondedDevices();
@@ -403,13 +544,10 @@ export default function App(): React.JSX.Element {
           }));
           setDevices(mapped);
         }
-      } catch {}
+      } catch { }
     }
   };
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 3. Connect & Verify Hardware (No Fake Connection)
-  // ─────────────────────────────────────────────────────────────────────────────
   const handleConnectDevice = async (device: BluetoothDevice) => {
     showToast(`${device.name}-এর সাথে কানেক্ট করার চেষ্টা করা হচ্ছে...`, 'info');
     setDevices(prev =>
@@ -440,7 +578,6 @@ export default function App(): React.JSX.Element {
           return;
         }
 
-        // Poll for 3 seconds
         let verifiedConnected = false;
         for (let i = 0; i < 3; i++) {
           await new Promise(r => setTimeout(r, 1000));
@@ -479,63 +616,300 @@ export default function App(): React.JSX.Element {
   };
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 4. Host Room & Join Room Logic
+  // 7. Host Room & Join Room Real Network Actions
   // ─────────────────────────────────────────────────────────────────────────────
   const generateNewRoomCode = () => {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let code = 'SYNC-';
-    for (let i = 0; i < 4; i++) {
-      code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
+    // Pure 4 numeric digits: 1000 - 9999 (No letters)
+    const code = Math.floor(1000 + Math.random() * 9000).toString();
     setRoomCode(code);
-    showToast(`নতুন রুম কোড তৈরি হয়েছে: ${code}`, 'success');
+    NativeNetwork.startRoomServer(code, 8942).catch(() => { });
+    showToast(`নতুন ৪ ডিজিটের রুম নম্বর: #${code}`, 'success');
   };
 
   const handleToggleHostBroadcast = () => {
     const next = !isHostBroadcasting;
     setIsHostBroadcasting(next);
+    NativeNetwork.updateBroadcastState(next, activeTrack.title, masterVolume).catch(() => {});
+
     if (next) {
-      showToast(`রুম ${roomCode} লাইভ ব্রডকাস্ট শুরু হয়েছে!`, 'success');
+      // Start transmitting real audio (mic or synth music) to all listeners!
+      NativeNetwork.startAudioBroadcaster(activeTrack.source).catch(() => {});
+      showToast(`রুম #${roomCode} লাইভ ব্রডকাস্ট শুরু হয়েছে!`, 'success');
       if (Platform.OS === 'android') {
         NativeAuracast.startBroadcast(roomCode).catch(() => {});
       }
     } else {
+      NativeNetwork.stopAudioBroadcaster().catch(() => {});
       showToast('ব্রডকাস্ট বন্ধ করা হয়েছে', 'info');
     }
   };
 
-  const handleJoinRoom = () => {
-    const target = inputRoomCode.trim().toUpperCase();
-    if (!target) {
-      showToast('রুম কোড লিখুন', 'warn');
+  // Join Room over Real Local Network
+  const handleJoinHost = async (targetIp: string, targetPort: number = 8942, codeToVerify?: string) => {
+    if (!targetIp || targetIp.trim().length === 0) {
+      setJoinFeedback({
+        type: 'warn',
+        message: 'অনুগ্রহ করে হোস্টের ৪-ডিজিটের রুম নম্বর বা IP লিখুন।',
+      });
+      showToast('হোস্টের IP অ্যাড্রেস লিখুন', 'warn');
       return;
     }
-    setJoinedRoom(target);
-    showToast(`সফলভাবে রুম ${target}-এ যুক্ত হয়েছেন! লাইভ অডিও রিসিভ হচ্ছে।`, 'success');
+
+    // Never join own phone's room!
+    if (networkInfo?.ipAddress && targetIp.trim() === networkInfo.ipAddress.trim()) {
+      setJoinFeedback({
+        type: 'warn',
+        message: 'এটি আপনার নিজের ফোন! অন্য কোনো ফোনের রুমে যুক্ত হোন।',
+      });
+      showToast('⚠️ এটি আপনার নিজের ফোন! অন্য কোনো ফোনের রুমে যুক্ত হোন।', 'warn');
+      return;
+    }
+
+    // Never join own phone's room!
+    if (networkInfo?.ipAddress && targetIp.trim() === networkInfo.ipAddress.trim()) {
+      showToast('⚠️ এটি আপনার নিজের ফোন! অন্য কোনো ফোনের রুমে যুক্ত হোন।', 'warn');
+      return;
+    }
+
+    setIsJoining(true);
+    showToast(`হোস্টে সংযোগ খোঁজা হচ্ছে...`, 'info');
+
+    try {
+      const myName = networkInfo?.deviceName || 'SyncBuddy Listener';
+      const res = await NativeNetwork.joinRoom(targetIp.trim(), targetPort, myName, deviceId, codeToVerify);
+
+      if (res.success === false) {
+        if (res.reason === 'ROOM_CODE_MISMATCH') {
+          setJoinFeedback({
+            type: 'error',
+            message: 'রুম কোডটি মেলেনি! হোস্টের স্ক্রিনে থাকা ৪-ডিজিট কোডটি দেখে আবার চেষ্টা করুন।',
+          });
+          showToast('🔐 রুম কোড মেলেনি! হোস্টের কোডটি মিলিয়ে নিন।', 'warn');
+        } else {
+          setJoinFeedback({
+            type: 'error',
+            message: res.message || 'রুমে যুক্ত হওয়া সম্ভব হয়নি।',
+          });
+          showToast(res.message || 'হোস্টে কানেক্ট করা সম্ভব হয়নি', 'warn');
+        }
+        return;
+      }
+
+      setJoinFeedback(null);
+      setJoinedRoom({
+        code: res.roomCode || codeToVerify || '0000',
+        hostName: res.hostName || 'Host Phone',
+        hostIp: targetIp.trim(),
+        participantsCount: res.participantsCount || 2,
+      });
+
+      showToast(`✅ ${res.hostName || 'হোস্ট'} এর রুমে সফলভাবে যুক্ত হয়েছেন!`, 'success');
+    } catch (e: any) {
+      setJoinFeedback({
+        type: 'warn',
+        message: 'হোস্ট পাওয়া যায়নি। উভয় ফোন একই Wi-Fi বা অফলাইন Hotspot-এ আছেন কি না নিশ্চিত করুন।',
+      });
+      showToast('🔍 হোস্টের সন্ধান পাওয়া যায়নি। একই Wi-Fi/হটস্পটে আছেন কি?', 'warn');
+    } finally {
+      setIsJoining(false);
+    }
   };
 
-  const handleLeaveRoom = () => {
+  const handleQrScanResult = (raw: string) => {
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+
+    // 1. If it's a URL like http://192.168.0.103:8942/join?c=7636
+    if (trimmed.includes('://')) {
+      try {
+        const urlMatch = trimmed.match(/https?:\/\/([^:/]+)(?::(\d+))?/);
+        if (urlMatch) {
+          const ip = urlMatch[1];
+          const port = urlMatch[2] ? parseInt(urlMatch[2], 10) : 8942;
+          const codeMatch = trimmed.match(/[?&]c=([0-9a-zA-Z]+)/);
+          const scannedCode = codeMatch ? codeMatch[1] : undefined;
+          if (scannedCode) setInputRoomCode(scannedCode);
+          handleJoinHost(ip, port, scannedCode);
+          return;
+        }
+      } catch {}
+    }
+
+    // 2. Format: SYNCBUDDY:IP:PORT:CODE
+    if (trimmed.startsWith('SYNCBUDDY:')) {
+      const parts = trimmed.substring('SYNCBUDDY:'.length).split(':');
+      if (parts.length >= 2) {
+        const ip = parts[0];
+        const port = parseInt(parts[1], 10) || 8942;
+        const code = parts[2];
+        if (code) setInputRoomCode(code);
+        handleJoinHost(ip, port, code);
+        return;
+      }
+    }
+
+    // 2. If it's an IP:Port like 192.168.0.103:8942 or 192.168.0.103
+    if (trimmed.includes('.')) {
+      const parts = trimmed.split(':');
+      const ip = parts[0];
+      const port = parts[1] ? parseInt(parts[1], 10) : 8942;
+      handleJoinHost(ip, port);
+      return;
+    }
+
+    // 3. If it's a 4-digit code (e.g. 7636)
+    if (/^\d{4}$/.test(trimmed)) {
+      setInputRoomCode(trimmed);
+      const matched = otherDiscoveredRooms.find(r => r.roomCode === trimmed);
+      if (matched) {
+        handleJoinHost(matched.hostIp, matched.port, trimmed);
+        return;
+      }
+    }
+
+    showToast(`স্ক্যান করা ডাটা: ${trimmed}`, 'info');
+  };
+
+  const handleOpenQrScanner = async () => {
+    try {
+      const scanned = await NativeNetwork.openCameraScanner();
+      if (scanned) {
+        showToast('QR কোড সফলভাবে স্ক্যান হয়েছে!', 'success');
+        handleQrScanResult(scanned);
+      }
+    } catch (err: any) {
+      const msg = err?.message || '';
+      if (err?.code !== 'CANCELLED' && !msg.toLowerCase().includes('cancel')) {
+        setShowQRScanner(true);
+        showToast('ক্যামেরা ওপেন করা যায়নি, সরাসরি কোড বা IP লিখুন', 'info');
+      }
+    }
+  };
+
+  const handleManualJoin = () => {
+    const target = (inputRoomCode || inputHostIp).trim();
+    if (!target) {
+      setJoinFeedback({
+        type: 'warn',
+        message: 'অনুগ্রহ করে ৪-ডিজিটের রুম নম্বর অথবা হোস্টের IP লিখুন।',
+      });
+      showToast('হোস্টের ৪-ডিজিটের রুম নম্বর লিখুন', 'warn');
+      return;
+    }
+
+    // 1. If entered an IP address (contains '.')
+    if (target.includes('.')) {
+      handleJoinHost(target);
+      return;
+    }
+
+    // 2. Check if entered 4-digit code matches an auto-discovered room on LAN
+    const matched = otherDiscoveredRooms.find(r => r.roomCode === target);
+    if (matched) {
+      handleJoinHost(matched.hostIp, matched.port, target);
+      return;
+    }
+
+    // 3. If there is an active room on LAN, but user typed a DIFFERENT 4-digit number:
+    if (otherDiscoveredRooms.length > 0) {
+      const topRoom = otherDiscoveredRooms[0];
+      setJoinFeedback({
+        type: 'warn',
+        message: `রুম #${target} পাওয়া যায়নি। কাছাকাছি পাওয়া সক্রিয় রুম হলো #${topRoom.roomCode} (${topRoom.hostName})।`,
+        suggestedRoom: topRoom,
+      });
+      showToast(`🔍 রুম #${target} পাওয়া যায়নি! হোস্টের কোড মিলিয়ে দেখুন।`, 'warn');
+      return;
+    }
+
+    // 4. If connected to Hotspot, try gateway IP (usually .1) with the typed room code
+    if (networkInfo?.ipAddress) {
+      const parts = networkInfo.ipAddress.split('.');
+      if (parts.length === 4) {
+        const defaultHostIp = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
+        handleJoinHost(defaultHostIp, 8942, target);
+        return;
+      }
+    }
+
+    // 5. Professional friendly fallback message
+    setJoinFeedback({
+      type: 'warn',
+      message: `রুম #${target} লোকাল নেটওয়ার্কে পাওয়া যায়নি। হোস্টের স্ক্রিন দেখে কোডটি আবার লিখুন।`,
+    });
+    showToast(`🔍 রুম #${target} সক্রিয় নেই। হোস্টের স্ক্রিন চেক করুন।`, 'warn');
+  };
+
+  const handleLeaveRoom = async () => {
+    if (joinedRoom) {
+      try {
+        await NativeNetwork.leaveRoom(joinedRoom.hostIp, 8942, deviceId);
+      } catch { }
+    }
     setJoinedRoom(null);
     setInputRoomCode('');
+    setInputHostIp('');
     showToast('রুম ত্যাগ করা হয়েছে', 'info');
   };
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 5. Walkie-Talkie (PTT) Logic
+  // 8. Walkie-Talkie (PTT) Unified Room Broadcast
   // ─────────────────────────────────────────────────────────────────────────────
-  const handlePttPressIn = () => {
-    setIsTalking(true);
-    setActiveSpeaker('You (Transmitting)');
-    showToast('🔴 কথা বলুন... সবাই শুনছে!', 'info');
+  const handlePttPressIn = async () => {
+    try {
+      if (Platform.OS === 'android') {
+        const hasMic = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+        if (!hasMic) {
+          const res = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+          if (res !== PermissionsAndroid.RESULTS.GRANTED) {
+            showToast('মাইক্রোফোন পারমিশন প্রয়োজন!', 'error');
+            return;
+          }
+        }
+      }
+
+      setIsTalking(true);
+      const myName = networkInfo?.deviceName || 'This Phone';
+      setActiveSpeaker(`${myName} (You)`);
+      showToast('🎙️ কথা বলুন... সবাই শুনছে!', 'info');
+
+      // 1. Start real low-latency microphone voice stream over UDP
+      await NativeNetwork.startAudioBroadcaster('mic');
+
+      // 2. Instant UDP PTT signaling broadcast
+      NativeNetwork.broadcastPtt(myName, true).catch(() => {});
+
+      // 3. If joined to a host, also send HTTP POST relay
+      if (joinedRoom && joinedRoom.hostIp) {
+        NativeNetwork.sendPttMessage(joinedRoom.hostIp, 8942, myName, true).catch(() => {});
+      }
+    } catch (err: any) {
+      setIsTalking(false);
+      showToast(`মাইক শুরু করতে সমস্যা: ${err?.message || ''}`, 'error');
+    }
   };
 
-  const handlePttPressOut = () => {
+  const handlePttPressOut = async () => {
     setIsTalking(false);
     setActiveSpeaker(null);
+    const myName = networkInfo?.deviceName || 'This Phone';
+
+    try {
+      // 1. Stop microphone streaming
+      await NativeNetwork.stopAudioBroadcaster();
+
+      // 2. Instant UDP PTT signaling release
+      NativeNetwork.broadcastPtt(myName, false).catch(() => {});
+
+      // 3. If joined to a host, also send HTTP POST relay
+      if (joinedRoom && joinedRoom.hostIp) {
+        NativeNetwork.sendPttMessage(joinedRoom.hostIp, 8942, myName, false).catch(() => {});
+      }
+    } catch {}
   };
 
   // Helpers
-  const connectedCount = devices.filter(d => d.status === 'Connected' || d.status === 'Broadcasting').length;
+  const connectedCount = hostParticipants.length + 1; // +1 for host itself
   const formatTime = (s: number) => {
     const m = Math.floor(s / 60);
     const sec = s % 60;
@@ -554,11 +928,24 @@ export default function App(): React.JSX.Element {
     return true;
   });
 
+  // Host QR Payload: Real scannable URL containing IP and Room Code
+  const hostIp = networkInfo?.ipAddress || '192.168.43.1';
+  const qrPayload = `http://${hostIp}:8942/join?c=${roomCode}`;
+
+  // Filter out self room so device never shows or connects to itself!
+  const otherDiscoveredRooms = discoveredRooms.filter(r => {
+    if (r.deviceId && r.deviceId === deviceId) return false;
+    if (networkInfo?.ipAddress && r.hostIp === networkInfo.ipAddress) return false;
+    if (r.roomCode === roomCode) return false;
+    if (networkInfo?.deviceName && r.hostName === networkInfo.deviceName) return false;
+    return true;
+  });
+
   return (
     <SafeAreaView style={styles.root}>
       <StatusBar barStyle="light-content" backgroundColor="#050811" />
 
-      {/* ── Toast Notification Banner ── */}
+      {/* ── Toast Notification ── */}
       {toast && (
         <View
           style={[
@@ -571,32 +958,72 @@ export default function App(): React.JSX.Element {
         </View>
       )}
 
-      {/* ── Futuristic Header ── */}
+      {/* ── Header ── */}
       <View style={styles.header}>
         <View>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-            <Text style={styles.appTitle}>SyncBuddy</Text>
+            <Text style={styles.appTitle}>SYNCBUDDY</Text>
             <View style={styles.proPill}>
-              <Text style={styles.proPillText}>V2 CYBER</Text>
+              <Text style={styles.proPillText}>v2.0 P2P</Text>
             </View>
           </View>
-          <Text style={styles.appSub}>Offline Multi-Audio &amp; Walkie-Talkie</Text>
+          <Text style={styles.subTitle}>Offline Audio Sync & Walkie-Talkie</Text>
         </View>
 
-        {/* Real-time BT Status Badge */}
+        {/* Real Network Status Badge */}
         <TouchableOpacity
-          style={[styles.btBadge, btEnabled ? styles.btBadgeOn : styles.btBadgeOff]}
-          onPress={() => setBtEnabled(!btEnabled)}>
-          <Text style={[styles.btBadgeText, btEnabled ? styles.btBadgeTextOn : styles.btBadgeTextOff]}>
-            {btEnabled ? '● BT ACTIVE' : '✕ BT OFF'}
+          style={[styles.netBadge, networkInfo?.hasNetwork ? styles.netBadgeOn : styles.netBadgeOff]}
+          onPress={refreshNetworkInfo}>
+          <Text style={[styles.netBadgeText, networkInfo?.hasNetwork ? styles.netBadgeTextOn : styles.netBadgeTextOff]}>
+            {networkInfo?.hasNetwork
+              ? `● ${networkInfo.isHotspot ? 'HOTSPOT' : 'WI-FI'}`
+              : '✕ OFFLINE'}
           </Text>
         </TouchableOpacity>
       </View>
 
+      {/* ── Offline Network Warning & Hotspot Prompt ── */}
+      {networkInfo && !networkInfo.hasNetwork && (
+        <View style={styles.netWarningBox}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+            <Text style={{ fontSize: 18 }}>⚠️</Text>
+            <Text style={styles.netWarningTitle}>কোনো অফলাইন নেটওয়ার্ক সক্রিয় নেই!</Text>
+          </View>
+          <Text style={styles.netWarningText}>
+            অফলাইনে গান ও কথা শেয়ার করতে নিচের যেকোনো একটি করুন:{'\n'}
+            ১. এই ফোনের Personal Hotspot চালু করুন (অন্য ফোন এতে কানেক্ট হবে){'\n'}
+            অথবা ২. একই Wi-Fi / অন্য ফোনের Hotspot-এ কানেক্ট করুন।
+          </Text>
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
+            <TouchableOpacity
+              style={styles.netActionBtn}
+              onPress={() => NativeNetwork.openHotspotSettings()}>
+              <Text style={styles.netActionBtnText}>⚙️ Hotspot অন করুন</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.netActionBtn, { backgroundColor: '#1E293B' }]}
+              onPress={() => NativeNetwork.openWifiSettings()}>
+              <Text style={styles.netActionBtnText}>📶 Wi-Fi সেটিংস</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {/* ── Active Network Info Strip ── */}
+      {networkInfo && networkInfo.hasNetwork && (
+        <View style={styles.netStatusStrip}>
+          <View style={styles.netStatusDot} />
+          <Text style={styles.netStatusText}>
+            {networkInfo.isHotspot ? 'মোবাইল হটস্পট' : 'লোকাল Wi-Fi'}: {networkInfo.ipAddress}:8942
+          </Text>
+          <Text style={styles.netDeviceName}>({networkInfo.deviceName})</Text>
+        </View>
+      )}
+
       {/* ── Main Page Content ── */}
       <ScrollView contentContainerStyle={styles.scrollBody} showsVerticalScrollIndicator={false}>
         {/* ═══════════════════════════════════════════════════════════════════
-            PAGE 1: 📡 HOST ROOM (CREATE ROOM + QR CODE + AUDIO BROADCAST)
+            PAGE 1: 📡 HOST ROOM (REAL HTTP SERVER + PARTICIPANTS LIST)
         ═══════════════════════════════════════════════════════════════════ */}
         {activePage === 'host' && (
           <View style={styles.pageContainer}>
@@ -608,30 +1035,31 @@ export default function App(): React.JSX.Element {
                   <Text style={styles.roomCodeTitle}>{roomCode}</Text>
                 </View>
                 <TouchableOpacity style={styles.regenBtn} onPress={generateNewRoomCode}>
-                  <Text style={styles.regenBtnText}>⚡ New Code</Text>
+                  <Text style={styles.regenBtnText}>⚡ নতুন কোড</Text>
                 </TouchableOpacity>
               </View>
 
               <Text style={styles.cardDesc}>
-                বন্ধুরা তাদের SyncBuddy অ্যাপে নিচের QR কোডটি স্ক্যান করে অথবা ৬ ডিজিটের কোড দিয়ে যুক্ত হতে পারবে।
+                অন্য ফোন থেকে নিচের ৪-ডিজিটের রুম নম্বর ({roomCode}) লিখুন অথবা ক্যামেরা দিয়ে QR কোডটি স্ক্যান করে যুক্ত হোন।
               </Text>
 
-              {/* Vector QR Code */}
+              {/* Real Standard ISO/IEC 18004 Scannable QR Code */}
               <View style={{ alignItems: 'center', marginVertical: 14 }}>
-                <QRMatrix code={roomCode} size={170} />
-                <Text style={styles.qrHint}>📱 বন্ধুদের স্ক্যান করতে বলুন (Zero Internet)</Text>
+                <RealQRMatrix value={qrPayload} size={180} />
+                <Text style={styles.qrHint}>📱 যেকোনো ক্যামেরা বা SyncBuddy দিয়ে স্ক্যান করুন</Text>
+                <Text style={styles.qrSubHint}>হোস্ট সার্ভার: {hostIp}:8942 (Zero Internet)</Text>
               </View>
 
-              {/* Live Connected Listeners Counter */}
+              {/* Real Live Connected Listeners Counter */}
               <View style={styles.listenerCounterRow}>
                 <View style={styles.listenerNumberBox}>
-                  <Text style={styles.listenerNumber}>{connectedCount > 0 ? connectedCount : 1}</Text>
+                  <Text style={styles.listenerNumber}>{connectedCount}</Text>
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.listenerTitle}>
                     {connectedCount > 1
-                      ? `${connectedCount} Headphones Synced`
-                      : '1 Headphone Receiving Stream'}
+                      ? `${connectedCount} জন ডিভাইসে অডিও সিঙ্ক হচ্ছে`
+                      : '১ জন (আপনি / হোস্ট)'}
                   </Text>
                   <Text style={styles.listenerSub}>
                     {isHostBroadcasting ? '● অডিও লাইভ ব্রডকাস্ট হচ্ছে' : '○ ব্রডকাস্ট শুরু করতে নিচের বাটনে চাপ দিন'}
@@ -656,12 +1084,57 @@ export default function App(): React.JSX.Element {
               )}
             </View>
 
+            {/* ── Real Connected Participants List on Host ── */}
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>
+                👥 সংযুক্ত ডিভাইসসমূহ ({connectedCount} জন)
+              </Text>
+              <Text style={styles.cardDesc}>
+                যেসব ফোন আপনার রুমে যুক্ত হয়েছে তাদের তালিকা নিচে লাইভ দেখতে পাবেন:
+              </Text>
+
+              {/* Host Phone */}
+              <View style={styles.participantItem}>
+                <Text style={{ fontSize: 20, marginRight: 10 }}>👑</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.participantName}>
+                    {networkInfo?.deviceName || 'This Phone'} (হোস্ট / আপনি)
+                  </Text>
+                  <Text style={styles.participantMeta}>IP: {hostIp}:8942 • প্রধান ব্রডকাস্টার</Text>
+                </View>
+                <View style={styles.hostBadge}>
+                  <Text style={styles.hostBadgeText}>HOST</Text>
+                </View>
+              </View>
+
+              {/* Connected Listeners */}
+              {hostParticipants.map((p, idx) => (
+                <View key={p.id || idx} style={styles.participantItem}>
+                  <Text style={{ fontSize: 20, marginRight: 10 }}>📱</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.participantName}>{p.name}</Text>
+                    <Text style={styles.participantMeta}>IP: {p.ip} • হেডফোনে লাইভ সিঙ্ক</Text>
+                  </View>
+                  <View style={styles.syncedBadge}>
+                    <Text style={styles.syncedBadgeText}>● SYNCED</Text>
+                  </View>
+                </View>
+              ))}
+
+              {hostParticipants.length === 0 && (
+                <View style={styles.noParticipantsBox}>
+                  <Text style={styles.noParticipantsText}>
+                    এখনো কোনো লিসেনার যুক্ত হয়নি। অন্য ফোনে &quot;Join Room&quot; ওপেন করুন!
+                  </Text>
+                </View>
+              )}
+            </View>
+
             {/* Audio Stream Source & Animated Visualizer */}
             <View style={styles.card}>
               <View style={styles.cardHeaderRow}>
                 <Text style={styles.sectionTitle}>Audio Stream Source</Text>
                 {isHostBroadcasting && (
-                  /* Audio Visualizer Waves */
                   <View style={styles.visualizerRow}>
                     <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim1 }] }]} />
                     <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim2 }] }]} />
@@ -679,6 +1152,10 @@ export default function App(): React.JSX.Element {
                     style={[styles.trackItem, isSelected && styles.trackItemActive]}
                     onPress={() => {
                       setActiveTrack(t);
+                      NativeNetwork.updateBroadcastState(isHostBroadcasting, t.title, masterVolume).catch(() => {});
+                      if (isHostBroadcasting) {
+                        NativeNetwork.startAudioBroadcaster(t.source).catch(() => {});
+                      }
                       showToast(`সোর্স নির্বাচিত: ${t.title}`, 'info');
                     }}>
                     <Text style={{ fontSize: 20, marginRight: 10 }}>
@@ -702,7 +1179,11 @@ export default function App(): React.JSX.Element {
                 <View style={styles.volControlRow}>
                   <TouchableOpacity
                     style={styles.volBtn}
-                    onPress={() => setMasterVolume(v => Math.max(0, v - 5))}>
+                    onPress={() => {
+                      const v = Math.max(0, masterVolume - 5);
+                      setMasterVolume(v);
+                      NativeNetwork.updateBroadcastState(isHostBroadcasting, activeTrack.title, v).catch(() => { });
+                    }}>
                     <Text style={styles.volBtnText}>−</Text>
                   </TouchableOpacity>
                   <View style={styles.volTrack}>
@@ -710,7 +1191,11 @@ export default function App(): React.JSX.Element {
                   </View>
                   <TouchableOpacity
                     style={styles.volBtn}
-                    onPress={() => setMasterVolume(v => Math.min(100, v + 5))}>
+                    onPress={() => {
+                      const v = Math.min(100, masterVolume + 5);
+                      setMasterVolume(v);
+                      NativeNetwork.updateBroadcastState(isHostBroadcasting, activeTrack.title, v).catch(() => { });
+                    }}>
                     <Text style={styles.volBtnText}>+</Text>
                   </TouchableOpacity>
                 </View>
@@ -720,7 +1205,7 @@ export default function App(): React.JSX.Element {
         )}
 
         {/* ═══════════════════════════════════════════════════════════════════
-            PAGE 2: 🎧 JOIN ROOM (LISTENER EXPERIENCE)
+            PAGE 2: 🎧 JOIN ROOM (REAL P2P LISTENER)
         ═══════════════════════════════════════════════════════════════════ */}
         {activePage === 'join' && (
           <View style={styles.pageContainer}>
@@ -730,9 +1215,21 @@ export default function App(): React.JSX.Element {
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 12 }}>
                   <View style={styles.liveGreenDot} />
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.joinedTitle}>Connected to {joinedRoom}</Text>
-                    <Text style={styles.joinedSub}>রিয়েল-টাইম অডিও আপনার হেডফোনে রিসিভ হচ্ছে</Text>
+                    <Text style={styles.joinedTitle}>Connected to {joinedRoom.hostName}</Text>
+                    <Text style={styles.joinedSub}>
+                      রুম কোড: {joinedRoom.code} • হোস্ট IP: {joinedRoom.hostIp}:8942
+                    </Text>
                   </View>
+                  <View style={styles.syncedBadge}>
+                    <Text style={styles.syncedBadgeText}>● LIVE</Text>
+                  </View>
+                </View>
+
+                {/* Live Participants Indicator */}
+                <View style={styles.listenerStatusRow}>
+                  <Text style={styles.listenerStatusText}>
+                    👥 রুমে মোট {joinedRoom.participantsCount} জন সক্রিয় আছেন
+                  </Text>
                 </View>
 
                 {/* Audio Visualizer */}
@@ -774,24 +1271,93 @@ export default function App(): React.JSX.Element {
               /* Join Form */
               <View style={styles.card}>
                 <Text style={styles.cardBadge}>JOIN BROADCAST ROOM</Text>
-                <Text style={styles.sectionTitle}>রুম কোড দিয়ে যুক্ত হন</Text>
+                <Text style={styles.sectionTitle}>হোস্টের রুমে যুক্ত হন</Text>
                 <Text style={styles.cardDesc}>
-                  হোস্টের স্ক্রিনে থাকা ৬-ডিজিটের রুম কোডটি লিখুন অথবা QR কোড স্ক্যান করুন।
+                  একই Wi-Fi বা অফলাইন Hotspot-এ থাকলে নিচের পাওয়া রুমে এক ক্লিকে যুক্ত হতে পারবেন:
                 </Text>
 
-                {/* Code Input */}
-                <View style={styles.codeRow}>
-                  <TextInput
-                    style={styles.codeInput}
-                    placeholder="SYNC-8942"
-                    placeholderTextColor="#64748B"
-                    value={inputRoomCode}
-                    onChangeText={setInputRoomCode}
-                    autoCapitalize="characters"
-                  />
-                  <TouchableOpacity style={styles.joinActionBtn} onPress={handleJoinRoom}>
-                    <Text style={styles.joinActionBtnText}>যুক্ত হন</Text>
-                  </TouchableOpacity>
+                {/* ── Auto-Discovered Other Rooms on LAN ── */}
+                {otherDiscoveredRooms.length > 0 && (
+                  <View style={styles.discoveredContainer}>
+                    <Text style={styles.discoveredHeader}>🌟 অফলাইনে সক্রিয় রুম পাওয়া গেছে:</Text>
+                    {otherDiscoveredRooms.map((r, idx) => (
+                      <TouchableOpacity
+                        key={idx}
+                        style={styles.discoveredItem}
+                        disabled={isJoining}
+                        onPress={() => handleJoinHost(r.hostIp, r.port)}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.discoveredTitle}>{r.hostName}</Text>
+                          <Text style={styles.discoveredMeta}>
+                            কোড: #{r.roomCode} • IP: {r.hostIp}:{r.port}
+                          </Text>
+                        </View>
+                        <View style={styles.quickJoinBtn}>
+                          <Text style={styles.quickJoinBtnText}>যুক্ত হন ⚡</Text>
+                        </View>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                )}
+
+                {/* 4-Digit Room Code or Host IP Input */}
+                <View style={{ marginTop: 12 }}>
+                  <Text style={styles.inputLabel}>হোস্টের ৪-ডিজিটের রুম নম্বর বা IP লিখুন:</Text>
+                  <View style={styles.codeRow}>
+                    <TextInput
+                      style={[
+                        styles.codeInput,
+                        joinFeedback?.type === 'error' && { borderColor: '#EF4444' },
+                        joinFeedback?.type === 'warn' && { borderColor: '#F59E0B' },
+                      ]}
+                      placeholder="৪-ডিজিট কোড (উদা: 8942)"
+                      placeholderTextColor="#64748B"
+                      value={inputRoomCode}
+                      onChangeText={val => {
+                        setInputRoomCode(val);
+                        if (joinFeedback) setJoinFeedback(null);
+                      }}
+                      keyboardType="numeric"
+                      maxLength={16}
+                    />
+                    <TouchableOpacity
+                      style={styles.joinActionBtn}
+                      disabled={isJoining}
+                      onPress={handleManualJoin}>
+                      {isJoining ? (
+                        <ActivityIndicator color="#050811" size="small" />
+                      ) : (
+                        <Text style={styles.joinActionBtnText}>যুক্ত হন</Text>
+                      )}
+                    </TouchableOpacity>
+                  </View>
+
+                  {/* Professional In-Line Helper & Guidance Card */}
+                  {joinFeedback && (
+                    <View style={[styles.feedbackCard, joinFeedback.type === 'error' && { borderColor: '#EF4444', backgroundColor: 'rgba(239,68,68,0.08)' }]}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                        <Text style={{ fontSize: 14 }}>{joinFeedback.type === 'error' ? '🔐' : '💡'}</Text>
+                        <Text style={[styles.feedbackTitle, joinFeedback.type === 'error' && { color: '#EF4444' }]}>
+                          {joinFeedback.type === 'error' ? 'রুম কোড মেলেনি' : 'কোড চেক করুন'}
+                        </Text>
+                      </View>
+                      <Text style={styles.feedbackText}>{joinFeedback.message}</Text>
+                      {joinFeedback.suggestedRoom && (
+                        <TouchableOpacity
+                          style={styles.suggestionBtn}
+                          onPress={() => {
+                            const sug = joinFeedback.suggestedRoom!;
+                            setInputRoomCode(sug.roomCode);
+                            setJoinFeedback(null);
+                            handleJoinHost(sug.hostIp, sug.port, sug.roomCode);
+                          }}>
+                          <Text style={styles.suggestionBtnText}>
+                            ⚡ {joinFeedback.suggestedRoom.hostName} (#{joinFeedback.suggestedRoom.roomCode})-এ যুক্ত হোন
+                          </Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  )}
                 </View>
 
                 {/* Divider */}
@@ -801,14 +1367,12 @@ export default function App(): React.JSX.Element {
                   <View style={styles.dividerLine} />
                 </View>
 
-                {/* QR Scanner Launcher */}
+                {/* Real Camera QR Scanner Launcher */}
                 <TouchableOpacity
                   style={styles.qrScanBtn}
-                  onPress={() => {
-                    setShowQRScanner(true);
-                  }}>
+                  onPress={handleOpenQrScanner}>
                   <Text style={{ fontSize: 22, marginRight: 8 }}>📷</Text>
-                  <Text style={styles.qrScanBtnText}>হোস্টের QR কোড স্ক্যান করুন</Text>
+                  <Text style={styles.qrScanBtnText}>ক্যামেরা দিয়ে QR কোড স্ক্যান করুন</Text>
                 </TouchableOpacity>
               </View>
             )}
@@ -817,7 +1381,7 @@ export default function App(): React.JSX.Element {
             <View style={styles.tipBox}>
               <Text style={styles.tipTitle}>💡 কীভাবে কাজ করে?</Text>
               <Text style={styles.tipText}>
-                ১. হোস্টের ফোনের সাথে একই অফলাইন হটস্পটে কানেক্ট থাকুন।{'\n'}
+                ১. হোস্টের ফোনের সাথে একই অফলাইন হটস্পট বা Wi-Fi তে কানেক্ট থাকুন।{'\n'}
                 ২. কানে ব্লুটুথ হেডফোন বা তারের ইয়ারফোন লাগিয়ে রাখুন।{'\n'}
                 ৩. হোস্টের সব গান বা কথা সরাসরি আপনার হেডফোনে লাইভ বাজবে!
               </Text>
@@ -826,35 +1390,64 @@ export default function App(): React.JSX.Element {
         )}
 
         {/* ═══════════════════════════════════════════════════════════════════
-            PAGE 3: 📻 WALKIE-TALKIE (PUSH-TO-TALK PTT)
+            PAGE 3: 📻 WALKIE-TALKIE (UNIFIED ROOM VOICE - NO CHANNELS)
         ═══════════════════════════════════════════════════════════════════ */}
         {activePage === 'walkie' && (
           <View style={styles.pageContainer}>
-            {/* Channel Switcher */}
+            {/* Room Voice Info Card */}
             <View style={styles.card}>
               <View style={styles.cardHeaderRow}>
-                <Text style={styles.cardBadge}>OFFLINE WALKIE-TALKIE</Text>
-                <Text style={styles.channelBadge}>CH {talkChannel} LIVE</Text>
+                <View>
+                  <Text style={styles.cardBadge}>OFFLINE ROOM WALKIE-TALKIE</Text>
+                  <Text style={styles.roomVoiceTitle}>
+                    রুম #{joinedRoom ? joinedRoom.code : roomCode}
+                  </Text>
+                </View>
+                <View style={styles.roomMemberBadge}>
+                  <Text style={styles.roomMemberBadgeText}>
+                    👥 {joinedRoom ? joinedRoom.participantsCount : connectedCount} জন সংযুক্ত
+                  </Text>
+                </View>
               </View>
 
               <Text style={styles.cardDesc}>
-                চ্যানেল নির্বাচন করে নিচে চাপ দিয়ে কথা বলুন। এই চ্যানেলের সবাই আপনার কথা শুনবে।
+                এই রুমে থাকা সবাই একসাথে কথা বলতে ও শুনতে পারবেন। কোনো চ্যানেল পরিবর্তন করতে হবে না।
               </Text>
 
-              <View style={styles.channelPillsRow}>
-                {[1, 2, 3, 4, 5, 6].map(ch => (
-                  <TouchableOpacity
-                    key={ch}
-                    style={[styles.channelPill, talkChannel === ch && styles.channelPillActive]}
-                    onPress={() => {
-                      setTalkChannel(ch);
-                      showToast(`চ্যানেল ${ch}-এ সুইচ করা হয়েছে`, 'info');
-                    }}>
-                    <Text style={[styles.channelPillText, talkChannel === ch && styles.channelPillTextActive]}>
-                      CH {ch}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
+              {/* Live Speaker Transmission Bar */}
+              <View
+                style={[
+                  styles.speakerBanner,
+                  isTalking
+                    ? styles.speakerBannerTalking
+                    : activeSpeaker
+                    ? styles.speakerBannerActive
+                    : styles.speakerBannerIdle,
+                ]}>
+                <Text style={{ fontSize: 24, marginRight: 10 }}>
+                  {isTalking ? '🎙️' : activeSpeaker ? '🔊' : '🟢'}
+                </Text>
+                <View style={{ flex: 1 }}>
+                  <Text
+                    style={[
+                      styles.speakerBannerTitle,
+                      isTalking && { color: '#EF4444' },
+                      activeSpeaker && !isTalking && { color: '#06B6D4' },
+                    ]}>
+                    {isTalking
+                      ? `আপনি কথা বলছেন (${networkInfo?.deviceName || 'This Phone'})`
+                      : activeSpeaker
+                      ? `${activeSpeaker} কথা বলছেন...`
+                      : 'রুম প্রস্তুত • কথা বলতে চেপে ধরুন'}
+                  </Text>
+                  <Text style={styles.speakerBannerSub}>
+                    {isTalking
+                      ? 'রুমের সবাই এখন আপনার কথা লাইভ শুনছে'
+                      : activeSpeaker
+                      ? 'সবাই এখন ওনার কথা শুনছে'
+                      : 'নিচের বড় বাটনে চাপ দিয়ে ধরে কথা বলুন'}
+                  </Text>
+                </View>
               </View>
             </View>
 
@@ -877,16 +1470,20 @@ export default function App(): React.JSX.Element {
                 </TouchableOpacity>
               </Animated.View>
 
-              {/* Status Indicator */}
+              {/* Speaker Phone Name Display */}
               <View style={styles.speakerStatusBox}>
                 <View
                   style={[
                     styles.activeSpeakerDot,
-                    { backgroundColor: isTalking ? '#EF4444' : '#10B981' },
+                    { backgroundColor: isTalking ? '#EF4444' : activeSpeaker ? '#06B6D4' : '#10B981' },
                   ]}
                 />
                 <Text style={styles.speakerStatusText}>
-                  {activeSpeaker || 'চ্যানেল ক্লিয়ার • কথা বলতে চাপুন'}
+                  {isTalking
+                    ? `মাইক্রোফোন সক্রিয়: ${networkInfo?.deviceName || 'This Phone'}`
+                    : activeSpeaker
+                    ? `কথা বলছেন: ${activeSpeaker}`
+                    : 'রুম প্রস্তুত • কথা বলতে বাটন চেপে ধরুন'}
                 </Text>
               </View>
             </View>
@@ -1054,29 +1651,54 @@ export default function App(): React.JSX.Element {
         </TouchableOpacity>
       </View>
 
-      {/* ── QR Scanner Simulator Modal ── */}
+      {/* ── QR Scanner & Quick Join Modal ── */}
       <Modal visible={showQRScanner} transparent animationType="slide">
         <View style={styles.modalBackdrop}>
           <View style={styles.qrModalCard}>
             <Text style={{ fontSize: 36, marginBottom: 8 }}>📷</Text>
-            <Text style={styles.modalTitle}>QR Code Scanner</Text>
-            <Text style={styles.modalSub}>হোস্টের ফোনের QR কোডের দিকে ক্যামেরা তাক করুন</Text>
+            <Text style={styles.modalTitle}>QR Code & Quick Join</Text>
+            <Text style={styles.modalSub}>হোস্টের IP অ্যাড্রেস লিখুন অথবা পাওয়া রুমে ট্যাপ করুন</Text>
 
-            {/* Camera Viewfinder Box */}
-            <View style={styles.viewfinderBox}>
-              <View style={styles.viewfinderCrosshair} />
-              <Text style={{ color: '#06B6D4', fontSize: 12, fontWeight: '700' }}>[ SCANNING READY ]</Text>
-            </View>
+            {otherDiscoveredRooms.length > 0 && (
+              <View style={{ width: '100%', marginBottom: 14 }}>
+                <Text style={{ color: '#06B6D4', fontSize: 12, fontWeight: '700', marginBottom: 6 }}>
+                  অফলাইনে পাওয়া সক্রিয় রুম:
+                </Text>
+                {otherDiscoveredRooms.map((r, i) => (
+                  <TouchableOpacity
+                    key={i}
+                    style={styles.modalRoomPill}
+                    onPress={() => {
+                      setShowQRScanner(false);
+                      handleJoinHost(r.hostIp, r.port);
+                    }}>
+                    <Text style={styles.modalRoomPillText}>
+                      ⚡ {r.hostName} (#{r.roomCode} @ {r.hostIp})
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
+
+            <TextInput
+              style={styles.modalIpInput}
+              placeholder="৪-ডিজিট রুম কোড (উদা: 8942) বা IP"
+              placeholderTextColor="#64748B"
+              value={inputRoomCode || inputHostIp}
+              onChangeText={val => {
+                setInputRoomCode(val);
+                setInputHostIp(val);
+              }}
+              keyboardType="numbers-and-punctuation"
+            />
 
             <TouchableOpacity
               style={styles.modalActionBtn}
               onPress={() => {
-                setInputRoomCode(roomCode);
-                setJoinedRoom(roomCode);
                 setShowQRScanner(false);
-                showToast(`QR কোড সফলভাবে স্ক্যান হয়েছে! রুম: ${roomCode}`, 'success');
+                handleManualJoin();
               }}>
-              <Text style={styles.modalActionBtnText}>⚡ Simulate QR Scan (Code: {roomCode})</Text>
+              <Text style={styles.modalActionBtnText}>⚡ রুমে যুক্ত হোন (Join Host)</Text>
             </TouchableOpacity>
 
             <TouchableOpacity style={styles.modalCloseBtn} onPress={() => setShowQRScanner(false)}>
@@ -1152,28 +1774,98 @@ const styles = StyleSheet.create({
   },
   proPillText: {
     color: '#06B6D4',
-    fontSize: 9.5,
+    fontSize: 10,
     fontWeight: '800',
-    letterSpacing: 0.5,
   },
-  appSub: {
-    fontSize: 11.5,
+  subTitle: {
     color: '#64748B',
+    fontSize: 11,
+    fontWeight: '500',
     marginTop: 1,
   },
-  btBadge: {
+  netBadge: {
     paddingHorizontal: 10,
     paddingVertical: 5,
     borderRadius: 20,
     borderWidth: 1,
   },
-  btBadgeOn: { backgroundColor: 'rgba(16,185,129,0.15)', borderColor: '#10B981' },
-  btBadgeOff: { backgroundColor: 'rgba(239,68,68,0.15)', borderColor: '#EF4444' },
-  btBadgeText: { fontSize: 11, fontWeight: '800' },
-  btBadgeTextOn: { color: '#10B981' },
-  btBadgeTextOff: { color: '#EF4444' },
+  netBadgeOn: {
+    backgroundColor: 'rgba(16,185,129,0.12)',
+    borderColor: '#10B981',
+  },
+  netBadgeOff: {
+    backgroundColor: 'rgba(239,68,68,0.12)',
+    borderColor: '#EF4444',
+  },
+  netBadgeText: {
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  netBadgeTextOn: { color: '#10B981' },
+  netBadgeTextOff: { color: '#EF4444' },
 
-  // Cards
+  // Network Warning Box
+  netWarningBox: {
+    backgroundColor: 'rgba(245,158,11,0.12)',
+    borderWidth: 1.5,
+    borderColor: '#F59E0B',
+    borderRadius: 14,
+    marginHorizontal: 16,
+    marginTop: 10,
+    padding: 14,
+  },
+  netWarningTitle: {
+    color: '#F59E0B',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  netWarningText: {
+    color: '#F8FAFC',
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 2,
+  },
+  netActionBtn: {
+    backgroundColor: '#F59E0B',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  netActionBtnText: {
+    color: '#050811',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  // Active Network Strip
+  netStatusStrip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#0A1220',
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: '#162238',
+  },
+  netStatusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#10B981',
+  },
+  netStatusText: {
+    color: '#06B6D4',
+    fontSize: 12,
+    fontWeight: '700',
+    fontFamily: 'monospace',
+  },
+  netDeviceName: {
+    color: '#64748B',
+    fontSize: 11,
+  },
+
+  // Card
   card: {
     backgroundColor: '#0A101D',
     borderRadius: 16,
@@ -1185,28 +1877,29 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 6,
+    marginBottom: 8,
   },
   cardBadge: {
     color: '#06B6D4',
-    fontSize: 10,
+    fontSize: 10.5,
     fontWeight: '800',
-    letterSpacing: 1,
+    letterSpacing: 1.2,
     textTransform: 'uppercase',
   },
   cardDesc: {
     color: '#94A3B8',
-    fontSize: 12,
-    lineHeight: 17,
-    marginTop: 2,
+    fontSize: 12.5,
+    lineHeight: 18,
     marginBottom: 10,
   },
+
+  // Host Room Styles
   roomCodeTitle: {
     color: '#F8FAFC',
-    fontSize: 26,
+    fontSize: 28,
     fontWeight: '900',
     letterSpacing: 2,
-    marginTop: 2,
+    fontFamily: 'monospace',
   },
   regenBtn: {
     backgroundColor: 'rgba(6,182,212,0.12)',
@@ -1222,41 +1915,46 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   qrHint: {
-    color: '#64748B',
-    fontSize: 11,
+    color: '#06B6D4',
+    fontSize: 12,
+    fontWeight: '700',
     marginTop: 8,
   },
-
-  // Listeners Counter
+  qrSubHint: {
+    color: '#64748B',
+    fontSize: 11,
+    fontFamily: 'monospace',
+    marginTop: 2,
+  },
   listenerCounterRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     backgroundColor: '#0F172A',
-    padding: 12,
     borderRadius: 12,
+    padding: 12,
+    marginBottom: 14,
     borderWidth: 1,
     borderColor: '#1E293B',
-    marginBottom: 14,
   },
   listenerNumberBox: {
     width: 44,
     height: 44,
     borderRadius: 10,
-    backgroundColor: 'rgba(16,185,129,0.15)',
+    backgroundColor: 'rgba(6,182,212,0.15)',
     borderWidth: 1.5,
-    borderColor: '#10B981',
+    borderColor: '#06B6D4',
     alignItems: 'center',
     justifyContent: 'center',
   },
   listenerNumber: {
-    color: '#10B981',
+    color: '#06B6D4',
     fontSize: 20,
     fontWeight: '900',
   },
   listenerTitle: {
     color: '#F8FAFC',
-    fontSize: 13,
+    fontSize: 13.5,
     fontWeight: '700',
   },
   listenerSub: {
@@ -1265,23 +1963,21 @@ const styles = StyleSheet.create({
     marginTop: 1,
   },
   liveTimerBadge: {
-    backgroundColor: '#10B981',
+    backgroundColor: '#EF4444',
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 6,
   },
   liveTimerText: {
-    color: '#000',
+    color: '#fff',
     fontSize: 11,
     fontWeight: '800',
     fontFamily: 'monospace',
   },
-
-  // Buttons
   startBtn: {
     backgroundColor: '#06B6D4',
-    paddingVertical: 14,
-    borderRadius: 12,
+    paddingVertical: 13,
+    borderRadius: 10,
     alignItems: 'center',
   },
   startBtnText: {
@@ -1291,14 +1987,72 @@ const styles = StyleSheet.create({
   },
   stopBtn: {
     backgroundColor: '#EF4444',
-    paddingVertical: 14,
-    borderRadius: 12,
+    paddingVertical: 13,
+    borderRadius: 10,
     alignItems: 'center',
   },
   stopBtnText: {
     color: '#FFFFFF',
     fontSize: 14,
     fontWeight: '800',
+  },
+
+  // Participant List on Host
+  participantItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0F172A',
+    padding: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    marginBottom: 8,
+  },
+  participantName: {
+    color: '#F8FAFC',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  participantMeta: {
+    color: '#64748B',
+    fontSize: 11,
+    fontFamily: 'monospace',
+    marginTop: 1,
+  },
+  hostBadge: {
+    backgroundColor: 'rgba(6,182,212,0.15)',
+    borderWidth: 1,
+    borderColor: '#06B6D4',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  hostBadgeText: {
+    color: '#06B6D4',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  syncedBadge: {
+    backgroundColor: 'rgba(16,185,129,0.15)',
+    borderWidth: 1,
+    borderColor: '#10B981',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  syncedBadgeText: {
+    color: '#10B981',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  noParticipantsBox: {
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  noParticipantsText: {
+    color: '#64748B',
+    fontSize: 12,
+    textAlign: 'center',
   },
 
   // Audio Visualizer
@@ -1398,45 +2152,182 @@ const styles = StyleSheet.create({
   },
   volFill: {
     height: '100%',
-    borderRadius: 4,
   },
 
   // Join Room Styles
+  liveGreenDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#10B981',
+  },
+  joinedTitle: {
+    color: '#10B981',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  joinedSub: {
+    color: '#94A3B8',
+    fontSize: 11.5,
+    marginTop: 2,
+    fontFamily: 'monospace',
+  },
+  listenerStatusRow: {
+    backgroundColor: 'rgba(16,185,129,0.1)',
+    borderRadius: 8,
+    padding: 8,
+    marginVertical: 10,
+  },
+  listenerStatusText: {
+    color: '#10B981',
+    fontSize: 12.5,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  listenerVisualizerBox: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'flex-end',
+    gap: 8,
+    height: 36,
+    backgroundColor: '#0A1E1B',
+    borderRadius: 10,
+    padding: 8,
+  },
+  leaveBtn: {
+    backgroundColor: 'rgba(239,68,68,0.15)',
+    borderWidth: 1,
+    borderColor: '#EF4444',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    marginTop: 14,
+  },
+  leaveBtnText: {
+    color: '#EF4444',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+
+  // Discovered Rooms
+  discoveredContainer: {
+    backgroundColor: '#0F1B2B',
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#06B6D4',
+    marginBottom: 10,
+  },
+  discoveredHeader: {
+    color: '#06B6D4',
+    fontSize: 12.5,
+    fontWeight: '800',
+    marginBottom: 8,
+  },
+  discoveredItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0A1220',
+    padding: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    marginBottom: 6,
+  },
+  discoveredTitle: {
+    color: '#F8FAFC',
+    fontSize: 13.5,
+    fontWeight: '700',
+  },
+  discoveredMeta: {
+    color: '#64748B',
+    fontSize: 11,
+    fontFamily: 'monospace',
+    marginTop: 1,
+  },
+  quickJoinBtn: {
+    backgroundColor: '#06B6D4',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  quickJoinBtnText: {
+    color: '#050811',
+    fontSize: 11.5,
+    fontWeight: '800',
+  },
+
+  // Form Inputs
+  inputLabel: {
+    color: '#94A3B8',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 6,
+  },
   codeRow: {
     flexDirection: 'row',
     gap: 10,
-    marginBottom: 14,
   },
   codeInput: {
     flex: 1,
     backgroundColor: '#0F172A',
     borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    color: '#F8FAFC',
-    fontSize: 16,
-    fontWeight: '800',
-    letterSpacing: 2,
     borderWidth: 1,
     borderColor: '#1E293B',
+    color: '#F8FAFC',
+    fontSize: 14,
+    fontWeight: '700',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontFamily: 'monospace',
   },
   joinActionBtn: {
     backgroundColor: '#06B6D4',
-    paddingHorizontal: 20,
+    paddingHorizontal: 18,
     borderRadius: 10,
     alignItems: 'center',
     justifyContent: 'center',
   },
   joinActionBtnText: {
     color: '#050811',
-    fontSize: 13.5,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  feedbackCard: {
+    backgroundColor: 'rgba(245,158,11,0.08)',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#F59E0B',
+    padding: 12,
+    marginTop: 10,
+  },
+  feedbackTitle: {
+    color: '#F59E0B',
+    fontSize: 12.5,
+    fontWeight: '800',
+  },
+  feedbackText: {
+    color: '#CBD5E1',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  suggestionBtn: {
+    backgroundColor: '#06B6D4',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    marginTop: 8,
+    alignItems: 'center',
+  },
+  suggestionBtnText: {
+    color: '#050811',
+    fontSize: 12,
     fontWeight: '800',
   },
   orDividerRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
-    marginBottom: 14,
+    marginVertical: 14,
   },
   dividerLine: {
     flex: 1,
@@ -1446,6 +2337,8 @@ const styles = StyleSheet.create({
   orText: {
     color: '#64748B',
     fontSize: 11,
+    marginHorizontal: 12,
+    fontWeight: '600',
   },
   qrScanBtn: {
     flexDirection: 'row',
@@ -1455,19 +2348,19 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
     borderColor: '#06B6D4',
     paddingVertical: 12,
-    borderRadius: 12,
+    borderRadius: 10,
   },
   qrScanBtnText: {
     color: '#06B6D4',
-    fontSize: 13.5,
-    fontWeight: '700',
+    fontSize: 13,
+    fontWeight: '800',
   },
   tipBox: {
-    backgroundColor: 'rgba(6,182,212,0.06)',
-    borderRadius: 12,
-    padding: 14,
+    backgroundColor: 'rgba(6,182,212,0.05)',
     borderWidth: 1,
     borderColor: 'rgba(6,182,212,0.2)',
+    borderRadius: 12,
+    padding: 12,
   },
   tipTitle: {
     color: '#06B6D4',
@@ -1480,95 +2373,68 @@ const styles = StyleSheet.create({
     fontSize: 11.5,
     lineHeight: 18,
   },
-  liveGreenDot: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: '#10B981',
-  },
-  joinedTitle: {
-    color: '#F8FAFC',
-    fontSize: 16,
-    fontWeight: '800',
-  },
-  joinedSub: {
-    color: '#6EE7B7',
-    fontSize: 11.5,
-  },
-  listenerVisualizerBox: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'flex-end',
-    gap: 8,
-    height: 40,
-    backgroundColor: '#0A1E1C',
-    borderRadius: 10,
-    padding: 8,
-  },
-  leaveBtn: {
-    marginTop: 14,
-    paddingVertical: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#EF4444',
-    backgroundColor: 'rgba(239,68,68,0.1)',
-    alignItems: 'center',
-  },
-  leaveBtnText: {
-    color: '#EF4444',
-    fontSize: 13,
-    fontWeight: '700',
-  },
 
-  // Walkie-Talkie (PTT)
-  channelBadge: {
-    backgroundColor: 'rgba(239,68,68,0.15)',
-    color: '#EF4444',
-    fontSize: 11,
-    fontWeight: '800',
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#EF4444',
+  // Walkie-Talkie Styles
+  roomVoiceTitle: {
+    color: '#F8FAFC',
+    fontSize: 22,
+    fontWeight: '900',
+    letterSpacing: 0.5,
   },
-  channelPillsRow: {
+  roomMemberBadge: {
+    backgroundColor: 'rgba(6,182,212,0.15)',
+    borderWidth: 1,
+    borderColor: '#06B6D4',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+  },
+  roomMemberBadgeText: {
+    color: '#06B6D4',
+    fontSize: 11.5,
+    fontWeight: '800',
+  },
+  speakerBanner: {
     flexDirection: 'row',
-    gap: 6,
+    alignItems: 'center',
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1.5,
     marginTop: 6,
   },
-  channelPill: {
-    flex: 1,
-    paddingVertical: 8,
-    borderRadius: 8,
+  speakerBannerIdle: {
     backgroundColor: '#0F172A',
-    borderWidth: 1,
     borderColor: '#1E293B',
-    alignItems: 'center',
   },
-  channelPillActive: {
-    backgroundColor: '#EF4444',
+  speakerBannerTalking: {
+    backgroundColor: 'rgba(239,68,68,0.12)',
     borderColor: '#EF4444',
   },
-  channelPillText: {
+  speakerBannerActive: {
+    backgroundColor: 'rgba(6,182,212,0.12)',
+    borderColor: '#06B6D4',
+  },
+  speakerBannerTitle: {
+    color: '#F8FAFC',
+    fontSize: 13.5,
+    fontWeight: '800',
+  },
+  speakerBannerSub: {
     color: '#94A3B8',
     fontSize: 11,
-    fontWeight: '700',
-  },
-  channelPillTextActive: {
-    color: '#FFFFFF',
+    marginTop: 1,
   },
   pttContainer: {
     alignItems: 'center',
-    paddingVertical: 24,
+    paddingVertical: 28,
   },
   pttOuterRing: {
-    width: 220,
-    height: 220,
-    borderRadius: 110,
-    backgroundColor: 'rgba(239,68,68,0.06)',
+    width: 200,
+    height: 200,
+    borderRadius: 100,
+    backgroundColor: 'rgba(6,182,212,0.1)',
     borderWidth: 2,
-    borderColor: '#1E293B',
+    borderColor: 'rgba(6,182,212,0.3)',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1577,34 +2443,33 @@ const styles = StyleSheet.create({
     borderColor: '#EF4444',
   },
   pttButton: {
-    width: 170,
-    height: 170,
-    borderRadius: 85,
-    backgroundColor: '#0F172A',
+    width: 160,
+    height: 160,
+    borderRadius: 80,
+    backgroundColor: '#0A1220',
     borderWidth: 3,
-    borderColor: '#EF4444',
+    borderColor: '#06B6D4',
     alignItems: 'center',
     justifyContent: 'center',
     elevation: 12,
   },
   pttButtonActive: {
     backgroundColor: '#7F1D1D',
-    borderColor: '#F87171',
+    borderColor: '#EF4444',
   },
   pttIcon: {
-    fontSize: 44,
+    fontSize: 38,
     marginBottom: 4,
   },
   pttText: {
     color: '#F8FAFC',
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '900',
     letterSpacing: 1,
   },
   pttSubtext: {
-    color: '#EF4444',
-    fontSize: 11,
-    fontWeight: '600',
+    color: '#64748B',
+    fontSize: 10.5,
     marginTop: 2,
   },
   speakerStatusBox: {
@@ -1612,12 +2477,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 8,
     marginTop: 20,
-    backgroundColor: '#0F172A',
+    backgroundColor: '#0A101D',
     paddingHorizontal: 14,
     paddingVertical: 8,
     borderRadius: 20,
     borderWidth: 1,
-    borderColor: '#1E293B',
+    borderColor: '#162238',
   },
   activeSpeakerDot: {
     width: 8,
@@ -1625,12 +2490,12 @@ const styles = StyleSheet.create({
     borderRadius: 4,
   },
   speakerStatusText: {
-    color: '#CBD5E1',
+    color: '#F8FAFC',
     fontSize: 12,
     fontWeight: '600',
   },
 
-  // Devices & Scanner
+  // Bluetooth Manager Styles
   scanBtn: {
     backgroundColor: '#06B6D4',
     paddingHorizontal: 12,
@@ -1638,11 +2503,11 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   scanBtnActive: {
-    backgroundColor: '#EF4444',
+    backgroundColor: '#3B82F6',
   },
   scanBtnText: {
     color: '#050811',
-    fontSize: 12,
+    fontSize: 11.5,
     fontWeight: '800',
   },
   searchBox: {
@@ -1773,7 +2638,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
 
-  // Futuristic Bottom Navigation
+  // Bottom Navigation
   bottomNav: {
     position: 'absolute',
     bottom: 0,
@@ -1800,24 +2665,23 @@ const styles = StyleSheet.create({
   },
   navIcon: {
     fontSize: 20,
-    marginBottom: 2,
-    opacity: 0.6,
+    opacity: 0.5,
   },
   navIconActive: {
     opacity: 1,
-    transform: [{ scale: 1.1 }],
   },
   navLabel: {
-    color: '#64748B',
     fontSize: 10,
+    color: '#64748B',
     fontWeight: '600',
+    marginTop: 2,
   },
   navLabelActive: {
     color: '#06B6D4',
     fontWeight: '800',
   },
 
-  // Modal Styles
+  // QR Modal
   modalBackdrop: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.85)',
@@ -1827,13 +2691,13 @@ const styles = StyleSheet.create({
   },
   qrModalCard: {
     width: '100%',
-    maxWidth: 360,
+    maxWidth: 340,
     backgroundColor: '#0A101D',
-    borderRadius: 18,
-    borderWidth: 1,
-    borderColor: '#06B6D4',
-    padding: 22,
+    borderRadius: 20,
+    padding: 20,
     alignItems: 'center',
+    borderWidth: 1.5,
+    borderColor: '#06B6D4',
   },
   modalTitle: {
     color: '#F8FAFC',
@@ -1847,23 +2711,32 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 16,
   },
-  viewfinderBox: {
-    width: 180,
-    height: 180,
-    borderRadius: 12,
-    borderWidth: 2,
+  modalRoomPill: {
+    backgroundColor: '#0F1B2B',
+    borderWidth: 1,
     borderColor: '#06B6D4',
-    borderStyle: 'dashed',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(6,182,212,0.04)',
-    marginBottom: 16,
+    borderRadius: 8,
+    padding: 10,
+    marginBottom: 6,
   },
-  viewfinderCrosshair: {
-    width: 60,
-    height: 2,
-    backgroundColor: '#06B6D4',
-    marginBottom: 8,
+  modalRoomPillText: {
+    color: '#06B6D4',
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  modalIpInput: {
+    width: '100%',
+    backgroundColor: '#0F172A',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    color: '#F8FAFC',
+    fontSize: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginBottom: 14,
+    fontFamily: 'monospace',
+    textAlign: 'center',
   },
   modalActionBtn: {
     width: '100%',
@@ -1871,18 +2744,19 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderRadius: 10,
     alignItems: 'center',
-    marginBottom: 8,
+    marginBottom: 10,
   },
   modalActionBtnText: {
     color: '#050811',
-    fontSize: 13,
+    fontSize: 13.5,
     fontWeight: '800',
   },
   modalCloseBtn: {
-    paddingVertical: 6,
+    paddingVertical: 8,
   },
   modalCloseBtnText: {
     color: '#64748B',
-    fontSize: 12,
+    fontSize: 12.5,
+    fontWeight: '600',
   },
 });

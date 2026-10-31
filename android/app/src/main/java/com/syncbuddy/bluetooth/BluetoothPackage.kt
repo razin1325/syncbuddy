@@ -21,7 +21,8 @@ class BluetoothPackage : ReactPackage {
         reactContext: ReactApplicationContext
     ): List<NativeModule> = listOf(
         BluetoothStateModule(reactContext),
-        AuracastModule(reactContext)
+        AuracastModule(reactContext),
+        com.syncbuddy.network.SyncNetworkModule(reactContext)
     )
 
     override fun createViewManagers(
