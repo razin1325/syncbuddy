@@ -5,6 +5,14 @@ module.exports = {
     version: '1.0.0',
     orientation: 'portrait',
     userInterfaceStyle: 'automatic',
+    ios: {
+      bundleIdentifier: 'com.syncbuddy.app',
+      supportsTablet: true,
+      infoPlist: {
+        NSMicrophoneUsageDescription: 'SyncBuddy needs access to the microphone for Walkie-Talkie voice communication.',
+        UIBackgroundModes: ['audio'],
+      },
+    },
     android: {
       package: 'com.syncbuddy',
       adaptiveIcon: {

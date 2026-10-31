@@ -1,0 +1,59 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build iOS IPA (Sideloadable)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install NPM Dependencies
+        run: npm ci || npm install
+
+      - name: Prebuild iOS Native Project
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install
+
+      - name: Build Xcode Archive (Unsigned)
+        run: |
+          cd ios
+          xcodebuild -workspace SyncBuddy.xcworkspace \
+            -scheme SyncBuddy \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath $PWD/build/SyncBuddy.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: Package IPA
+        run: |
+          cd ios/build
+          mkdir -p Payload
+          cp -r SyncBuddy.xcarchive/Products/Applications/SyncBuddy.app Payload/
+          zip -r SyncBuddy-iOS.ipa Payload/
+
+      - name: Upload iOS IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SyncBuddy-iOS-IPA
+          path: ios/build/SyncBuddy-iOS.ipa
+          retention-days: 14
