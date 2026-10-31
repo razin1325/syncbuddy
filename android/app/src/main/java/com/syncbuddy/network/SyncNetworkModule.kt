@@ -1031,12 +1031,6 @@ class SyncNetworkModule(
             promise.reject("ERR_STOP_CAPTURE", e.message)
         }
     }
-                promise.resolve(true)
-            }
-        } catch (e: Exception) {
-            promise.reject("ERR_AUDIO_BROADCAST", e.message)
-        }
-    }
 
     private fun stopAudioBroadcasterInternal() {
         isAudioBroadcasting = false
