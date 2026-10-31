@@ -125,6 +125,43 @@ class SyncNetworkModule(
 
             return targets
         }
+
+        fun getAudioStreamTargets(): List<InetAddress> {
+            val targets = mutableListOf<InetAddress>()
+            // 1. If we have known connected listeners, send UNICAST directly to each listener.
+            // Wi-Fi 802.11 unicast provides hardware ACK, avoids multicast queue drops, and eliminates duplicates.
+            val peers = ArrayList(knownPeerIps)
+            if (peers.isNotEmpty()) {
+                for (peerIp in peers) {
+                    try {
+                        targets.add(InetAddress.getByName(peerIp))
+                    } catch (e: Exception) {}
+                }
+                return targets
+            }
+
+            // 2. If no peers registered yet, broadcast to the local subnet ONLY (never both subnet and 255.255.255.255)
+            try {
+                val interfaces = NetworkInterface.getNetworkInterfaces()
+                while (interfaces != null && interfaces.hasMoreElements()) {
+                    val iface = interfaces.nextElement()
+                    if (iface.isLoopback || !iface.isUp) continue
+                    for (ia in iface.interfaceAddresses) {
+                        val bcast = ia.broadcast
+                        if (bcast != null) {
+                            targets.add(bcast)
+                            return targets
+                        }
+                    }
+                }
+            } catch (e: Exception) {}
+
+            try {
+                targets.add(InetAddress.getByName("255.255.255.255"))
+            } catch (e: Exception) {}
+
+            return targets
+        }
     }
 
     // Audio Receiver & Player State (Plays incoming stream on phone/headphones)
@@ -918,7 +955,8 @@ class SyncNetworkModule(
                 AudioFormat.CHANNEL_OUT_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferCapacity = Math.max(minBuf, AUDIO_BUFFER_SIZE * 8)
+            // Buffer capacity ~50-80ms for ultra low latency without underruns
+            val bufferCapacity = Math.max(minBuf * 2, 4800 * 2)
 
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -953,19 +991,22 @@ class SyncNetworkModule(
             try {
                 audioTrack?.setVolume(AudioTrack.getMaxVolume())
             } catch (e: Exception) {}
-            try {
-                audioTrack?.play()
-            } catch (e: Exception) {}
 
             try { audioReceiverSocket?.close() } catch (e: Exception) {}
             audioReceiverSocket = DatagramSocket(null).apply {
                 reuseAddress = true
+                receiveBufferSize = 65536
                 bind(java.net.InetSocketAddress(AUDIO_STREAM_PORT))
             }
             isAudioReceiverRunning = true
 
             audioReceiverThread = Thread {
-                val buffer = ByteArray(4096)
+                val buffer = ByteArray(2048)
+                var lastPlayedSeq = -1
+                var isPrebuffering = true
+                var prebufferCount = 0
+                val prebufferTarget = 2 // 2 packets = ~20ms cushion before starting playback
+                var lastPacketTime = 0L
 
                 while (isAudioReceiverRunning && audioReceiverSocket != null && !audioReceiverSocket!!.isClosed) {
                     try {
@@ -979,8 +1020,10 @@ class SyncNetworkModule(
                             knownPeerIps.add(senderIp)
                         }
 
-                        if (packet.length > 4 && audioTrack != null) {
-                            if (packet.data[0] == 'S'.code.toByte() &&
+                        val len = packet.length
+                        if (len < 8 || audioTrack == null) {
+                            // Backward compatibility for legacy 4-byte header
+                            if (len > 4 && packet.data[0] == 'S'.code.toByte() &&
                                 packet.data[1] == 'B'.code.toByte() &&
                                 packet.data[2] == 'U'.code.toByte() &&
                                 packet.data[3] == 'D'.code.toByte()
@@ -988,8 +1031,65 @@ class SyncNetworkModule(
                                 if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
                                     try { audioTrack?.play() } catch (e: Exception) {}
                                 }
-                                val pcmLen = packet.length - 4
-                                audioTrack?.write(packet.data, 4, pcmLen)
+                                audioTrack?.write(packet.data, 4, len - 4)
+                            }
+                            continue
+                        }
+
+                        if (packet.data[0] == 'S'.code.toByte() &&
+                            packet.data[1] == 'B'.code.toByte() &&
+                            packet.data[2] == 'U'.code.toByte() &&
+                            packet.data[3] == 'D'.code.toByte()
+                        ) {
+                            val seq = ((packet.data[4].toInt() and 0xFF) shl 8) or (packet.data[5].toInt() and 0xFF)
+                            val now = System.currentTimeMillis()
+
+                            // If stream was silent for > 350ms, re-anchor prebuffer so playback starts cleanly
+                            if (now - lastPacketTime > 350L) {
+                                lastPlayedSeq = -1
+                                isPrebuffering = true
+                                prebufferCount = 0
+                            }
+                            lastPacketTime = now
+
+                            // Duplicate & stale packet filter
+                            if (lastPlayedSeq != -1) {
+                                val diff = (seq - lastPlayedSeq) and 0xFFFF
+                                if (diff == 0 || diff > 32768) {
+                                    // Duplicate or old stale packet -> DROP immediately
+                                    continue
+                                }
+                                if (diff > 1500) {
+                                    // Stream reset or track switch
+                                    lastPlayedSeq = seq
+                                    isPrebuffering = true
+                                    prebufferCount = 0
+                                } else {
+                                    lastPlayedSeq = seq
+                                }
+                            } else {
+                                lastPlayedSeq = seq
+                            }
+
+                            val payloadOffset = 8
+                            val pcmLen = len - payloadOffset
+
+                            if (isPrebuffering) {
+                                try { audioTrack?.write(packet.data, payloadOffset, pcmLen) } catch (e: Exception) {}
+                                prebufferCount++
+                                if (prebufferCount >= prebufferTarget) {
+                                    if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                                        try { audioTrack?.play() } catch (e: Exception) {}
+                                    }
+                                    isPrebuffering = false
+                                }
+                            } else {
+                                if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                                    try { audioTrack?.play() } catch (e: Exception) {}
+                                }
+                                try {
+                                    audioTrack?.write(packet.data, payloadOffset, pcmLen, AudioTrack.WRITE_NON_BLOCKING)
+                                } catch (e: Exception) {}
                             }
                         }
                     } catch (e: Exception) {
@@ -1114,6 +1214,7 @@ class SyncNetworkModule(
             stopAudioBroadcasterInternal()
             acquireMulticastLock()
             isFileBroadcasting = true
+            isFilePaused = false
 
             fileBroadcasterThread = Thread {
                 var extractor: MediaExtractor? = null
@@ -1144,37 +1245,53 @@ class SyncNetworkModule(
 
                     extractor.selectTrack(audioTrackIndex)
                     val mime = format.getString(MediaFormat.KEY_MIME) ?: "audio/mp4a-latm"
-                    val fileSampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else SAMPLE_RATE
-                    val channelCount = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
+                    var fileSampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else SAMPLE_RATE
+                    var channelCount = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
 
                     codec = MediaCodec.createDecoderByType(mime)
                     codec.configure(format, null, null, 0)
                     codec.start()
 
-                    val minBuf = AudioTrack.getMinBufferSize(fileSampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                    val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
                     localTrack = AudioTrack.Builder()
                         .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-                        .setAudioFormat(AudioFormat.Builder().setSampleRate(fileSampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                        .setBufferSizeInBytes(Math.max(minBuf, 8192))
+                        .setAudioFormat(AudioFormat.Builder().setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                        .setBufferSizeInBytes(Math.max(minBuf * 2, 4800 * 2))
                         .setTransferMode(AudioTrack.MODE_STREAM)
                         .build()
                     localTrack.play()
 
-                    val packetBuf = ByteArray(4200)
+                    val packetBuf = ByteArray(968) // 8 byte header + 960 bytes pcm (480 samples = 10ms at 48kHz)
                     packetBuf[0] = 'S'.code.toByte()
                     packetBuf[1] = 'B'.code.toByte()
                     packetBuf[2] = 'U'.code.toByte()
                     packetBuf[3] = 'D'.code.toByte()
+                    packetBuf[6] = 1.toByte() // 1 = music file
+                    packetBuf[7] = 2.toByte() // v2
 
                     DatagramSocket().use { sendSocket ->
                         sendSocket.broadcast = true
                         val info = MediaCodec.BufferInfo()
                         var isEOS = false
 
+                        val chunkSamples = 480 // 10ms at 48kHz
+                        val chunkBytes = ByteArray(chunkSamples * 2)
+                        var leftoverShorts = ShortArray(0)
+
+                        var streamStartTimeNs = 0L
+                        var totalSamplesSent = 0L
+                        var seq = 0
+
                         while (isFileBroadcasting && !isEOS) {
                             while (isFilePaused && isFileBroadcasting) {
-                                Thread.sleep(40)
+                                try { localTrack.pause() } catch (e: Exception) {}
+                                Thread.sleep(30)
+                                if (!isFilePaused) {
+                                    try { localTrack.play() } catch (e: Exception) {}
+                                    streamStartTimeNs = System.nanoTime() - ((totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong())
+                                }
                             }
+
                             val inIdx = codec.dequeueInputBuffer(10000)
                             if (inIdx >= 0) {
                                 val inBuf = codec.getInputBuffer(inIdx)
@@ -1191,44 +1308,129 @@ class SyncNetworkModule(
                             }
 
                             var outIdx = codec.dequeueOutputBuffer(info, 10000)
+                            if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                                val outFmt = codec.outputFormat
+                                if (outFmt.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                                    fileSampleRate = outFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                                }
+                                if (outFmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                                    channelCount = outFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                                }
+                            }
+
                             while (outIdx >= 0 && isFileBroadcasting) {
                                 val outBuf = codec.getOutputBuffer(outIdx)
                                 if (outBuf != null && info.size > 0) {
                                     outBuf.position(info.offset)
                                     outBuf.limit(info.offset + info.size)
-                                    val chunk = ByteArray(info.size)
-                                    outBuf.get(chunk)
 
-                                    val monoBytes: ByteArray
+                                    val rawBytes = ByteArray(info.size)
+                                    outBuf.get(rawBytes)
+
+                                    val totalRawShorts = rawBytes.size / 2
+                                    val monoShorts: ShortArray
+
                                     if (channelCount >= 2) {
-                                        val samples = chunk.size / 4
-                                        monoBytes = ByteArray(samples * 2)
-                                        for (s in 0 until samples) {
-                                            val left = (chunk[s * 4].toInt() and 0xFF) or (chunk[s * 4 + 1].toInt() shl 8)
-                                            val right = (chunk[s * 4 + 2].toInt() and 0xFF) or (chunk[s * 4 + 3].toInt() shl 8)
-                                            val mono = ((left.toShort() + right.toShort()) / 2).toShort()
-                                            monoBytes[s * 2] = (mono.toInt() and 0xFF).toByte()
-                                            monoBytes[s * 2 + 1] = ((mono.toInt() shr 8) and 0xFF).toByte()
+                                        val frames = totalRawShorts / channelCount
+                                        monoShorts = ShortArray(frames)
+                                        for (f in 0 until frames) {
+                                            val leftIdx = (f * channelCount) * 2
+                                            val rightIdx = (f * channelCount + 1) * 2
+                                            val left = ((rawBytes[leftIdx].toInt() and 0xFF) or (rawBytes[leftIdx + 1].toInt() shl 8)).toShort()
+                                            val right = ((rawBytes[rightIdx].toInt() and 0xFF) or (rawBytes[rightIdx + 1].toInt() shl 8)).toShort()
+                                            monoShorts[f] = ((left.toInt() + right.toInt()) / 2).toShort()
                                         }
                                     } else {
-                                        monoBytes = chunk
+                                        monoShorts = ShortArray(totalRawShorts)
+                                        for (s in 0 until totalRawShorts) {
+                                            monoShorts[s] = ((rawBytes[s * 2].toInt() and 0xFF) or (rawBytes[s * 2 + 1].toInt() shl 8)).toShort()
+                                        }
                                     }
 
-                                    try { localTrack.write(monoBytes, 0, monoBytes.size) } catch (e: Exception) {}
+                                    // Resample to standard 48,000 Hz if source rate differs
+                                    val samples48k: ShortArray
+                                    if (fileSampleRate != SAMPLE_RATE && fileSampleRate > 0) {
+                                        val ratio = fileSampleRate.toDouble() / SAMPLE_RATE.toDouble()
+                                        val targetLen = (monoShorts.size / ratio).toInt()
+                                        samples48k = ShortArray(targetLen)
+                                        for (i in 0 until targetLen) {
+                                            val srcPos = i * ratio
+                                            val srcIdx = srcPos.toInt()
+                                            val frac = srcPos - srcIdx
+                                            if (srcIdx + 1 < monoShorts.size) {
+                                                val s0 = monoShorts[srcIdx].toDouble()
+                                                val s1 = monoShorts[srcIdx + 1].toDouble()
+                                                samples48k[i] = (s0 + frac * (s1 - s0)).toInt().coerceIn(-32768, 32767).toShort()
+                                            } else if (srcIdx < monoShorts.size) {
+                                                samples48k[i] = monoShorts[srcIdx]
+                                            }
+                                        }
+                                    } else {
+                                        samples48k = monoShorts
+                                    }
+
+                                    // Combine with leftover from previous iteration
+                                    val combined: ShortArray
+                                    if (leftoverShorts.isNotEmpty()) {
+                                        combined = ShortArray(leftoverShorts.size + samples48k.size)
+                                        System.arraycopy(leftoverShorts, 0, combined, 0, leftoverShorts.size)
+                                        System.arraycopy(samples48k, 0, combined, leftoverShorts.size, samples48k.size)
+                                    } else {
+                                        combined = samples48k
+                                    }
 
                                     var offset = 0
-                                    while (offset < monoBytes.size && isFileBroadcasting) {
-                                        val toSend = Math.min(1024, monoBytes.size - offset)
-                                        System.arraycopy(monoBytes, offset, packetBuf, 4, toSend)
-                                        val targets = getBroadcastTargets()
+                                    while (offset + chunkSamples <= combined.size && isFileBroadcasting) {
+                                        if (streamStartTimeNs == 0L) {
+                                            streamStartTimeNs = System.nanoTime()
+                                        }
+
+                                        for (i in 0 until chunkSamples) {
+                                            val s = combined[offset + i]
+                                            chunkBytes[i * 2] = (s.toInt() and 0xFF).toByte()
+                                            chunkBytes[i * 2 + 1] = ((s.toInt() shr 8) and 0xFF).toByte()
+                                        }
+
+                                        // Play locally on Host with non-blocking write
+                                        try {
+                                            localTrack.write(chunkBytes, 0, chunkBytes.size, AudioTrack.WRITE_NON_BLOCKING)
+                                        } catch (e: Exception) {}
+
+                                        // Prepare UDP packet with sequence number
+                                        packetBuf[4] = ((seq shr 8) and 0xFF).toByte()
+                                        packetBuf[5] = (seq and 0xFF).toByte()
+                                        System.arraycopy(chunkBytes, 0, packetBuf, 8, chunkBytes.size)
+
+                                        val targets = getAudioStreamTargets()
                                         for (target in targets) {
                                             try {
-                                                val packet = DatagramPacket(packetBuf, toSend + 4, target, AUDIO_STREAM_PORT)
+                                                val packet = DatagramPacket(packetBuf, 8 + chunkBytes.size, target, AUDIO_STREAM_PORT)
                                                 sendSocket.send(packet)
                                             } catch (e: Exception) {}
                                         }
-                                        offset += toSend
-                                        Thread.sleep(10)
+
+                                        seq = (seq + 1) and 0xFFFF
+                                        totalSamplesSent += chunkSamples
+                                        offset += chunkSamples
+
+                                        // Precision Audio Clock Pacing
+                                        val expectedElapsedNs = (totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong()
+                                        val actualElapsedNs = System.nanoTime() - streamStartTimeNs
+                                        val sleepNs = expectedElapsedNs - actualElapsedNs
+
+                                        if (sleepNs > 1_500_000L) {
+                                            Thread.sleep(sleepNs / 1_000_000L)
+                                        } else if (sleepNs < -40_000_000L) {
+                                            streamStartTimeNs = System.nanoTime() - expectedElapsedNs
+                                        }
+                                    }
+
+                                    val remaining = combined.size - offset
+                                    if (remaining > 0) {
+                                        leftoverShorts = ShortArray(remaining)
+                                        System.arraycopy(combined, offset, leftoverShorts, 0, remaining)
+                                    } else {
+                                        leftoverShorts = ShortArray(0)
                                     }
                                 }
                                 codec.releaseOutputBuffer(outIdx, false)
@@ -1273,29 +1475,37 @@ class SyncNetworkModule(
                 val localTrack = AudioTrack.Builder()
                     .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
                     .setAudioFormat(AudioFormat.Builder().setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                    .setBufferSizeInBytes(Math.max(minBuf, 4096))
+                    .setBufferSizeInBytes(Math.max(minBuf * 2, 4800 * 2))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build()
                 localTrack.play()
 
                 audioBroadcasterThread = Thread {
-                    val pcm = ByteArray(AUDIO_BUFFER_SIZE)
-                    val packetBuf = ByteArray(AUDIO_BUFFER_SIZE + 4)
+                    val chunkSamples = 480 // 10ms
+                    val pcm = ByteArray(chunkSamples * 2)
+                    val packetBuf = ByteArray(chunkSamples * 2 + 8)
                     packetBuf[0] = 'S'.code.toByte()
                     packetBuf[1] = 'B'.code.toByte()
                     packetBuf[2] = 'U'.code.toByte()
                     packetBuf[3] = 'D'.code.toByte()
+                    packetBuf[6] = 4.toByte() // 4 = synth
+                    packetBuf[7] = 2.toByte()
 
                     val notes = doubleArrayOf(261.63, 329.63, 392.00, 493.88, 523.25, 392.00, 329.63, 261.63)
                     var sampleIdx = 0L
+                    var seq = 0
+                    var streamStartTimeNs = 0L
+                    var totalSamplesSent = 0L
 
                     try {
                         DatagramSocket().use { sendSocket ->
                             sendSocket.broadcast = true
 
                             while (isAudioBroadcasting) {
-                                val samplesPerChunk = AUDIO_BUFFER_SIZE / 2
-                                for (i in 0 until samplesPerChunk) {
+                                if (streamStartTimeNs == 0L) {
+                                    streamStartTimeNs = System.nanoTime()
+                                }
+                                for (i in 0 until chunkSamples) {
                                     val noteIdx = ((sampleIdx / (SAMPLE_RATE / 4)) % notes.size).toInt()
                                     val freq = notes[noteIdx]
                                     val phase = 2.0 * Math.PI * (sampleIdx % SAMPLE_RATE) * freq / SAMPLE_RATE
@@ -1308,18 +1518,31 @@ class SyncNetworkModule(
                                     sampleIdx++
                                 }
 
-                                try { localTrack.write(pcm, 0, pcm.size) } catch (e: Exception) {}
+                                try { localTrack.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING) } catch (e: Exception) {}
 
-                                System.arraycopy(pcm, 0, packetBuf, 4, pcm.size)
-                                val targets = getBroadcastTargets()
+                                packetBuf[4] = ((seq shr 8) and 0xFF).toByte()
+                                packetBuf[5] = (seq and 0xFF).toByte()
+                                System.arraycopy(pcm, 0, packetBuf, 8, pcm.size)
+                                seq = (seq + 1) and 0xFFFF
+                                totalSamplesSent += chunkSamples
+
+                                val targets = getAudioStreamTargets()
                                 for (target in targets) {
                                     try {
-                                        val packet = DatagramPacket(packetBuf, pcm.size + 4, target, AUDIO_STREAM_PORT)
+                                        val packet = DatagramPacket(packetBuf, pcm.size + 8, target, AUDIO_STREAM_PORT)
                                         sendSocket.send(packet)
                                     } catch (e: Exception) {}
                                 }
 
-                                Thread.sleep(10)
+                                val expectedElapsedNs = (totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong()
+                                val actualElapsedNs = System.nanoTime() - streamStartTimeNs
+                                val sleepNs = expectedElapsedNs - actualElapsedNs
+
+                                if (sleepNs > 1_500_000L) {
+                                    Thread.sleep(sleepNs / 1_000_000L)
+                                } else if (sleepNs < -40_000_000L) {
+                                    streamStartTimeNs = System.nanoTime() - expectedElapsedNs
+                                }
                             }
                         }
                     } catch (e: Exception) {
@@ -1331,7 +1554,7 @@ class SyncNetworkModule(
                 audioBroadcasterThread?.start()
                 promise.resolve(true)
             } else if (sourceType.equals("mic", ignoreCase = true)) {
-                // Mic mode: record from microphone and broadcast
+                // Mic mode: record from microphone and broadcast with ultra low latency
                 isAudioBroadcasting = true
                 val minBuf = AudioRecord.getMinBufferSize(
                     SAMPLE_RATE,
@@ -1343,7 +1566,7 @@ class SyncNetworkModule(
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
-                    Math.max(minBuf, AUDIO_BUFFER_SIZE * 4)
+                    Math.max(minBuf, 480 * 2 * 4)
                 )
 
                 if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
@@ -1354,12 +1577,15 @@ class SyncNetworkModule(
                 audioRecord?.startRecording()
 
                 audioBroadcasterThread = Thread {
-                    val pcm = ByteArray(AUDIO_BUFFER_SIZE)
-                    val packetBuf = ByteArray(AUDIO_BUFFER_SIZE + 4)
+                    val pcm = ByteArray(960) // 480 samples = 10ms at 48kHz
+                    val packetBuf = ByteArray(968)
                     packetBuf[0] = 'S'.code.toByte()
                     packetBuf[1] = 'B'.code.toByte()
                     packetBuf[2] = 'U'.code.toByte()
                     packetBuf[3] = 'D'.code.toByte()
+                    packetBuf[6] = 2.toByte() // 2 = mic
+                    packetBuf[7] = 2.toByte()
+                    var seq = 0
 
                     try {
                         DatagramSocket().use { sendSocket ->
@@ -1368,14 +1594,18 @@ class SyncNetworkModule(
                             while (isAudioBroadcasting && audioRecord != null) {
                                 val read = audioRecord!!.read(pcm, 0, pcm.size)
                                 if (read <= 0) {
-                                    Thread.sleep(15)
+                                    Thread.sleep(10)
                                     continue
                                 }
-                                System.arraycopy(pcm, 0, packetBuf, 4, read)
-                                val targets = getBroadcastTargets()
+                                packetBuf[4] = ((seq shr 8) and 0xFF).toByte()
+                                packetBuf[5] = (seq and 0xFF).toByte()
+                                System.arraycopy(pcm, 0, packetBuf, 8, read)
+                                seq = (seq + 1) and 0xFFFF
+
+                                val targets = getAudioStreamTargets()
                                 for (target in targets) {
                                     try {
-                                        val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
+                                        val packet = DatagramPacket(packetBuf, read + 8, target, AUDIO_STREAM_PORT)
                                         sendSocket.send(packet)
                                     } catch (e: Exception) {}
                                 }

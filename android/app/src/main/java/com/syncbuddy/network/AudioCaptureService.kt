@@ -134,7 +134,7 @@ class AudioCaptureService : Service() {
 
             val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             val nativeRate = audioManager?.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull() ?: SAMPLE_RATE
-            val candidateRates = intArrayOf(nativeRate, 48000, 44100)
+            val candidateRates = intArrayOf(SAMPLE_RATE, nativeRate, 44100)
             val channelConfigs = intArrayOf(AudioFormat.CHANNEL_IN_STEREO, AudioFormat.CHANNEL_IN_MONO)
             var initializedRecord: AudioRecord? = null
             var isStereoCapture = false
@@ -207,16 +207,19 @@ class AudioCaptureService : Service() {
             isCapturing = true
 
             captureThread = Thread {
-                val shortBufferSize = 1024
+                val shortBufferSize = if (isStereoCapture) 480 * 2 else 480
                 val shortBuf = ShortArray(shortBufferSize)
-                val packetBuf = ByteArray(4200)
+                val packetBuf = ByteArray(480 * 2 + 8) // 968 bytes
                 packetBuf[0] = 'S'.code.toByte()
                 packetBuf[1] = 'B'.code.toByte()
                 packetBuf[2] = 'U'.code.toByte()
                 packetBuf[3] = 'D'.code.toByte()
+                packetBuf[6] = 3.toByte() // 3 = system audio
+                packetBuf[7] = 2.toByte() // v2
 
                 var consecutiveSilentFrames = 0
                 var currentRecord = audioRecord
+                var seq = 0
 
                 try {
                     DatagramSocket().use { sendSocket ->
@@ -225,7 +228,7 @@ class AudioCaptureService : Service() {
                         while (isCapturing && currentRecord != null) {
                             val shortsRead = currentRecord?.read(shortBuf, 0, shortBuf.size) ?: -1
                             if (shortsRead <= 0) {
-                                Thread.sleep(15)
+                                Thread.sleep(10)
                                 continue
                             }
 
@@ -240,7 +243,7 @@ class AudioCaptureService : Service() {
 
                             if (!hasSignal) {
                                 consecutiveSilentFrames++
-                                // If 120 consecutive frames (~2.5 seconds) are completely silent zeroes,
+                                // If 120 consecutive frames (~1.2 seconds) are completely silent zeroes,
                                 // the media player app has blocked AudioPlaybackCapture.
                                 // Auto-fallback to MIC so listeners hear the music!
                                 if (consecutiveSilentFrames == 120) {
@@ -277,7 +280,7 @@ class AudioCaptureService : Service() {
                                 val frames = shortsRead / 2
                                 for (i in 0 until frames) {
                                     val monoSample = ((shortBuf[i * 2].toInt() + shortBuf[i * 2 + 1].toInt()) / 2).toShort()
-                                    val byteIdx = 4 + i * 2
+                                    val byteIdx = 8 + i * 2
                                     packetBuf[byteIdx] = (monoSample.toInt() and 0xFF).toByte()
                                     packetBuf[byteIdx + 1] = ((monoSample.toInt() shr 8) and 0xFF).toByte()
                                 }
@@ -285,17 +288,21 @@ class AudioCaptureService : Service() {
                             } else {
                                 for (i in 0 until shortsRead) {
                                     val sample = shortBuf[i]
-                                    val byteIdx = 4 + i * 2
+                                    val byteIdx = 8 + i * 2
                                     packetBuf[byteIdx] = (sample.toInt() and 0xFF).toByte()
                                     packetBuf[byteIdx + 1] = ((sample.toInt() shr 8) and 0xFF).toByte()
                                 }
                                 bytesToSend = shortsRead * 2
                             }
 
-                            val targets = SyncNetworkModule.getBroadcastTargets()
+                            packetBuf[4] = ((seq shr 8) and 0xFF).toByte()
+                            packetBuf[5] = (seq and 0xFF).toByte()
+                            seq = (seq + 1) and 0xFFFF
+
+                            val targets = SyncNetworkModule.getAudioStreamTargets()
                             for (target in targets) {
                                 try {
-                                    val packet = DatagramPacket(packetBuf, bytesToSend + 4, target, AUDIO_STREAM_PORT)
+                                    val packet = DatagramPacket(packetBuf, bytesToSend + 8, target, AUDIO_STREAM_PORT)
                                     sendSocket.send(packet)
                                 } catch (e: Exception) {}
                             }
