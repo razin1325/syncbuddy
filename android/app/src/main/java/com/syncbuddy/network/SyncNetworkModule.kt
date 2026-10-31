@@ -2,6 +2,7 @@ package com.syncbuddy.network
 
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -9,6 +10,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -186,8 +188,10 @@ class SyncNetworkModule(
         return false
     }
 
-    // Wi-Fi Multicast Lock to prevent Android hardware filter from dropping UDP packets
+    // Locks to prevent Android from dropping UDP packets and putting CPU/Wi-Fi to sleep when screen is off
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private fun acquireMulticastLock() {
         try {
@@ -197,15 +201,49 @@ class SyncNetworkModule(
                 multicastLock?.setReferenceCounted(false)
                 multicastLock?.acquire()
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) {}
+
+        try {
+            if (wifiLock == null || !wifiLock!!.isHeld) {
+                val wifiManager = reactContext.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wifiManager?.createWifiLock(mode, "SyncBuddyWifiLock")
+                wifiLock?.setReferenceCounted(false)
+                wifiLock?.acquire()
+            }
+        } catch (e: Exception) {}
+
+        try {
+            if (wakeLock == null || !wakeLock!!.isHeld) {
+                val powerManager = reactContext.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SyncBuddy:ScreenOffAudio")
+                wakeLock?.setReferenceCounted(false)
+                wakeLock?.acquire(2 * 60 * 60 * 1000L) // 2 hours
+            }
+        } catch (e: Exception) {}
     }
 
     private fun releaseMulticastLock() {
         try {
             if (multicastLock != null && multicastLock!!.isHeld) {
                 multicastLock?.release()
+            }
+        } catch (e: Exception) {}
+
+        try {
+            if (wifiLock != null && wifiLock!!.isHeld) {
+                wifiLock?.release()
+            }
+        } catch (e: Exception) {}
+
+        try {
+            if (wakeLock != null && wakeLock!!.isHeld) {
+                wakeLock?.release()
             }
         } catch (e: Exception) {}
     }
@@ -1027,10 +1065,6 @@ class SyncNetworkModule(
     }
 
     private fun requestSystemAudioCaptureInternal(promise: Promise) {
-        // Share known peer IPs with the AudioCaptureService
-        AudioCaptureService.knownPeerIps.clear()
-        AudioCaptureService.knownPeerIps.addAll(knownPeerIps)
-
         val activity = currentActivity
         if (activity is com.syncbuddy.MainActivity) {
             activity.requestMediaProjection(promise)
