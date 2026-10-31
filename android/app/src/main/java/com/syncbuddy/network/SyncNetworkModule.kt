@@ -810,14 +810,14 @@ class SyncNetworkModule(
 
             val scanner = GmsBarcodeScanning.getClient(activity, options)
             scanner.startScan()
-                .addOnSuccessListener { barcode ->
+                .addOnSuccessListener { barcode: Barcode ->
                     val raw = barcode.rawValue ?: barcode.displayValue ?: ""
                     promise.resolve(raw)
                 }
                 .addOnCanceledListener {
                     promise.reject("CANCELLED", "User cancelled scan")
                 }
-                .addOnFailureListener { e ->
+                .addOnFailureListener { e: java.lang.Exception ->
                     promise.reject("ERR_SCAN", e.message)
                 }
         } catch (e: Exception) {
@@ -954,28 +954,26 @@ class SyncNetworkModule(
                     packetBuf[2] = 'U'.code.toByte()
                     packetBuf[3] = 'D'.code.toByte()
 
-                    var sendSocket: DatagramSocket? = null
                     try {
-                        sendSocket = DatagramSocket()
-                        sendSocket.broadcast = true
+                        DatagramSocket().use { sendSocket ->
+                            sendSocket.broadcast = true
 
-                        while (isAudioBroadcasting && audioRecord != null) {
-                            val read = audioRecord!!.read(pcm, 0, pcm.size)
-                            if (read > 0) {
-                                System.arraycopy(pcm, 0, packetBuf, 4, read)
-                                val targets = getBroadcastTargets()
-                                for (target in targets) {
-                                    try {
-                                        val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
-                                        sendSocket.send(packet)
-                                    } catch (e: Exception) {}
+                            while (isAudioBroadcasting && audioRecord != null) {
+                                val read = audioRecord!!.read(pcm, 0, pcm.size)
+                                if (read > 0) {
+                                    System.arraycopy(pcm, 0, packetBuf, 4, read)
+                                    val targets = getBroadcastTargets()
+                                    for (target in targets) {
+                                        try {
+                                            val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
+                                            sendSocket.send(packet)
+                                        } catch (e: Exception) {}
+                                    }
                                 }
                             }
                         }
                     } catch (e: Exception) {
                         e.printStackTrace()
-                    } finally {
-                        try { sendSocket?.close() } catch (e: Exception) {}
                     }
                 }
                 audioBroadcasterThread?.start()
@@ -989,52 +987,50 @@ class SyncNetworkModule(
                     packetBuf[2] = 'U'.code.toByte()
                     packetBuf[3] = 'D'.code.toByte()
 
-                    var sendSocket: DatagramSocket? = null
                     try {
-                        sendSocket = DatagramSocket()
-                        sendSocket.broadcast = true
+                        DatagramSocket().use { sendSocket ->
+                            sendSocket.broadcast = true
 
-                        var sampleIndex = 0
-                        val samplesPerBuffer = AUDIO_BUFFER_SIZE / 2
-                        val shortBuffer = ShortArray(samplesPerBuffer)
+                            var sampleIndex = 0
+                            val samplesPerBuffer = AUDIO_BUFFER_SIZE / 2
+                            val shortBuffer = ShortArray(samplesPerBuffer)
 
-                        while (isAudioBroadcasting) {
-                            val beatPattern = (sampleIndex / (SAMPLE_RATE / 2)) % 4
-                            val baseFreq = when (beatPattern) {
-                                0 -> 440.0
-                                1 -> 554.37
-                                2 -> 659.25
-                                else -> 880.0
+                            while (isAudioBroadcasting) {
+                                val beatPattern = (sampleIndex / (SAMPLE_RATE / 2)) % 4
+                                val baseFreq = when (beatPattern) {
+                                    0 -> 440.0
+                                    1 -> 554.37
+                                    2 -> 659.25
+                                    else -> 880.0
+                                }
+
+                                for (i in 0 until samplesPerBuffer) {
+                                    val t = (sampleIndex + i).toDouble() / SAMPLE_RATE
+                                    val envelope = Math.max(0.1, 1.0 - ((sampleIndex + i) % (SAMPLE_RATE / 2)).toDouble() / (SAMPLE_RATE / 2))
+                                    val wave = Math.sin(2.0 * Math.PI * baseFreq * t) * 0.4 +
+                                               Math.sin(2.0 * Math.PI * (baseFreq * 0.5) * t) * 0.3
+                                    shortBuffer[i] = (wave * envelope * 24000.0).toInt().coerceIn(-32768, 32767).toShort()
+                                }
+                                sampleIndex += samplesPerBuffer
+
+                                for (i in 0 until samplesPerBuffer) {
+                                    val s = shortBuffer[i].toInt()
+                                    packetBuf[4 + i * 2] = (s and 0xFF).toByte()
+                                    packetBuf[4 + i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+                                }
+
+                                val targets = getBroadcastTargets()
+                                for (target in targets) {
+                                    try {
+                                        val packet = DatagramPacket(packetBuf, packetBuf.size, target, AUDIO_STREAM_PORT)
+                                        sendSocket.send(packet)
+                                    } catch (e: Exception) {}
+                                }
+                                Thread.sleep(30)
                             }
-
-                            for (i in 0 until samplesPerBuffer) {
-                                val t = (sampleIndex + i).toDouble() / SAMPLE_RATE
-                                val envelope = Math.max(0.1, 1.0 - ((sampleIndex + i) % (SAMPLE_RATE / 2)).toDouble() / (SAMPLE_RATE / 2))
-                                val wave = Math.sin(2.0 * Math.PI * baseFreq * t) * 0.4 +
-                                           Math.sin(2.0 * Math.PI * (baseFreq * 0.5) * t) * 0.3
-                                shortBuffer[i] = (wave * envelope * 24000.0).toInt().coerceIn(-32768, 32767).toShort()
-                            }
-                            sampleIndex += samplesPerBuffer
-
-                            for (i in 0 until samplesPerBuffer) {
-                                val s = shortBuffer[i].toInt()
-                                packetBuf[4 + i * 2] = (s and 0xFF).toByte()
-                                packetBuf[4 + i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
-                            }
-
-                            val targets = getBroadcastTargets()
-                            for (target in targets) {
-                                try {
-                                    val packet = DatagramPacket(packetBuf, packetBuf.size, target, AUDIO_STREAM_PORT)
-                                    sendSocket.send(packet)
-                                } catch (e: Exception) {}
-                            }
-                            Thread.sleep(30)
                         }
                     } catch (e: Exception) {
                         e.printStackTrace()
-                    } finally {
-                        try { sendSocket?.close() } catch (e: Exception) {}
                     }
                 }
                 audioBroadcasterThread?.start()
