@@ -19,8 +19,8 @@ import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.google.mlkit.vision.barcode.common.Barcode
-import com.google.mlkit.vision.codescan.GmsBarcodeScannerOptions
-import com.google.mlkit.vision.codescan.GmsBarcodeScanning
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -117,7 +117,12 @@ class SyncNetworkModule(
         if (!senderDeviceId.isNullOrEmpty() && senderDeviceId == myDeviceId) {
             return true
         }
-        if (senderIp.isEmpty() || senderIp == "127.0.0.1" || senderIp.equals("localhost", ignoreCase = true)) {
+        val cleanIp = senderIp.substringBefore('%').trim()
+        if (cleanIp.isEmpty() || cleanIp == "127.0.0.1" || cleanIp.equals("localhost", ignoreCase = true)) {
+            return true
+        }
+        val myIp = getLocalIp()
+        if (myIp.isNotEmpty() && cleanIp == myIp) {
             return true
         }
         try {
@@ -127,7 +132,8 @@ class SyncNetworkModule(
                 val addresses = iface.inetAddresses
                 while (addresses.hasMoreElements()) {
                     val addr = addresses.nextElement()
-                    if (addr.hostAddress == senderIp) {
+                    val addrIp = (addr.hostAddress ?: "").substringBefore('%').trim()
+                    if (addrIp.isNotEmpty() && addrIp == cleanIp) {
                         return true
                     }
                 }

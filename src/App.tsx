@@ -229,6 +229,13 @@ export default function App(): React.JSX.Element {
   const heartbeatTimer = useRef<any>(null);
   const netPollTimer = useRef<any>(null);
 
+  const networkInfoRef = useRef<NetworkInfo | null>(networkInfo);
+  networkInfoRef.current = networkInfo;
+  const roomCodeRef = useRef<string>(roomCode);
+  roomCodeRef.current = roomCode;
+  const deviceIdRef = useRef<string>(deviceId);
+  deviceIdRef.current = deviceId;
+
   const pttPulse = useRef(new Animated.Value(1)).current;
   const waveAnim1 = useRef(new Animated.Value(0.3)).current;
   const waveAnim2 = useRef(new Animated.Value(0.7)).current;
@@ -312,18 +319,16 @@ export default function App(): React.JSX.Element {
 
       const subDiscover = NativeNetwork.onRoomDiscovered((r: DiscoveredRoom) => {
         // Never discover self: check deviceId, IP, roomCode, and deviceName
-        if (r.deviceId && r.deviceId === deviceId) {
-          return;
-        }
-        if (networkInfo?.ipAddress && r.hostIp === networkInfo.ipAddress) {
-          return;
-        }
-        if (r.roomCode === roomCode) {
-          return;
-        }
-        if (networkInfo?.deviceName && r.hostName === networkInfo.deviceName) {
-          return;
-        }
+        const myIp = (networkInfoRef.current?.ipAddress || '').trim();
+        const hostIp = (r.hostIp || '').trim();
+        const curCode = roomCodeRef.current;
+        const myName = (networkInfoRef.current?.deviceName || '').toLowerCase();
+        const hostName = (r.hostName || '').toLowerCase();
+
+        if (r.deviceId && r.deviceId === deviceIdRef.current) return;
+        if (myIp && hostIp && (hostIp === myIp || hostIp.startsWith(myIp) || myIp.startsWith(hostIp))) return;
+        if (curCode && r.roomCode === curCode) return;
+        if (myName && hostName && (hostName.includes(myName) || myName.includes(hostName))) return;
 
         setDiscoveredRooms(prev => {
           const exists = prev.some(item => item.hostIp === r.hostIp && item.roomCode === r.roomCode);
@@ -935,9 +940,13 @@ export default function App(): React.JSX.Element {
   // Filter out self room so device never shows or connects to itself!
   const otherDiscoveredRooms = discoveredRooms.filter(r => {
     if (r.deviceId && r.deviceId === deviceId) return false;
-    if (networkInfo?.ipAddress && r.hostIp === networkInfo.ipAddress) return false;
-    if (r.roomCode === roomCode) return false;
-    if (networkInfo?.deviceName && r.hostName === networkInfo.deviceName) return false;
+    const cleanHostIp = (r.hostIp || '').trim();
+    const cleanMyIp = (networkInfo?.ipAddress || '').trim();
+    if (cleanMyIp && cleanHostIp && (cleanHostIp === cleanMyIp || cleanHostIp.startsWith(cleanMyIp) || cleanMyIp.startsWith(cleanHostIp))) return false;
+    if (r.roomCode && r.roomCode === roomCode) return false;
+    const myName = (networkInfo?.deviceName || '').toLowerCase();
+    const hostName = (r.hostName || '').toLowerCase();
+    if (myName && hostName && (hostName.includes(myName) || myName.includes(hostName))) return false;
     return true;
   });
 
