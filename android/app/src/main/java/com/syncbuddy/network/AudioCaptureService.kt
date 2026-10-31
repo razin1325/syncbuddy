@@ -129,44 +129,71 @@ class AudioCaptureService : Service() {
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
 
-            // Try native 44100 first, fallback to 48000
+            // Try stereo first (required by Android 10+ AudioPlaybackCapture HAL), then mono
+            val channelConfigs = intArrayOf(AudioFormat.CHANNEL_IN_STEREO, AudioFormat.CHANNEL_IN_MONO)
             val candidateRates = intArrayOf(SAMPLE_RATE, 48000)
             var initializedRecord: AudioRecord? = null
+            var isStereoCapture = false
 
-            for (sr in candidateRates) {
+            for (ch in channelConfigs) {
+                for (sr in candidateRates) {
+                    try {
+                        val minBuf = AudioRecord.getMinBufferSize(
+                            sr,
+                            ch,
+                            AudioFormat.ENCODING_PCM_16BIT
+                        )
+                        if (minBuf <= 0) continue
+
+                        val rec = AudioRecord.Builder()
+                            .setAudioPlaybackCaptureConfig(config)
+                            .setAudioFormat(
+                                AudioFormat.Builder()
+                                    .setSampleRate(sr)
+                                    .setChannelMask(ch)
+                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                    .build()
+                            )
+                            .setBufferSizeInBytes(Math.max(minBuf, AUDIO_BUFFER_SIZE * 8))
+                            .build()
+
+                        if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                            initializedRecord = rec
+                            isStereoCapture = (ch == AudioFormat.CHANNEL_IN_STEREO)
+                            break
+                        } else {
+                            rec.release()
+                        }
+                    } catch (e: Exception) {}
+                }
+                if (initializedRecord != null) break
+            }
+
+            // Reliable fallback to MIC if playback capture is blocked by vendor or app
+            if (initializedRecord == null) {
+                android.util.Log.w("AudioCaptureService", "Playback capture unavailable, falling back to MIC")
                 try {
                     val minBuf = AudioRecord.getMinBufferSize(
-                        sr,
+                        SAMPLE_RATE,
                         AudioFormat.CHANNEL_IN_MONO,
                         AudioFormat.ENCODING_PCM_16BIT
                     )
-                    if (minBuf <= 0) continue
-
-                    val rec = AudioRecord.Builder()
-                        .setAudioPlaybackCaptureConfig(config)
-                        .setAudioFormat(
-                            AudioFormat.Builder()
-                                .setSampleRate(sr)
-                                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                .build()
-                        )
-                        .setBufferSizeInBytes(Math.max(minBuf, AUDIO_BUFFER_SIZE * 4))
-                        .build()
-
-                    if (rec.state == AudioRecord.STATE_INITIALIZED) {
-                        initializedRecord = rec
-                        break
-                    } else {
-                        rec.release()
+                    val micRec = AudioRecord(
+                        android.media.MediaRecorder.AudioSource.MIC,
+                        SAMPLE_RATE,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        Math.max(minBuf, AUDIO_BUFFER_SIZE * 4)
+                    )
+                    if (micRec.state == AudioRecord.STATE_INITIALIZED) {
+                        initializedRecord = micRec
+                        isStereoCapture = false
                     }
-                } catch (e: Exception) {
-                    // Try next
-                }
+                } catch (e: Exception) {}
             }
 
             if (initializedRecord == null) {
-                android.util.Log.e("AudioCaptureService", "Could not initialize AudioRecord for AudioPlaybackCapture")
+                android.util.Log.e("AudioCaptureService", "Could not initialize any AudioRecord source")
                 stopSelf()
                 return
             }
@@ -176,7 +203,9 @@ class AudioCaptureService : Service() {
             isCapturing = true
 
             captureThread = Thread {
-                val pcm = ByteArray(AUDIO_BUFFER_SIZE)
+                val pcmBufferSize = if (isStereoCapture) AUDIO_BUFFER_SIZE * 2 else AUDIO_BUFFER_SIZE
+                val pcm = ByteArray(pcmBufferSize)
+                val monoPcm = ByteArray(AUDIO_BUFFER_SIZE)
                 val packetBuf = ByteArray(AUDIO_BUFFER_SIZE + 4)
                 packetBuf[0] = 'S'.code.toByte()
                 packetBuf[1] = 'B'.code.toByte()
@@ -193,11 +222,29 @@ class AudioCaptureService : Service() {
                                 Thread.sleep(15)
                                 continue
                             }
-                            System.arraycopy(pcm, 0, packetBuf, 4, read)
+
+                            val bytesToSend: Int
+                            if (isStereoCapture) {
+                                // Downmix 16-bit stereo PCM to 16-bit mono PCM
+                                val sampleCount = Math.min(read / 4, AUDIO_BUFFER_SIZE / 2)
+                                for (i in 0 until sampleCount) {
+                                    val left = (pcm[i * 4].toInt() and 0xFF) or (pcm[i * 4 + 1].toInt() shl 8)
+                                    val right = (pcm[i * 4 + 2].toInt() and 0xFF) or (pcm[i * 4 + 3].toInt() shl 8)
+                                    val mono = ((left + right) / 2).coerceIn(-32768, 32767)
+                                    monoPcm[i * 2] = (mono and 0xFF).toByte()
+                                    monoPcm[i * 2 + 1] = ((mono shr 8) and 0xFF).toByte()
+                                }
+                                bytesToSend = sampleCount * 2
+                                System.arraycopy(monoPcm, 0, packetBuf, 4, bytesToSend)
+                            } else {
+                                bytesToSend = Math.min(read, AUDIO_BUFFER_SIZE)
+                                System.arraycopy(pcm, 0, packetBuf, 4, bytesToSend)
+                            }
+
                             val targets = SyncNetworkModule.getBroadcastTargets()
                             for (target in targets) {
                                 try {
-                                    val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
+                                    val packet = DatagramPacket(packetBuf, bytesToSend + 4, target, AUDIO_STREAM_PORT)
                                     sendSocket.send(packet)
                                 } catch (e: Exception) {}
                             }

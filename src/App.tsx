@@ -721,6 +721,9 @@ export default function App(): React.JSX.Element {
         participantsCount: res.participantsCount || 2,
       });
 
+      // Immediately spin up audio receiver so sound plays without waiting
+      NativeNetwork.startAudioReceiver().catch(() => {});
+
       showToast(`✅ ${res.hostName || 'হোস্ট'} এর রুমে সফলভাবে যুক্ত হয়েছেন!`, 'success');
     } catch (e: any) {
       setJoinFeedback({

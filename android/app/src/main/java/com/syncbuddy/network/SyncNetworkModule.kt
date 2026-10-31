@@ -924,13 +924,28 @@ class SyncNetworkModule(
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
+            if (audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
+                @Suppress("DEPRECATION")
+                audioTrack = AudioTrack(
+                    AudioManager.STREAM_MUSIC,
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferCapacity,
+                    AudioTrack.MODE_STREAM
+                )
+            }
+
             try {
                 audioTrack?.setVolume(1.0f)
             } catch (e: Exception) {}
             audioTrack?.play()
 
-            audioReceiverSocket = DatagramSocket(AUDIO_STREAM_PORT)
-            audioReceiverSocket?.reuseAddress = true
+            try { audioReceiverSocket?.close() } catch (e: Exception) {}
+            audioReceiverSocket = DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(java.net.InetSocketAddress(AUDIO_STREAM_PORT))
+            }
             isAudioReceiverRunning = true
 
             audioReceiverThread = Thread {
