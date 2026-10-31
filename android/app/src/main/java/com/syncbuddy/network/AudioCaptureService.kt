@@ -189,15 +189,17 @@ class AudioCaptureService : Service() {
 
                         while (isCapturing && audioRecord != null) {
                             val read = audioRecord?.read(pcm, 0, pcm.size) ?: -1
-                            if (read > 0) {
-                                System.arraycopy(pcm, 0, packetBuf, 4, read)
-                                val targets = SyncNetworkModule.getBroadcastTargets()
-                                for (target in targets) {
-                                    try {
-                                        val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
-                                        sendSocket.send(packet)
-                                    } catch (e: Exception) {}
-                                }
+                            if (read <= 0) {
+                                Thread.sleep(15)
+                                continue
+                            }
+                            System.arraycopy(pcm, 0, packetBuf, 4, read)
+                            val targets = SyncNetworkModule.getBroadcastTargets()
+                            for (target in targets) {
+                                try {
+                                    val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
+                                    sendSocket.send(packet)
+                                } catch (e: Exception) {}
                             }
                         }
                     }

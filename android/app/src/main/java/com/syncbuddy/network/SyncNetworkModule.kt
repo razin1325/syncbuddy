@@ -188,12 +188,15 @@ class SyncNetworkModule(
         return false
     }
 
-    // Locks to prevent Android from dropping UDP packets and putting CPU/Wi-Fi to sleep when screen is off
+    // Power-optimized locks: allows hardware micro-sleeps to prevent phone heating & save battery
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var activeLocksCount = 0
 
+    @Synchronized
     private fun acquireMulticastLock() {
+        activeLocksCount++
         try {
             if (multicastLock == null || !multicastLock!!.isHeld) {
                 val wifiManager = reactContext.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -206,12 +209,8 @@ class SyncNetworkModule(
         try {
             if (wifiLock == null || !wifiLock!!.isHeld) {
                 val wifiManager = reactContext.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
-                }
+                @Suppress("DEPRECATION")
+                val mode = WifiManager.WIFI_MODE_FULL
                 wifiLock = wifiManager?.createWifiLock(mode, "SyncBuddyWifiLock")
                 wifiLock?.setReferenceCounted(false)
                 wifiLock?.acquire()
@@ -223,12 +222,17 @@ class SyncNetworkModule(
                 val powerManager = reactContext.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
                 wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SyncBuddy:ScreenOffAudio")
                 wakeLock?.setReferenceCounted(false)
-                wakeLock?.acquire(2 * 60 * 60 * 1000L) // 2 hours
+                wakeLock?.acquire(60 * 60 * 1000L) // 1 hour timeout
             }
         } catch (e: Exception) {}
     }
 
+    @Synchronized
     private fun releaseMulticastLock() {
+        activeLocksCount--
+        if (activeLocksCount > 0) return
+        activeLocksCount = 0
+
         try {
             if (multicastLock != null && multicastLock!!.isHeld) {
                 multicastLock?.release()
@@ -427,6 +431,7 @@ class SyncNetworkModule(
             } catch (e: Exception) { }
             serverSocket = null
             participants.clear()
+            releaseMulticastLock()
 
             promise.resolve(true)
         } catch (e: Exception) {
@@ -796,6 +801,7 @@ class SyncNetworkModule(
             isDiscoveryRunning = false
             discoverySocket?.close()
             discoverySocket = null
+            releaseMulticastLock()
             promise.resolve(true)
         } catch (e: Exception) {
             promise.reject("ERR_STOP_DISCOVERY", e.message)
@@ -977,6 +983,7 @@ class SyncNetworkModule(
             } catch (e: Exception) {}
             audioTrack = null
 
+            releaseMulticastLock()
             promise.resolve(true)
         } catch (e: Exception) {
             promise.reject("ERR_STOP_RECV", e.message)
@@ -1026,15 +1033,17 @@ class SyncNetworkModule(
 
                             while (isAudioBroadcasting && audioRecord != null) {
                                 val read = audioRecord!!.read(pcm, 0, pcm.size)
-                                if (read > 0) {
-                                    System.arraycopy(pcm, 0, packetBuf, 4, read)
-                                    val targets = getBroadcastTargets()
-                                    for (target in targets) {
-                                        try {
-                                            val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
-                                            sendSocket.send(packet)
-                                        } catch (e: Exception) {}
-                                    }
+                                if (read <= 0) {
+                                    Thread.sleep(15)
+                                    continue
+                                }
+                                System.arraycopy(pcm, 0, packetBuf, 4, read)
+                                val targets = getBroadcastTargets()
+                                for (target in targets) {
+                                    try {
+                                        val packet = DatagramPacket(packetBuf, read + 4, target, AUDIO_STREAM_PORT)
+                                        sendSocket.send(packet)
+                                    } catch (e: Exception) {}
                                 }
                             }
                         }
@@ -1100,6 +1109,8 @@ class SyncNetworkModule(
             val context = reactApplicationContext
             context.stopService(Intent(context, AudioCaptureService::class.java))
         } catch (e: Exception) {}
+
+        releaseMulticastLock()
     }
 
     @ReactMethod
