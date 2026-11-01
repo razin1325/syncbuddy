@@ -42,7 +42,7 @@ object Media3Manager {
         return exoPlayer!!
     }
 
-    fun play(context: Context, uriString: String, isVideoFile: Boolean) {
+    fun play(context: Context, uriString: String, isVideoFile: Boolean, volume: Float = 1.0f) {
         mainHandler.post {
             try {
                 val player = getPlayer(context)
@@ -54,12 +54,23 @@ object Media3Manager {
 
                 player.stop()
                 player.clearMediaItems()
+                player.volume = volume
                 player.setMediaItem(mediaItem)
                 player.prepare()
                 player.play()
 
                 // Re-bind to attached view if one exists
                 attachedPlayerView?.player = player
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun setVolume(volume: Float) {
+        mainHandler.post {
+            try {
+                exoPlayer?.volume = volume
             } catch (e: Exception) {
                 e.printStackTrace()
             }

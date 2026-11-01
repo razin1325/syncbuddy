@@ -248,12 +248,12 @@ export const NativeNetwork = {
   },
 
   /**
-   * Play an offline audio or video file with Google Media3
+   * Play an offline audio or video file with Google Media3 and real-time UDP room sync
    */
-  async playMediaFile(uri: string, isVideo: boolean = false): Promise<boolean> {
+  async playMediaFile(uri: string, isVideo: boolean = false, broadcastToRoom: boolean = true): Promise<boolean> {
     if (Platform.OS !== 'android' || !SyncNetworkModule?.playMediaFile) return false;
     try {
-      return await SyncNetworkModule.playMediaFile(uri, isVideo);
+      return await SyncNetworkModule.playMediaFile(uri, isVideo, broadcastToRoom);
     } catch {
       return false;
     }

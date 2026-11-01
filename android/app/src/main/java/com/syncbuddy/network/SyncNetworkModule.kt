@@ -1318,21 +1318,293 @@ class SyncNetworkModule(
     // Google Media3 (ExoPlayer) Unified Audio & Video Engine
     // ─────────────────────────────────────────────────────────────────────────
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Google Media3 (ExoPlayer) + Real-time UDP Room Audio Broadcasting Engine
+    // ─────────────────────────────────────────────────────────────────────────
+
     @ReactMethod
-    fun playMediaFile(uriString: String, isVideo: Boolean, promise: Promise) {
+    fun playMediaFile(uriString: String, isVideo: Boolean, broadcastToRoom: Boolean, promise: Promise) {
         try {
             stopAudioFileInternal()
             stopAudioBroadcasterInternal()
-            com.syncbuddy.media.Media3Manager.play(reactApplicationContext, uriString, isVideo)
-            promise.resolve(true)
+            acquireMulticastLock()
+
+            if (isVideo) {
+                // If broadcasting to room, mute ExoPlayer so localTrack outputs the audio
+                // in perfect lockstep with the UDP stream sent to all listeners!
+                val exoVolume = if (broadcastToRoom) 0.0f else 1.0f
+                com.syncbuddy.media.Media3Manager.play(reactApplicationContext, uriString, true, exoVolume)
+            }
+
+            if (broadcastToRoom) {
+                startFileBroadcastStreamer(uriString, promise)
+            } else {
+                if (!isVideo) {
+                    com.syncbuddy.media.Media3Manager.play(reactApplicationContext, uriString, false, 1.0f)
+                }
+                promise.resolve(true)
+            }
         } catch (e: Exception) {
             promise.reject("ERR_PLAY_MEDIA", e.message)
+        }
+    }
+
+    private fun startFileBroadcastStreamer(uriString: String, promise: Promise) {
+        try {
+            acquireMulticastLock()
+            isFileBroadcasting = true
+            isFilePaused = false
+
+            fileBroadcasterThread = Thread {
+                var extractor: MediaExtractor? = null
+                var codec: MediaCodec? = null
+                var localTrack: AudioTrack? = null
+
+                try {
+                    val context = reactApplicationContext
+                    val uri = Uri.parse(uriString)
+                    extractor = MediaExtractor()
+                    extractor.setDataSource(context, uri, null)
+
+                    var audioTrackIndex = -1
+                    var format: MediaFormat? = null
+                    for (i in 0 until extractor.trackCount) {
+                        val f = extractor.getTrackFormat(i)
+                        val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
+                        if (mime.startsWith("audio/")) {
+                            audioTrackIndex = i
+                            format = f
+                            break
+                        }
+                    }
+
+                    if (audioTrackIndex == -1 || format == null) {
+                        return@Thread
+                    }
+
+                    extractor.selectTrack(audioTrackIndex)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: "audio/mp4a-latm"
+                    val fileSampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else SAMPLE_RATE
+                    val channelCount = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
+
+                    codec = MediaCodec.createDecoderByType(mime)
+                    codec.configure(format, null, null, 0)
+                    codec.start()
+
+                    if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                        currentFileDurationSec = format.getLong(MediaFormat.KEY_DURATION) / 1_000_000.0
+                    } else {
+                        currentFileDurationSec = 0.0
+                    }
+                    currentFilePositionSec = 0.0
+
+                    val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                    localTrack = AudioTrack.Builder()
+                        .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                        .setAudioFormat(AudioFormat.Builder().setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                        .setBufferSizeInBytes(Math.max(minBuf * 2, 4800 * 2))
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .build()
+                    activeFileAudioTrack = localTrack
+                    localTrack.play()
+
+                    val packetBuf = ByteArray(968) // 8 byte header + 960 bytes pcm (480 samples = 10ms at 48kHz)
+                    packetBuf[0] = 'S'.code.toByte()
+                    packetBuf[1] = 'B'.code.toByte()
+                    packetBuf[2] = 'U'.code.toByte()
+                    packetBuf[3] = 'D'.code.toByte()
+                    packetBuf[6] = 1.toByte() // 1 = music/media
+                    packetBuf[7] = 2.toByte() // v2
+
+                    DatagramSocket().use { sendSocket ->
+                        sendSocket.broadcast = true
+                        val info = MediaCodec.BufferInfo()
+                        var isEOS = false
+
+                        val chunkSamples = 480 // 10ms at 48kHz
+                        val chunkBytes = ByteArray(chunkSamples * 2)
+                        var leftoverShorts = ShortArray(0)
+
+                        var streamStartTimeNs = 0L
+                        var totalSamplesSent = 0L
+                        var seq = 0
+
+                        while (isFileBroadcasting && !isEOS) {
+                            if (seekRequestedUs >= 0L) {
+                                val targetUs = seekRequestedUs
+                                seekRequestedUs = -1L
+                                try {
+                                    extractor.seekTo(targetUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                                    codec.flush()
+                                    leftoverShorts = ShortArray(0)
+                                    totalSamplesSent = ((targetUs / 1_000_000.0) * SAMPLE_RATE).toLong()
+                                    streamStartTimeNs = System.nanoTime() - ((totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong())
+                                    localTrack.flush()
+                                } catch (e: Exception) {}
+                            }
+
+                            while (isFilePaused && isFileBroadcasting) {
+                                try { localTrack.pause() } catch (e: Exception) {}
+                                Thread.sleep(30)
+                                if (!isFilePaused) {
+                                    try { localTrack.play() } catch (e: Exception) {}
+                                    streamStartTimeNs = System.nanoTime() - ((totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong())
+                                }
+                            }
+
+                            val inIdx = codec.dequeueInputBuffer(1000)
+                            if (inIdx >= 0) {
+                                val inBuf = codec.getInputBuffer(inIdx)
+                                if (inBuf != null) {
+                                    inBuf.clear()
+                                    val sampleSize = extractor.readSampleData(inBuf, 0)
+                                    if (sampleSize < 0) {
+                                        codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                        isEOS = true
+                                    } else {
+                                        codec.queueInputBuffer(inIdx, 0, sampleSize, extractor.sampleTime, 0)
+                                        extractor.advance()
+                                    }
+                                }
+                            }
+
+                            var outIdx = codec.dequeueOutputBuffer(info, 1000)
+                            while (outIdx >= 0 && isFileBroadcasting) {
+                                val outBuf = codec.getOutputBuffer(outIdx)
+                                if (outBuf != null && info.size > 0) {
+                                    val outBytes = ByteArray(info.size)
+                                    outBuf.position(info.offset)
+                                    outBuf.get(outBytes, 0, info.size)
+
+                                    val numRawSamples = info.size / 2
+                                    val rawShorts = ShortArray(numRawSamples)
+                                    for (i in 0 until numRawSamples) {
+                                        val b1 = outBytes[i * 2].toInt() and 0xFF
+                                        val b2 = outBytes[i * 2 + 1].toInt()
+                                        rawShorts[i] = ((b2 shl 8) or b1).toShort()
+                                    }
+
+                                    val monoShorts: ShortArray
+                                    if (channelCount >= 2) {
+                                        val monoCount = numRawSamples / channelCount
+                                        monoShorts = ShortArray(monoCount)
+                                        for (i in 0 until monoCount) {
+                                            var sum = 0
+                                            for (c in 0 until channelCount) {
+                                                sum += rawShorts[i * channelCount + c]
+                                            }
+                                            monoShorts[i] = (sum / channelCount).toShort()
+                                        }
+                                    } else {
+                                        monoShorts = rawShorts
+                                    }
+
+                                    val samples48k: ShortArray
+                                    if (fileSampleRate != SAMPLE_RATE && fileSampleRate > 0) {
+                                        val ratio = SAMPLE_RATE.toDouble() / fileSampleRate.toDouble()
+                                        val targetCount = Math.round(monoShorts.size * ratio).toInt()
+                                        samples48k = ShortArray(targetCount)
+                                        for (i in 0 until targetCount) {
+                                            val srcIdx = i / ratio
+                                            val idx0 = Math.floor(srcIdx).toInt().coerceIn(0, monoShorts.size - 1)
+                                            val idx1 = Math.ceil(srcIdx).toInt().coerceIn(0, monoShorts.size - 1)
+                                            val frac = srcIdx - idx0
+                                            val s0 = monoShorts[idx0].toDouble()
+                                            val s1 = monoShorts[idx1].toDouble()
+                                            val interp = s0 + frac * (s1 - s0)
+                                            samples48k[i] = Math.round(interp).toInt().coerceIn(-32768, 32767).toShort()
+                                        }
+                                    } else {
+                                        samples48k = monoShorts
+                                    }
+
+                                    val combined: ShortArray
+                                    if (leftoverShorts.isNotEmpty()) {
+                                        combined = ShortArray(leftoverShorts.size + samples48k.size)
+                                        System.arraycopy(leftoverShorts, 0, combined, 0, leftoverShorts.size)
+                                        System.arraycopy(samples48k, 0, combined, leftoverShorts.size, samples48k.size)
+                                    } else {
+                                        combined = samples48k
+                                    }
+
+                                    var offset = 0
+                                    while (offset + chunkSamples <= combined.size && isFileBroadcasting) {
+                                        if (streamStartTimeNs == 0L) {
+                                            streamStartTimeNs = System.nanoTime()
+                                        }
+
+                                        for (i in 0 until chunkSamples) {
+                                            val s = combined[offset + i]
+                                            chunkBytes[i * 2] = (s.toInt() and 0xFF).toByte()
+                                            chunkBytes[i * 2 + 1] = ((s.toInt() shr 8) and 0xFF).toByte()
+                                        }
+
+                                        try {
+                                            localTrack.write(chunkBytes, 0, chunkBytes.size, AudioTrack.WRITE_NON_BLOCKING)
+                                        } catch (e: Exception) {}
+
+                                        packetBuf[4] = ((seq shr 8) and 0xFF).toByte()
+                                        packetBuf[5] = (seq and 0xFF).toByte()
+                                        System.arraycopy(chunkBytes, 0, packetBuf, 8, chunkBytes.size)
+
+                                        val targets = getAudioStreamTargets()
+                                        for (target in targets) {
+                                            try {
+                                                val packet = DatagramPacket(packetBuf, 8 + chunkBytes.size, target, AUDIO_STREAM_PORT)
+                                                sendSocket.send(packet)
+                                            } catch (e: Exception) {}
+                                        }
+
+                                        seq = (seq + 1) and 0xFFFF
+                                        totalSamplesSent += chunkSamples
+                                        offset += chunkSamples
+                                        currentFilePositionSec = totalSamplesSent.toDouble() / SAMPLE_RATE.toDouble()
+
+                                        val expectedElapsedNs = (totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong()
+                                        val actualElapsedNs = System.nanoTime() - streamStartTimeNs
+                                        val sleepNs = expectedElapsedNs - actualElapsedNs
+
+                                        if (sleepNs > 1_500_000L) {
+                                            Thread.sleep(sleepNs / 1_000_000L)
+                                        } else if (sleepNs < -40_000_000L) {
+                                            streamStartTimeNs = System.nanoTime() - expectedElapsedNs
+                                        }
+                                    }
+
+                                    val remaining = combined.size - offset
+                                    if (remaining > 0) {
+                                        leftoverShorts = ShortArray(remaining)
+                                        System.arraycopy(combined, offset, leftoverShorts, 0, remaining)
+                                    } else {
+                                        leftoverShorts = ShortArray(0)
+                                    }
+                                }
+                                codec.releaseOutputBuffer(outIdx, false)
+                                outIdx = codec.dequeueOutputBuffer(info, 0)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                } finally {
+                    try { codec?.stop(); codec?.release() } catch (e: Exception) {}
+                    try { extractor?.release() } catch (e: Exception) {}
+                    try { localTrack?.stop(); localTrack?.release() } catch (e: Exception) {}
+                    activeFileAudioTrack = null
+                    isFileBroadcasting = false
+                }
+            }
+            fileBroadcasterThread?.start()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_FILE_STREAM", e.message)
         }
     }
 
     @ReactMethod
     fun pauseMediaFile(promise: Promise) {
         try {
+            isFilePaused = true
             com.syncbuddy.media.Media3Manager.pause()
             promise.resolve(true)
         } catch (e: Exception) {
@@ -1343,6 +1615,7 @@ class SyncNetworkModule(
     @ReactMethod
     fun resumeMediaFile(promise: Promise) {
         try {
+            isFilePaused = false
             com.syncbuddy.media.Media3Manager.resume()
             promise.resolve(true)
         } catch (e: Exception) {
@@ -1363,6 +1636,8 @@ class SyncNetworkModule(
     @ReactMethod
     fun seekMediaFile(positionSeconds: Double, promise: Promise) {
         try {
+            seekRequestedUs = (positionSeconds * 1_000_000.0).toLong()
+            currentFilePositionSec = positionSeconds
             com.syncbuddy.media.Media3Manager.seekTo(positionSeconds)
             promise.resolve(true)
         } catch (e: Exception) {
@@ -1374,10 +1649,17 @@ class SyncNetworkModule(
     fun getMediaPlaybackState(promise: Promise) {
         try {
             val map = Arguments.createMap()
-            map.putBoolean("isPlaying", com.syncbuddy.media.Media3Manager.isPlaying())
-            map.putDouble("position", com.syncbuddy.media.Media3Manager.getPosition())
-            map.putDouble("duration", com.syncbuddy.media.Media3Manager.getDuration())
-            map.putBoolean("isVideo", com.syncbuddy.media.Media3Manager.isVideo)
+            if (isFileBroadcasting) {
+                map.putBoolean("isPlaying", isFileBroadcasting && !isFilePaused)
+                map.putDouble("position", currentFilePositionSec)
+                map.putDouble("duration", currentFileDurationSec)
+                map.putBoolean("isVideo", com.syncbuddy.media.Media3Manager.isVideo)
+            } else {
+                map.putBoolean("isPlaying", com.syncbuddy.media.Media3Manager.isPlaying())
+                map.putDouble("position", com.syncbuddy.media.Media3Manager.getPosition())
+                map.putDouble("duration", com.syncbuddy.media.Media3Manager.getDuration())
+                map.putBoolean("isVideo", com.syncbuddy.media.Media3Manager.isVideo)
+            }
             promise.resolve(map)
         } catch (e: Exception) {
             promise.reject("ERR_GET_PLAYBACK_STATE", e.message)
@@ -1403,7 +1685,7 @@ class SyncNetworkModule(
     // Backward-compatible delegates
     @ReactMethod
     fun playAudioFile(uriString: String, promise: Promise) {
-        playMediaFile(uriString, false, promise)
+        playMediaFile(uriString, false, true, promise)
     }
 
     @ReactMethod

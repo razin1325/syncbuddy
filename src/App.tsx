@@ -1086,11 +1086,11 @@ export default function App(): React.JSX.Element {
         setIsHostBroadcasting(true);
         NativeNetwork.updateBroadcastState(true, item.title, masterVolume).catch(() => {});
       }
-      await NativeNetwork.playMediaFile(item.uri, item.type === 'video');
+      await NativeNetwork.playMediaFile(item.uri, item.type === 'video', broadcastToRoom);
       showToast(
         item.type === 'video'
-          ? `🎬 ${item.title} ভিডিও প্লে হচ্ছে! [${item.format}]`
-          : `▶️ ${item.title} অডিও প্লে হচ্ছে! [${item.format}]`,
+          ? `🎬 ${item.title} ভিডিও ${broadcastToRoom ? 'লাইভ সম্প্রচার' : 'প্লে'} হচ্ছে! [${item.format}]`
+          : `▶️ ${item.title} অডিও ${broadcastToRoom ? 'লাইভ সম্প্রচার' : 'প্লে'} হচ্ছে! [${item.format}]`,
         'success',
       );
     } catch {
@@ -1778,12 +1778,18 @@ export default function App(): React.JSX.Element {
                 </View>
                 <TouchableOpacity
                   style={{ backgroundColor: broadcastToRoom ? '#10B981' : '#334155', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}
-                  onPress={() => {
+                  onPress={async () => {
                     const next = !broadcastToRoom;
                     setBroadcastToRoom(next);
-                    if (next && currentMedia && isMediaPlaying) {
-                      setIsHostBroadcasting(true);
-                      NativeNetwork.updateBroadcastState(true, currentMedia.title, masterVolume).catch(() => {});
+                    if (currentMedia && isMediaPlaying) {
+                      if (next) {
+                        setIsHostBroadcasting(true);
+                        NativeNetwork.updateBroadcastState(true, currentMedia.title, masterVolume).catch(() => {});
+                      } else {
+                        setIsHostBroadcasting(false);
+                        NativeNetwork.updateBroadcastState(false, '', masterVolume).catch(() => {});
+                      }
+                      await NativeNetwork.playMediaFile(currentMedia.uri, currentMedia.type === 'video', next);
                     }
                     showToast(next ? '📡 রুমে লাইভ ব্রডকাস্ট অন করা হয়েছে' : '🔕 ব্রডকাস্ট অফ (শুধু নিজের ফোনে বাজবে)', 'info');
                   }}>
