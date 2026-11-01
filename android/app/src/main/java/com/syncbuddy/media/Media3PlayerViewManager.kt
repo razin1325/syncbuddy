@@ -66,3 +66,4 @@ class Media3PlayerViewManager : SimpleViewManager<PlayerView>() {
         view.useController = use
     }
 }
+
