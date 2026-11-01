@@ -86,6 +86,16 @@ class SyncNetworkModule(
         val knownPeerIps = ConcurrentHashMap.newKeySet<String>()
         val participantIps = ConcurrentHashMap.newKeySet<String>()
 
+        fun dismissAllNotifications(context: Context) {
+            try {
+                val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                manager?.cancel(STATUS_NOTIFICATION_ID)
+                manager?.cancel(AudioCaptureService.NOTIFICATION_ID)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
         fun getBroadcastTargets(): List<InetAddress> {
             val targets = mutableListOf<InetAddress>()
             try {
@@ -1849,7 +1859,8 @@ class SyncNetworkModule(
                 .setContentTitle(title)
                 .setContentText(message)
                 .setSmallIcon(iconRes)
-                .setOngoing(true)
+                .setOngoing(false) // Swipeable / dismissible by user
+                .setAutoCancel(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .setCategory(NotificationCompat.CATEGORY_SERVICE)
                 .setContentIntent(pendingIntent)
@@ -1898,5 +1909,11 @@ class SyncNetworkModule(
 
     @ReactMethod
     fun removeListeners(count: Double) {}
+
+    override fun onCatalystInstanceDestroy() {
+        dismissStatusNotificationInternal()
+        stopAudioBroadcasterInternal()
+        super.onCatalystInstanceDestroy()
+    }
 }
 

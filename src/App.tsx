@@ -395,13 +395,38 @@ export default function App(): React.JSX.Element {
   }, [joinedRoom, deviceId]);
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 5. Real-time Persistent Status Notification (Always visible at top of screen)
+  // 5. Real-time Status Notification (Only shown when active audio session or room exists)
   // ─────────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    return () => {
+      if (Platform.OS === 'android') {
+        NativeNetwork.dismissPersistentNotification().catch(() => {});
+      }
+    };
+  }, []);
+
   useEffect(() => {
     if (Platform.OS !== 'android') return;
 
-    let title = 'SyncBuddy • রানিং 🟢';
-    let msg = 'অফলাইন অডিও সিঙ্ক ও ওয়াকি-টকি ব্যাকগ্রাউন্ডে সক্রিয়';
+    // Only show notification if an actual session or stream is actively in progress
+    const isHostingWithGuests = activePage === 'host' && hostParticipants.length > 0;
+    const isStreamingMedia = isMediaPlaying && broadcastToRoom;
+    const isRoomActive =
+      isTalking ||
+      !!activeSpeaker ||
+      isHostBroadcasting ||
+      isStreamingMedia ||
+      !!joinedRoom ||
+      isHostingWithGuests;
+
+    if (!isRoomActive) {
+      // Nothing running in background - dismiss notification immediately!
+      NativeNetwork.dismissPersistentNotification().catch(() => {});
+      return;
+    }
+
+    let title = 'SyncBuddy • সক্রিয় 🟢';
+    let msg = 'অফলাইন অডিও সিঙ্ক ব্যাকগ্রাউন্ডে সক্রিয়';
 
     if (isTalking) {
       title = 'SyncBuddy • ওয়াকি-টকি কথা বলছেন... 🎙️';
@@ -413,10 +438,13 @@ export default function App(): React.JSX.Element {
       const count = hostParticipants.length;
       title = `SyncBuddy • ব্রডকাস্ট চলছে 🔴 (রুম #${roomCode})`;
       msg = `মিউজিক সবার হেডফোনে বাজছে • ${count > 0 ? `${count} জন শুনছেন` : 'লিসেনারদের অপেক্ষা'}`;
-    } else if (activePage === 'host') {
+    } else if (isStreamingMedia) {
+      title = 'SyncBuddy • মিডিয়া প্লেয়ার স্ট্রিম 🎵';
+      msg = `অডিও/ভিডিও সবার ডিভাইসে প্লে হচ্ছে (${hostParticipants.length} জন সংযুক্ত)`;
+    } else if (isHostingWithGuests) {
       const count = hostParticipants.length;
       title = `SyncBuddy • হোস্ট রুম #${roomCode} 📡`;
-      msg = count > 0 ? `${count} টি ডিভাইস সংযুক্ত • অডিও ব্রডকাস্ট প্রস্তুত` : 'অফলাইন হোস্ট রুম সক্রিয় • ডিভাইসের অপেক্ষা';
+      msg = `${count} টি ডিভাইস সংযুক্ত • অডিও ব্রডকাস্ট প্রস্তুত`;
     } else if (joinedRoom) {
       title = `SyncBuddy • সংযুক্ত 🎧 (রুম #${joinedRoom.code})`;
       msg = `হোস্ট: ${joinedRoom.hostName} • অডিও সিঙ্ক ও ওয়াকি-টকি অন`;
@@ -427,6 +455,8 @@ export default function App(): React.JSX.Element {
     activePage,
     roomCode,
     isHostBroadcasting,
+    isMediaPlaying,
+    broadcastToRoom,
     hostParticipants.length,
     joinedRoom,
     isTalking,

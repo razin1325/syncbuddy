@@ -319,6 +319,16 @@ class AudioCaptureService : Service() {
         }
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        try {
+            SyncNetworkModule.dismissAllNotifications(this)
+            stopSelf()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         isCapturing = false
         activeProjectionData = null
@@ -336,6 +346,9 @@ class AudioCaptureService : Service() {
         mediaProjection = null
 
         captureThread = null
+        try {
+            SyncNetworkModule.dismissAllNotifications(this)
+        } catch (e: Exception) {}
         super.onDestroy()
     }
 

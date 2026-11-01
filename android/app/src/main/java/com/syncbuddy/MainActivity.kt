@@ -38,6 +38,7 @@ class MainActivity : ReactActivity() {
     }
 
     override fun onDestroy() {
+        com.syncbuddy.network.SyncNetworkModule.dismissAllNotifications(this)
         instance = null
         super.onDestroy()
     }
