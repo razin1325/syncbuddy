@@ -59,6 +59,23 @@ const networkEmitter =
     ? new NativeEventEmitter(SyncNetworkModule)
     : null;
 
+export interface DeviceMediaItem {
+  id: string;
+  title: string;
+  artist: string;
+  duration: number;
+  uri: string;
+  type: 'audio' | 'video';
+  format: string;
+  size: string;
+}
+
+export interface PlaybackState {
+  isPlaying: boolean;
+  position: number;
+  duration: number;
+}
+
 export const NativeNetwork = {
   /**
    * Get current device local IP (Wi-Fi or Hotspot) & network connection state
@@ -287,6 +304,44 @@ export const NativeNetwork = {
       return await SyncNetworkModule.getDeviceAudioFiles();
     } catch {
       return [];
+    }
+  },
+
+  /**
+   * Scan device storage for all audio and video media files (Google Media3 / VLC / My Files style)
+   */
+  async getDeviceMediaFiles(filter: 'all' | 'audio' | 'video' = 'all'): Promise<DeviceMediaItem[]> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.getDeviceMediaFiles) return [];
+    try {
+      return await SyncNetworkModule.getDeviceMediaFiles(filter);
+    } catch {
+      return [];
+    }
+  },
+
+  /**
+   * Seek audio playback to a specific timestamp in seconds
+   */
+  async seekAudioFile(positionSeconds: number): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.seekAudioFile) return false;
+    try {
+      return await SyncNetworkModule.seekAudioFile(positionSeconds);
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Get live playback progress and duration in seconds
+   */
+  async getAudioPlaybackState(): Promise<PlaybackState> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.getAudioPlaybackState) {
+      return { isPlaying: false, position: 0, duration: 0 };
+    }
+    try {
+      return await SyncNetworkModule.getAudioPlaybackState();
+    } catch {
+      return { isPlaying: false, position: 0, duration: 0 };
     }
   },
 

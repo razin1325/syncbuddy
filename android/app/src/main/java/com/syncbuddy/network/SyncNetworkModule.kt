@@ -44,6 +44,7 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -1128,6 +1129,10 @@ class SyncNetworkModule(
     private var isFilePaused = false
     private var fileBroadcasterThread: Thread? = null
 
+    @Volatile private var seekRequestedUs: Long = -1L
+    @Volatile private var currentFilePositionSec: Double = 0.0
+    @Volatile private var currentFileDurationSec: Double = 0.0
+
     @ReactMethod
     fun pauseAudioFile(promise: Promise) {
         isFilePaused = true
@@ -1141,61 +1146,154 @@ class SyncNetworkModule(
     }
 
     @ReactMethod
-    fun getDeviceAudioFiles(promise: Promise) {
+    fun seekAudioFile(positionSeconds: Double, promise: Promise) {
+        seekRequestedUs = (positionSeconds * 1_000_000.0).toLong()
+        currentFilePositionSec = positionSeconds
+        promise.resolve(true)
+    }
+
+    @ReactMethod
+    fun getAudioPlaybackState(promise: Promise) {
+        val map = Arguments.createMap()
+        map.putBoolean("isPlaying", isFileBroadcasting && !isFilePaused)
+        map.putDouble("position", currentFilePositionSec)
+        map.putDouble("duration", currentFileDurationSec)
+        promise.resolve(map)
+    }
+
+    private fun formatFileSize(bytes: Long): String {
+        if (bytes <= 0) return "0 B"
+        val kb = bytes / 1024.0
+        val mb = kb / 1024.0
+        val gb = mb / 1024.0
+        return when {
+            gb >= 1.0 -> String.format(Locale.US, "%.1f GB", gb)
+            mb >= 1.0 -> String.format(Locale.US, "%.1f MB", mb)
+            kb >= 1.0 -> String.format(Locale.US, "%.1f KB", kb)
+            else -> "$bytes B"
+        }
+    }
+
+    @ReactMethod
+    fun getDeviceMediaFiles(filter: String, promise: Promise) {
         Executors.newSingleThreadExecutor().execute {
             try {
                 val list = Arguments.createArray()
-                val projection = arrayOf(
-                    MediaStore.Audio.Media._ID,
-                    MediaStore.Audio.Media.TITLE,
-                    MediaStore.Audio.Media.ARTIST,
-                    MediaStore.Audio.Media.DURATION,
-                    MediaStore.Audio.Media.DATA
-                )
+                val resolver = reactApplicationContext.contentResolver
 
-                val uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-                val cursor = reactApplicationContext.contentResolver.query(
-                    uri,
-                    projection,
-                    "${MediaStore.Audio.Media.IS_MUSIC} != 0",
-                    null,
-                    "${MediaStore.Audio.Media.TITLE} ASC"
-                )
+                // 1. Scan Audio Files (MP3, M4A, FLAC, WAV, AAC, OGG)
+                if (filter == "all" || filter == "audio") {
+                    val audioUri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                    val audioProjection = arrayOf(
+                        MediaStore.Audio.Media._ID,
+                        MediaStore.Audio.Media.TITLE,
+                        MediaStore.Audio.Media.ARTIST,
+                        MediaStore.Audio.Media.DURATION,
+                        MediaStore.Audio.Media.DATA,
+                        MediaStore.Audio.Media.SIZE
+                    )
+                    resolver.query(
+                        audioUri,
+                        audioProjection,
+                        "${MediaStore.Audio.Media.IS_MUSIC} != 0",
+                        null,
+                        "${MediaStore.Audio.Media.TITLE} ASC"
+                    )?.use { cursor ->
+                        val idCol = cursor.getColumnIndex(MediaStore.Audio.Media._ID)
+                        val titleCol = cursor.getColumnIndex(MediaStore.Audio.Media.TITLE)
+                        val artistCol = cursor.getColumnIndex(MediaStore.Audio.Media.ARTIST)
+                        val durCol = cursor.getColumnIndex(MediaStore.Audio.Media.DURATION)
+                        val dataCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
+                        val sizeCol = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
 
-                cursor?.use {
-                    val idCol = it.getColumnIndex(MediaStore.Audio.Media._ID)
-                    val titleCol = it.getColumnIndex(MediaStore.Audio.Media.TITLE)
-                    val artistCol = it.getColumnIndex(MediaStore.Audio.Media.ARTIST)
-                    val durCol = it.getColumnIndex(MediaStore.Audio.Media.DURATION)
-                    val dataCol = it.getColumnIndex(MediaStore.Audio.Media.DATA)
+                        var count = 0
+                        while (cursor.moveToNext() && count < 100) {
+                            val id = if (idCol != -1) cursor.getLong(idCol) else 0L
+                            val title = if (titleCol != -1) cursor.getString(titleCol) ?: "Audio Track" else "Audio Track"
+                            val artist = if (artistCol != -1) cursor.getString(artistCol) ?: "Music" else "Music"
+                            val duration = if (durCol != -1) cursor.getLong(durCol) else 0L
+                            val path = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
+                            val size = if (sizeCol != -1) cursor.getLong(sizeCol) else 0L
 
-                    var count = 0
-                    while (it.moveToNext() && count < 100) {
-                        val id = if (idCol != -1) it.getLong(idCol) else 0L
-                        val title = if (titleCol != -1) it.getString(titleCol) ?: "Unknown Song" else "Unknown Song"
-                        val artist = if (artistCol != -1) it.getString(artistCol) ?: "<unknown>" else "<unknown>"
-                        val duration = if (durCol != -1) it.getLong(durCol) else 0L
-                        val path = if (dataCol != -1) it.getString(dataCol) ?: "" else ""
+                            val contentUri = ContentUris.withAppendedId(audioUri, id).toString()
+                            val finalUri = if (path.isNotEmpty() && java.io.File(path).exists()) "file://$path" else contentUri
 
-                        val contentUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id).toString()
-                        val finalUri = if (path.isNotEmpty() && java.io.File(path).exists()) "file://$path" else contentUri
+                            val ext = if (path.contains(".")) path.substringAfterLast(".").uppercase() else "MP3"
+                            val map = Arguments.createMap()
+                            map.putString("id", "audio_$id")
+                            map.putString("title", title)
+                            map.putString("artist", if (artist == "<unknown>") "Local Audio" else artist)
+                            map.putDouble("duration", duration.toDouble())
+                            map.putString("uri", finalUri)
+                            map.putString("type", "audio")
+                            map.putString("format", ext)
+                            map.putString("size", formatFileSize(size))
+                            list.pushMap(map)
+                            count++
+                        }
+                    }
+                }
 
-                        val map = Arguments.createMap()
-                        map.putString("id", id.toString())
-                        map.putString("title", title)
-                        map.putString("artist", if (artist == "<unknown>") "Local Music" else artist)
-                        map.putDouble("duration", duration.toDouble())
-                        map.putString("uri", finalUri)
-                        list.pushMap(map)
-                        count++
+                // 2. Scan Video Files (MP4, MKV, WebM, 3GP)
+                if (filter == "all" || filter == "video") {
+                    val videoUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                    val videoProjection = arrayOf(
+                        MediaStore.Video.Media._ID,
+                        MediaStore.Video.Media.TITLE,
+                        MediaStore.Video.Media.DURATION,
+                        MediaStore.Video.Media.DATA,
+                        MediaStore.Video.Media.SIZE
+                    )
+                    resolver.query(
+                        videoUri,
+                        videoProjection,
+                        null,
+                        null,
+                        "${MediaStore.Video.Media.DATE_ADDED} DESC"
+                    )?.use { cursor ->
+                        val idCol = cursor.getColumnIndex(MediaStore.Video.Media._ID)
+                        val titleCol = cursor.getColumnIndex(MediaStore.Video.Media.TITLE)
+                        val durCol = cursor.getColumnIndex(MediaStore.Video.Media.DURATION)
+                        val dataCol = cursor.getColumnIndex(MediaStore.Video.Media.DATA)
+                        val sizeCol = cursor.getColumnIndex(MediaStore.Video.Media.SIZE)
+
+                        var count = 0
+                        while (cursor.moveToNext() && count < 100) {
+                            val id = if (idCol != -1) cursor.getLong(idCol) else 0L
+                            val title = if (titleCol != -1) cursor.getString(titleCol) ?: "Video File" else "Video File"
+                            val duration = if (durCol != -1) cursor.getLong(durCol) else 0L
+                            val path = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
+                            val size = if (sizeCol != -1) cursor.getLong(sizeCol) else 0L
+
+                            val contentUri = ContentUris.withAppendedId(videoUri, id).toString()
+                            val finalUri = if (path.isNotEmpty() && java.io.File(path).exists()) "file://$path" else contentUri
+
+                            val ext = if (path.contains(".")) path.substringAfterLast(".").uppercase() else "MP4"
+                            val map = Arguments.createMap()
+                            map.putString("id", "video_$id")
+                            map.putString("title", title)
+                            map.putString("artist", "Video Audio ($ext)")
+                            map.putDouble("duration", duration.toDouble())
+                            map.putString("uri", finalUri)
+                            map.putString("type", "video")
+                            map.putString("format", ext)
+                            map.putString("size", formatFileSize(size))
+                            list.pushMap(map)
+                            count++
+                        }
                     }
                 }
 
                 promise.resolve(list)
             } catch (e: Exception) {
-                promise.reject("ERR_MEDIASTORE", e.message)
+                promise.reject("ERR_SCAN_MEDIA", e.message)
             }
         }
+    }
+
+    @ReactMethod
+    fun getDeviceAudioFiles(promise: Promise) {
+        getDeviceMediaFiles("audio", promise)
     }
 
     @ReactMethod
@@ -1252,6 +1350,13 @@ class SyncNetworkModule(
                     codec.configure(format, null, null, 0)
                     codec.start()
 
+                    if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                        currentFileDurationSec = format.getLong(MediaFormat.KEY_DURATION) / 1_000_000.0
+                    } else {
+                        currentFileDurationSec = 0.0
+                    }
+                    currentFilePositionSec = 0.0
+
                     val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
                     localTrack = AudioTrack.Builder()
                         .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
@@ -1283,6 +1388,20 @@ class SyncNetworkModule(
                         var seq = 0
 
                         while (isFileBroadcasting && !isEOS) {
+                            // Handle real-time seek request from UI slider
+                            if (seekRequestedUs >= 0L) {
+                                val targetUs = seekRequestedUs
+                                seekRequestedUs = -1L
+                                try {
+                                    extractor.seekTo(targetUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                                    codec.flush()
+                                    leftoverShorts = ShortArray(0)
+                                    totalSamplesSent = ((targetUs / 1_000_000.0) * SAMPLE_RATE).toLong()
+                                    streamStartTimeNs = System.nanoTime() - ((totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong())
+                                    localTrack.flush()
+                                } catch (e: Exception) {}
+                            }
+
                             while (isFilePaused && isFileBroadcasting) {
                                 try { localTrack.pause() } catch (e: Exception) {}
                                 Thread.sleep(30)
@@ -1412,6 +1531,7 @@ class SyncNetworkModule(
                                         seq = (seq + 1) and 0xFFFF
                                         totalSamplesSent += chunkSamples
                                         offset += chunkSamples
+                                        currentFilePositionSec = totalSamplesSent.toDouble() / SAMPLE_RATE.toDouble()
 
                                         // Precision Audio Clock Pacing
                                         val expectedElapsedNs = (totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong()
@@ -1458,6 +1578,9 @@ class SyncNetworkModule(
     fun stopAudioFile(promise: Promise) {
         isFileBroadcasting = false
         fileBroadcasterThread = null
+        seekRequestedUs = -1L
+        currentFilePositionSec = 0.0
+        currentFileDurationSec = 0.0
         promise.resolve(true)
     }
 

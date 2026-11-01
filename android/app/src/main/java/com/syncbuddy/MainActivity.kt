@@ -60,10 +60,11 @@ class MainActivity : ReactActivity() {
         pendingAudioPickerPromise = promise
         try {
             val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                type = "audio/*"
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("audio/*", "video/*"))
                 addCategory(Intent.CATEGORY_OPENABLE)
             }
-            startActivityForResult(Intent.createChooser(intent, "গান নির্বাচন করুন"), AUDIO_PICKER_REQUEST)
+            startActivityForResult(Intent.createChooser(intent, "অডিও বা ভিডিও ফাইল নির্বাচন করুন"), AUDIO_PICKER_REQUEST)
         } catch (e: Exception) {
             promise.reject("ERR_PICKER", e.message)
         }

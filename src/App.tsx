@@ -38,12 +38,14 @@ import {
   ListenerJoinedEvent,
   ListenerLeftEvent,
   PttMessageEvent,
+  DeviceMediaItem,
+  PlaybackState,
 } from './NativeNetwork';
 import { generateQRMatrix } from './QRCodeGenerator';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type NavigationPage = 'host' | 'join' | 'walkie' | 'devices';
+export type NavigationPage = 'host' | 'join' | 'media' | 'walkie' | 'devices';
 export type DeviceType = 'Audio' | 'Wearable' | 'Computer' | 'IoT Sensor' | 'Peripheral';
 export type DeviceStatus = 'Broadcasting' | 'Connected' | 'Connecting' | 'Paired' | 'Available';
 export type FilterTab = 'All' | 'Connected' | 'Paired' | 'Audio' | 'Wearables';
@@ -209,6 +211,17 @@ export default function App(): React.JSX.Element {
   const [isSongPaused, setIsSongPaused] = useState<boolean>(false);
   const [masterVolume, setMasterVolume] = useState<number>(85);
   const [broadcastElapsed, setBroadcastElapsed] = useState<number>(0);
+
+  // Media Player State (Google Media3 / VLC / My Files style)
+  const [mediaFiles, setMediaFiles] = useState<DeviceMediaItem[]>([]);
+  const [mediaCategory, setMediaCategory] = useState<'all' | 'audio' | 'video'>('all');
+  const [mediaSearch, setMediaSearch] = useState<string>('');
+  const [isLoadingMedia, setIsLoadingMedia] = useState<boolean>(false);
+  const [currentMedia, setCurrentMedia] = useState<DeviceMediaItem | null>(null);
+  const [isMediaPlaying, setIsMediaPlaying] = useState<boolean>(false);
+  const [playbackPos, setPlaybackPos] = useState<number>(0);
+  const [playbackDur, setPlaybackDur] = useState<number>(0);
+  const [broadcastToRoom, setBroadcastToRoom] = useState<boolean>(true);
 
   // Join Room State (Listener)
   const [inputRoomCode, setInputRoomCode] = useState<string>('');
@@ -435,7 +448,7 @@ export default function App(): React.JSX.Element {
             );
           }
           if (typeof Platform.Version === 'number' && Platform.Version >= 33) {
-            reqs.push('android.permission.POST_NOTIFICATIONS', 'android.permission.READ_MEDIA_AUDIO');
+            reqs.push('android.permission.POST_NOTIFICATIONS', 'android.permission.READ_MEDIA_AUDIO', 'android.permission.READ_MEDIA_VIDEO');
           } else {
             reqs.push(PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE);
           }
@@ -443,6 +456,7 @@ export default function App(): React.JSX.Element {
         } catch { }
 
         try {
+          loadDeviceMedia('all');
           NativeNetwork.getDeviceAudioFiles().then(setDeviceSongs).catch(() => {});
         } catch { }
 
@@ -1011,9 +1025,119 @@ export default function App(): React.JSX.Element {
   const connectedCount = hostParticipants.length + 1; // +1 for host itself
   const formatTime = (s: number) => {
     const m = Math.floor(s / 60);
-    const sec = s % 60;
+    const sec = Math.floor(s % 60);
     return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
   };
+
+  const loadDeviceMedia = useCallback(async (filter: 'all' | 'audio' | 'video' = 'all') => {
+    setIsLoadingMedia(true);
+    try {
+      const files = await NativeNetwork.getDeviceMediaFiles(filter);
+      setMediaFiles(files);
+    } catch {
+      setMediaFiles([]);
+    } finally {
+      setIsLoadingMedia(false);
+    }
+  }, []);
+
+  const handlePlayMedia = async (item: DeviceMediaItem) => {
+    try {
+      setCurrentMedia(item);
+      setPlaybackPos(0);
+      setPlaybackDur(item.duration > 0 ? item.duration / 1000 : 0);
+      setIsMediaPlaying(true);
+      if (broadcastToRoom) {
+        setIsHostBroadcasting(true);
+        NativeNetwork.updateBroadcastState(true, item.title, masterVolume).catch(() => {});
+      }
+      await NativeNetwork.playAudioFile(item.uri);
+      showToast(`▶️ ${item.title} প্লে হচ্ছে! [${item.format}]`, 'success');
+    } catch {
+      showToast('মিডিয়া প্লে করতে সমস্যা হয়েছে', 'error');
+    }
+  };
+
+  const handleTogglePlayPause = async () => {
+    if (!currentMedia) return;
+    if (isMediaPlaying) {
+      await NativeNetwork.pauseAudioFile();
+      setIsMediaPlaying(false);
+      showToast('⏸️ পজ করা হয়েছে', 'info');
+    } else {
+      await NativeNetwork.resumeAudioFile();
+      setIsMediaPlaying(true);
+      showToast('▶️ চালু করা হয়েছে', 'success');
+    }
+  };
+
+  const handleStopMedia = async () => {
+    await NativeNetwork.stopAudioFile();
+    setIsMediaPlaying(false);
+    setPlaybackPos(0);
+    if (isHostBroadcasting && !joinedRoom) {
+      setIsHostBroadcasting(false);
+      NativeNetwork.updateBroadcastState(false, '', masterVolume).catch(() => {});
+    }
+    showToast('⏹️ মিডিয়া বন্ধ করা হয়েছে', 'info');
+  };
+
+  const handleSeek = async (newPosSec: number) => {
+    setPlaybackPos(newPosSec);
+    await NativeNetwork.seekAudioFile(newPosSec);
+  };
+
+  const handleRewind10 = async () => {
+    const target = Math.max(0, playbackPos - 10);
+    await handleSeek(target);
+  };
+
+  const handleForward10 = async () => {
+    const maxDur = playbackDur > 0 ? playbackDur : 999999;
+    const target = Math.min(maxDur, playbackPos + 10);
+    await handleSeek(target);
+  };
+
+  const handlePickCustomMedia = async () => {
+    const picked = await NativeNetwork.pickAudioFile();
+    if (picked && picked.uri) {
+      const ext = picked.name.includes('.') ? picked.name.substring(picked.name.lastIndexOf('.') + 1).toUpperCase() : 'MEDIA';
+      const isVideo = ['MP4', 'MKV', 'WEBM', '3GP', 'MOV', 'AVI'].includes(ext);
+      const customItem: DeviceMediaItem = {
+        id: 'picked_' + Date.now(),
+        title: picked.name,
+        artist: isVideo ? `Video Audio (${ext})` : 'Storage File',
+        duration: 0,
+        uri: picked.uri,
+        type: isVideo ? 'video' : 'audio',
+        format: ext,
+        size: 'Custom File',
+      };
+      await handlePlayMedia(customItem);
+    }
+  };
+
+  // Poll live playback position and duration
+  useEffect(() => {
+    let timer: any = null;
+    if (isMediaPlaying) {
+      timer = setInterval(async () => {
+        try {
+          const state = await NativeNetwork.getAudioPlaybackState();
+          if (state) {
+            setPlaybackPos(state.position);
+            if (state.duration > 0) setPlaybackDur(state.duration);
+            if (!state.isPlaying && state.duration > 0 && state.position >= state.duration - 1) {
+              setIsMediaPlaying(false);
+            }
+          }
+        } catch {}
+      }, 500);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [isMediaPlaying]);
 
   const filteredDevices = devices.filter(d => {
     const q = searchQuery.toLowerCase();
@@ -1233,141 +1357,44 @@ export default function App(): React.JSX.Element {
               )}
             </View>
 
-            {/* ─── VLC In-App Music Player (Auto-detects all device songs) ─── */}
-            <View style={styles.card}>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            {/* ─── Google Media3 & VLC Media Suite Card ─── */}
+            <View style={[styles.card, { borderColor: '#06B6D4' }]}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                 <View style={{ flex: 1, marginRight: 10 }}>
-                  <Text style={styles.sectionTitle}>🎵 ইন-অ্যাপ VLC মিউজিক প্লেয়ার</Text>
-                  <Text style={styles.cardDesc}>ফোনের ডাউনলোড করা গান সরাসরি চালান (কোনো থার্ড-পার্টি অ্যাপ ছাড়াই)</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    <Text style={{ fontSize: 20 }}>🎬</Text>
+                    <Text style={styles.sectionTitle}>Google Media3 & VLC Player</Text>
+                  </View>
+                  <Text style={styles.cardDesc}>MP3, MP4 (ভিডিও অডিও), FLAC, WAV সব ফাইল আলাদা প্রফেশনাল পেজে চালান</Text>
                 </View>
                 <TouchableOpacity
-                  style={{ backgroundColor: '#1E293B', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}
-                  onPress={async () => {
-                    const songs = await NativeNetwork.getDeviceAudioFiles();
-                    setDeviceSongs(songs);
-                    showToast(`${songs.length} টি গান পাওয়া গেছে`, 'info');
-                  }}>
-                  <Text style={{ color: '#06B6D4', fontSize: 12, fontWeight: 'bold' }}>🔄 রিফ্রেশ</Text>
+                  style={{ backgroundColor: '#06B6D4', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 }}
+                  onPress={() => setActivePage('media')}>
+                  <Text style={{ color: '#000000', fontSize: 12, fontWeight: 'bold' }}>প্লেয়ার খুলুন ➔</Text>
                 </TouchableOpacity>
               </View>
 
-              {/* Now Playing Mini Player if a song is active */}
-              {selectedFileName && (
-                <View style={{ backgroundColor: '#0F172A', borderColor: '#06B6D4', borderWidth: 1, borderRadius: 12, padding: 12, marginBottom: 14 }}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <View style={{ flex: 1, marginRight: 10 }}>
-                      <Text style={{ color: '#06B6D4', fontSize: 11, fontWeight: 'bold' }}>NOW STREAMING TO HEADPHONES</Text>
-                      <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: 'bold', marginTop: 2 }} numberOfLines={1}>{selectedFileName}</Text>
-                    </View>
-                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                      <TouchableOpacity
-                        style={{ backgroundColor: '#06B6D4', width: 36, height: 36, borderRadius: 18, justifyContent: 'center', alignItems: 'center', marginRight: 8 }}
-                        onPress={async () => {
-                          if (isSongPaused) {
-                            await NativeNetwork.resumeAudioFile();
-                            setIsSongPaused(false);
-                            showToast('গান রিজুম হয়েছে', 'info');
-                          } else {
-                            await NativeNetwork.pauseAudioFile();
-                            setIsSongPaused(true);
-                            showToast('গান পজ হয়েছে', 'info');
-                          }
-                        }}>
-                        <Text style={{ color: '#000000', fontSize: 16, fontWeight: 'bold' }}>{isSongPaused ? '▶' : '⏸'}</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        style={{ backgroundColor: '#EF4444', width: 36, height: 36, borderRadius: 18, justifyContent: 'center', alignItems: 'center' }}
-                        onPress={async () => {
-                          await NativeNetwork.stopAudioFile();
-                          setIsHostBroadcasting(false);
-                          setIsSongPaused(false);
-                          setSelectedFileName(null);
-                          setSelectedFileUri(null);
-                          showToast('গান বন্ধ করা হয়েছে', 'info');
-                        }}>
-                        <Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: 'bold' }}>⏹</Text>
-                      </TouchableOpacity>
-                    </View>
+              {currentMedia && isMediaPlaying && (
+                <View style={{ backgroundColor: '#0F172A', borderColor: '#06B6D4', borderWidth: 1, borderRadius: 10, padding: 10, marginTop: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <View style={{ flex: 1, marginRight: 8 }}>
+                    <Text style={{ color: '#06B6D4', fontSize: 10, fontWeight: 'bold' }}>NOW STREAMING [{currentMedia.format}]</Text>
+                    <Text style={{ color: '#FFFFFF', fontSize: 13, fontWeight: 'bold' }} numberOfLines={1}>{currentMedia.title}</Text>
+                    <Text style={{ color: '#94A3B8', fontSize: 11 }}>{formatTime(playbackPos)} / {formatTime(playbackDur)}</Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', gap: 6 }}>
+                    <TouchableOpacity
+                      style={{ backgroundColor: '#06B6D4', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}
+                      onPress={handleTogglePlayPause}>
+                      <Text style={{ color: '#000000', fontSize: 12, fontWeight: 'bold' }}>{isMediaPlaying ? '⏸' : '▶'}</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={{ backgroundColor: '#EF4444', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}
+                      onPress={handleStopMedia}>
+                      <Text style={{ color: '#FFFFFF', fontSize: 12, fontWeight: 'bold' }}>⏹</Text>
+                    </TouchableOpacity>
                   </View>
                 </View>
               )}
-
-              {/* Song Search Box */}
-              <TextInput
-                style={{ backgroundColor: '#0F172A', borderColor: '#334155', borderWidth: 1, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, color: '#FFFFFF', fontSize: 13, marginBottom: 10 }}
-                placeholder="গান খুঁজুন... (Search songs)"
-                placeholderTextColor="#64748B"
-                value={songSearch}
-                onChangeText={setSongSearch}
-              />
-
-              {/* Scanned Songs List */}
-              <View style={{ maxHeight: 220 }}>
-                {deviceSongs
-                  .filter(s => s.title.toLowerCase().includes(songSearch.toLowerCase()) || s.artist.toLowerCase().includes(songSearch.toLowerCase()))
-                  .slice(0, 8)
-                  .map(song => (
-                    <TouchableOpacity
-                      key={song.id}
-                      style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomColor: '#1E293B', borderBottomWidth: 1 }}
-                      onPress={async () => {
-                        setSelectedFileUri(song.uri);
-                        setSelectedFileName(song.title);
-                        setActiveTrack({
-                          id: 'song_' + song.id,
-                          title: song.title,
-                          artist: song.artist,
-                          duration: 'Live',
-                          source: 'file',
-                        });
-                        setIsSongPaused(false);
-                        setIsHostBroadcasting(true);
-                        await NativeNetwork.playAudioFile(song.uri);
-                        NativeNetwork.updateBroadcastState(true, song.title, masterVolume).catch(() => {});
-                        showToast(`🎵 ${song.title} সবার হেডফোনে বাজা শুরু হয়েছে!`, 'success');
-                      }}>
-                      <Text style={{ fontSize: 18, marginRight: 10 }}>🎶</Text>
-                      <View style={{ flex: 1 }}>
-                        <Text style={{ color: '#FFFFFF', fontSize: 13, fontWeight: '600' }} numberOfLines={1}>{song.title}</Text>
-                        <Text style={{ color: '#64748B', fontSize: 11 }} numberOfLines={1}>{song.artist}</Text>
-                      </View>
-                      <Text style={{ color: '#06B6D4', fontSize: 12, fontWeight: 'bold' }}>PLAY ▶</Text>
-                    </TouchableOpacity>
-                  ))}
-
-                {deviceSongs.length === 0 && (
-                  <View style={{ paddingVertical: 14, alignItems: 'center' }}>
-                    <Text style={{ color: '#94A3B8', fontSize: 13, textAlign: 'center' }}>
-                      মেমোরির গান লোড করতে ওপরের 🔄 রিফ্রেশ চাপুন অথবা নিচের বাটন দিয়ে সরাসরি ফাইল বেছে নিন
-                    </Text>
-                  </View>
-                )}
-              </View>
-
-              {/* Manual File Picker button */}
-              <TouchableOpacity
-                style={{ marginTop: 10, backgroundColor: '#0891B2', paddingVertical: 10, borderRadius: 8, alignItems: 'center' }}
-                onPress={async () => {
-                  const picked = await NativeNetwork.pickAudioFile();
-                  if (picked && picked.uri) {
-                    setSelectedFileUri(picked.uri);
-                    setSelectedFileName(picked.name);
-                    setActiveTrack({
-                      id: 'picked_' + Math.random().toString(36).substring(2, 6),
-                      title: picked.name,
-                      artist: 'Local Audio',
-                      duration: 'Live',
-                      source: 'file',
-                    });
-                    setIsSongPaused(false);
-                    setIsHostBroadcasting(true);
-                    await NativeNetwork.playAudioFile(picked.uri);
-                    NativeNetwork.updateBroadcastState(true, picked.name, masterVolume).catch(() => {});
-                    showToast(`🎵 ${picked.name} বাজতে শুরু করেছে!`, 'success');
-                  }
-                }}>
-                <Text style={{ color: '#FFFFFF', fontWeight: 'bold', fontSize: 13 }}>📂 মেমোরি / ডাউনলোড ফোল্ডার থেকে ফাইল খুলুন</Text>
-              </TouchableOpacity>
             </View>
 
             {/* Audio Stream Source & Animated Visualizer */}
@@ -1671,6 +1698,247 @@ export default function App(): React.JSX.Element {
         )}
 
         {/* ═══════════════════════════════════════════════════════════════════
+            PAGE: 🎬 MEDIA PLAYER (GOOGLE MEDIA3 / VLC / MY FILES STYLE)
+        ═══════════════════════════════════════════════════════════════════ */}
+        {activePage === 'media' && (
+          <View style={styles.pageContainer}>
+            {/* Hero Banner Card */}
+            <View style={styles.card}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  <Text style={{ fontSize: 24 }}>🎬</Text>
+                  <View>
+                    <Text style={styles.sectionTitle}>SyncBuddy Media Player</Text>
+                    <Text style={styles.cardDesc}>Google Media3 & VLC স্টাইল হাই-পারফরম্যান্স প্লেয়ার</Text>
+                  </View>
+                </View>
+                <View style={{ backgroundColor: '#06B6D420', borderColor: '#06B6D4', borderWidth: 1, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 }}>
+                  <Text style={{ color: '#06B6D4', fontSize: 10, fontWeight: 'bold' }}>MEDIA3 PRO</Text>
+                </View>
+              </View>
+
+              {/* Supported Formats Pills */}
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginVertical: 8 }}>
+                {['MP3', 'MP4', 'FLAC', 'WAV', 'M4A', 'MKV', 'AAC'].map(fmt => (
+                  <View key={fmt} style={{ backgroundColor: '#1E293B', paddingHorizontal: 7, paddingVertical: 2, borderRadius: 4 }}>
+                    <Text style={{ color: '#94A3B8', fontSize: 10, fontWeight: '700' }}>{fmt}</Text>
+                  </View>
+                ))}
+              </View>
+
+              {/* Room Live Sync Status Banner */}
+              <View style={{ backgroundColor: isHostBroadcasting ? '#064E3B' : '#0F172A', borderColor: isHostBroadcasting ? '#10B981' : '#334155', borderWidth: 1, borderRadius: 8, padding: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                <View style={{ flex: 1, marginRight: 8 }}>
+                  <Text style={{ color: isHostBroadcasting ? '#10B981' : '#94A3B8', fontSize: 11, fontWeight: 'bold' }}>
+                    {isHostBroadcasting ? `📡 রুম #${roomCode} লাইভ সিঙ্ক চালু আছে` : '🎵 লোকাল মিডিয়া প্লেয়ার মোড'}
+                  </Text>
+                  <Text style={{ color: '#CBD5E1', fontSize: 11, marginTop: 2 }}>
+                    {isHostBroadcasting ? 'যা প্লে করবেন সব লিসেনারদের হেডফোনে একই সাথে বাজবে!' : 'রুমে ব্রডকাস্ট করতে পাশের টগল অন করুন।'}
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={{ backgroundColor: broadcastToRoom ? '#10B981' : '#334155', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}
+                  onPress={() => {
+                    const next = !broadcastToRoom;
+                    setBroadcastToRoom(next);
+                    if (next && currentMedia && isMediaPlaying) {
+                      setIsHostBroadcasting(true);
+                      NativeNetwork.updateBroadcastState(true, currentMedia.title, masterVolume).catch(() => {});
+                    }
+                    showToast(next ? '📡 রুমে লাইভ ব্রডকাস্ট অন করা হয়েছে' : '🔕 ব্রডকাস্ট অফ (শুধু নিজের ফোনে বাজবে)', 'info');
+                  }}>
+                  <Text style={{ color: '#FFFFFF', fontSize: 11, fontWeight: 'bold' }}>{broadcastToRoom ? 'BROADCAST: ON' : 'BROADCAST: OFF'}</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Now Playing Floating / Sticky Deck (If an item is selected or playing) */}
+            {currentMedia && (
+              <View style={[styles.card, { borderColor: '#06B6D4', backgroundColor: '#091528' }]}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 10 }}>
+                  <View style={{ width: 44, height: 44, borderRadius: 8, backgroundColor: currentMedia.type === 'video' ? '#581C87' : '#0E7490', justifyContent: 'center', alignItems: 'center', marginRight: 12 }}>
+                    <Text style={{ fontSize: 22 }}>{currentMedia.type === 'video' ? '🎬' : '🎵'}</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: 'bold' }} numberOfLines={1}>{currentMedia.title}</Text>
+                      <View style={{ backgroundColor: currentMedia.type === 'video' ? '#9333EA' : '#06B6D4', paddingHorizontal: 5, paddingVertical: 1, borderRadius: 4 }}>
+                        <Text style={{ color: '#FFFFFF', fontSize: 9, fontWeight: 'bold' }}>{currentMedia.format}</Text>
+                      </View>
+                    </View>
+                    <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 2 }}>{currentMedia.artist} • {currentMedia.size}</Text>
+                  </View>
+                </View>
+
+                {/* Interactive Scrubbable Seek Bar */}
+                <View style={{ marginVertical: 6 }}>
+                  <View style={{ height: 6, backgroundColor: '#1E293B', borderRadius: 3, overflow: 'hidden', position: 'relative' }}>
+                    <View
+                      style={{
+                        height: '100%',
+                        backgroundColor: '#06B6D4',
+                        width: playbackDur > 0 ? `${Math.min(100, Math.max(0, (playbackPos / playbackDur) * 100))}%` : '0%',
+                      }}
+                    />
+                  </View>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}>
+                    <Text style={{ color: '#06B6D4', fontSize: 11, fontWeight: '700' }}>{formatTime(playbackPos)}</Text>
+                    <Text style={{ color: '#64748B', fontSize: 11 }}>{formatTime(playbackDur)}</Text>
+                  </View>
+                </View>
+
+                {/* Playback Controls Row */}
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 16, marginTop: 8 }}>
+                  <TouchableOpacity
+                    style={{ backgroundColor: '#1E293B', width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' }}
+                    onPress={handleRewind10}>
+                    <Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: 'bold' }}>-10s</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={{ backgroundColor: '#06B6D4', width: 56, height: 56, borderRadius: 28, justifyContent: 'center', alignItems: 'center', elevation: 6 }}
+                    onPress={handleTogglePlayPause}>
+                    <Text style={{ color: '#000000', fontSize: 24, fontWeight: 'bold' }}>{isMediaPlaying ? '⏸' : '▶'}</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={{ backgroundColor: '#1E293B', width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' }}
+                    onPress={handleForward10}>
+                    <Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: 'bold' }}>+10s</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={{ backgroundColor: '#EF4444', width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' }}
+                    onPress={handleStopMedia}>
+                    <Text style={{ color: '#FFFFFF', fontSize: 16, fontWeight: 'bold' }}>⏹</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+
+            {/* Category Filter Tabs & Toolbar */}
+            <View style={styles.card}>
+              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+                {[
+                  { key: 'all', label: `🌟 All (${mediaFiles.length})` },
+                  { key: 'audio', label: `🎵 Audio (${mediaFiles.filter(m => m.type === 'audio').length})` },
+                  { key: 'video', label: `🎬 Video (${mediaFiles.filter(m => m.type === 'video').length})` },
+                ].map(tab => (
+                  <TouchableOpacity
+                    key={tab.key}
+                    style={{
+                      flex: 1,
+                      backgroundColor: mediaCategory === tab.key ? '#06B6D4' : '#1E293B',
+                      paddingVertical: 8,
+                      borderRadius: 8,
+                      alignItems: 'center',
+                    }}
+                    onPress={() => {
+                      setMediaCategory(tab.key as any);
+                      loadDeviceMedia(tab.key as any);
+                    }}>
+                    <Text style={{ color: mediaCategory === tab.key ? '#000000' : '#CBD5E1', fontSize: 12, fontWeight: 'bold' }}>
+                      {tab.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {/* Search Box */}
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                <TextInput
+                  style={{ flex: 1, backgroundColor: '#0F172A', borderColor: '#334155', borderWidth: 1, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, color: '#FFFFFF', fontSize: 13 }}
+                  placeholder="গান বা ভিডিও খুঁজুন... (Search Media)"
+                  placeholderTextColor="#64748B"
+                  value={mediaSearch}
+                  onChangeText={setMediaSearch}
+                />
+                <TouchableOpacity
+                  style={{ backgroundColor: '#1E293B', paddingHorizontal: 12, paddingVertical: 9, borderRadius: 8 }}
+                  onPress={() => loadDeviceMedia(mediaCategory)}>
+                  <Text style={{ color: '#06B6D4', fontSize: 13, fontWeight: 'bold' }}>🔄</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Pick from My Files / Storage Button */}
+              <TouchableOpacity
+                style={{ backgroundColor: '#0891B2', paddingVertical: 11, borderRadius: 8, alignItems: 'center', marginBottom: 14 }}
+                onPress={handlePickCustomMedia}>
+                <Text style={{ color: '#FFFFFF', fontWeight: 'bold', fontSize: 13 }}>📂 ফোনের মেমোরি / My Files থেকে যেকোনো ফাইল খুলুন</Text>
+              </TouchableOpacity>
+
+              {/* Media Files List */}
+              {isLoadingMedia ? (
+                <View style={{ paddingVertical: 30, alignItems: 'center' }}>
+                  <ActivityIndicator size="large" color="#06B6D4" />
+                  <Text style={{ color: '#94A3B8', fontSize: 13, marginTop: 10 }}>ডিভাইসের মিডিয়া ফাইল স্ক্যান করা হচ্ছে...</Text>
+                </View>
+              ) : (
+                <View>
+                  {mediaFiles
+                    .filter(m => {
+                      if (mediaCategory !== 'all' && m.type !== mediaCategory) return false;
+                      if (!mediaSearch.trim()) return true;
+                      const q = mediaSearch.toLowerCase();
+                      return m.title.toLowerCase().includes(q) || m.artist.toLowerCase().includes(q) || m.format.toLowerCase().includes(q);
+                    })
+                    .slice(0, 50)
+                    .map(item => {
+                      const isCurrent = currentMedia?.uri === item.uri && isMediaPlaying;
+                      return (
+                        <TouchableOpacity
+                          key={item.id}
+                          style={{
+                            flexDirection: 'row',
+                            alignItems: 'center',
+                            paddingVertical: 10,
+                            paddingHorizontal: 8,
+                            borderRadius: 8,
+                            backgroundColor: isCurrent ? '#06B6D415' : 'transparent',
+                            borderBottomColor: '#1E293B',
+                            borderBottomWidth: 1,
+                            marginBottom: 2,
+                          }}
+                          onPress={() => handlePlayMedia(item)}>
+                          <View style={{ width: 38, height: 38, borderRadius: 8, backgroundColor: item.type === 'video' ? '#581C87' : '#0E7490', justifyContent: 'center', alignItems: 'center', marginRight: 10 }}>
+                            <Text style={{ fontSize: 18 }}>{item.type === 'video' ? '🎬' : '🎧'}</Text>
+                          </View>
+                          <View style={{ flex: 1, marginRight: 8 }}>
+                            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                              <Text style={{ color: isCurrent ? '#06B6D4' : '#FFFFFF', fontSize: 13, fontWeight: '600' }} numberOfLines={1}>
+                                {item.title}
+                              </Text>
+                              <View style={{ backgroundColor: item.type === 'video' ? '#9333EA25' : '#06B6D425', borderColor: item.type === 'video' ? '#9333EA' : '#06B6D4', borderWidth: 1, paddingHorizontal: 4, paddingVertical: 1, borderRadius: 3 }}>
+                                <Text style={{ color: item.type === 'video' ? '#C084FC' : '#67E8F9', fontSize: 8, fontWeight: 'bold' }}>{item.format}</Text>
+                              </View>
+                            </View>
+                            <Text style={{ color: '#64748B', fontSize: 11, marginTop: 2 }}>
+                              {item.artist} {item.duration > 0 ? `• ${formatTime(item.duration / 1000)}` : ''} • {item.size}
+                            </Text>
+                          </View>
+                          <View style={{ backgroundColor: isCurrent ? '#10B981' : '#06B6D4', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}>
+                            <Text style={{ color: '#000000', fontSize: 11, fontWeight: 'bold' }}>{isCurrent ? 'LIVE ⏸' : 'PLAY ▶'}</Text>
+                          </View>
+                        </TouchableOpacity>
+                      );
+                    })}
+
+                  {mediaFiles.length === 0 && !isLoadingMedia && (
+                    <View style={{ paddingVertical: 24, alignItems: 'center' }}>
+                      <Text style={{ fontSize: 32, marginBottom: 8 }}>📁</Text>
+                      <Text style={{ color: '#94A3B8', fontSize: 14, fontWeight: 'bold', textAlign: 'center' }}>কোনো মিডিয়া ফাইল পাওয়া যায়নি</Text>
+                      <Text style={{ color: '#64748B', fontSize: 12, textAlign: 'center', marginTop: 4 }}>
+                        ওপরের "My Files থেকে খুলুন" বাটন চেপে আপনার ফোনের যেকোনো ফোল্ডার থেকে গান বা ভিডিও বেছে নিন
+                      </Text>
+                    </View>
+                  )}
+                </View>
+              )}
+            </View>
+          </View>
+        )}
+
+        {/* ═══════════════════════════════════════════════════════════════════
             PAGE 3: 📻 WALKIE-TALKIE (UNIFIED ROOM VOICE - NO CHANNELS)
         ═══════════════════════════════════════════════════════════════════ */}
         {activePage === 'walkie' && (
@@ -1907,28 +2175,35 @@ export default function App(): React.JSX.Element {
           style={[styles.navItem, activePage === 'host' && styles.navItemActive]}
           onPress={() => setActivePage('host')}>
           <Text style={[styles.navIcon, activePage === 'host' && styles.navIconActive]}>📡</Text>
-          <Text style={[styles.navLabel, activePage === 'host' && styles.navLabelActive]}>Host Room</Text>
+          <Text style={[styles.navLabel, activePage === 'host' && styles.navLabelActive]}>Host</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
           style={[styles.navItem, activePage === 'join' && styles.navItemActive]}
           onPress={() => setActivePage('join')}>
           <Text style={[styles.navIcon, activePage === 'join' && styles.navIconActive]}>🎧</Text>
-          <Text style={[styles.navLabel, activePage === 'join' && styles.navLabelActive]}>Join Room</Text>
+          <Text style={[styles.navLabel, activePage === 'join' && styles.navLabelActive]}>Join</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.navItem, activePage === 'media' && styles.navItemActive]}
+          onPress={() => setActivePage('media')}>
+          <Text style={[styles.navIcon, activePage === 'media' && styles.navIconActive]}>🎬</Text>
+          <Text style={[styles.navLabel, activePage === 'media' && styles.navLabelActive]}>Media</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
           style={[styles.navItem, activePage === 'walkie' && styles.navItemActive]}
           onPress={() => setActivePage('walkie')}>
           <Text style={[styles.navIcon, activePage === 'walkie' && styles.navIconActive]}>📻</Text>
-          <Text style={[styles.navLabel, activePage === 'walkie' && styles.navLabelActive]}>Walkie-Talkie</Text>
+          <Text style={[styles.navLabel, activePage === 'walkie' && styles.navLabelActive]}>Walkie</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
           style={[styles.navItem, activePage === 'devices' && styles.navItemActive]}
           onPress={() => setActivePage('devices')}>
           <Text style={[styles.navIcon, activePage === 'devices' && styles.navIconActive]}>📱</Text>
-          <Text style={[styles.navLabel, activePage === 'devices' && styles.navLabelActive]}>Devices ({devices.length})</Text>
+          <Text style={[styles.navLabel, activePage === 'devices' && styles.navLabelActive]}>Devices</Text>
         </TouchableOpacity>
       </View>
 
