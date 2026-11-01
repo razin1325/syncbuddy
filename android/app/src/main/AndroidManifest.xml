@@ -33,6 +33,7 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <!-- ── System Audio Capture (Android 10+) ── -->
@@ -88,6 +89,13 @@
             android:name="com.syncbuddy.network.AudioCaptureService"
             android:foregroundServiceType="mediaProjection"
             android:exported="false" />
+
+        <!-- Media3 Fullscreen Video Player Activity (VLC Style) -->
+        <activity
+            android:name="com.syncbuddy.media.Media3FullscreenActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />
 
     </application>
 </manifest>

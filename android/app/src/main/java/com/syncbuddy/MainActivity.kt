@@ -39,6 +39,7 @@ class MainActivity : ReactActivity() {
 
     override fun onDestroy() {
         com.syncbuddy.network.SyncNetworkModule.dismissAllNotifications(this)
+        com.syncbuddy.media.Media3Manager.release()
         instance = null
         super.onDestroy()
     }

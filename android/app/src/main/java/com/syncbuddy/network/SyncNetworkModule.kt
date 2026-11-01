@@ -1138,37 +1138,35 @@ class SyncNetworkModule(
     private var isFileBroadcasting = false
     private var isFilePaused = false
     private var fileBroadcasterThread: Thread? = null
+    private var activeFileAudioTrack: AudioTrack? = null
 
     @Volatile private var seekRequestedUs: Long = -1L
     @Volatile private var currentFilePositionSec: Double = 0.0
     @Volatile private var currentFileDurationSec: Double = 0.0
 
-    @ReactMethod
-    fun pauseAudioFile(promise: Promise) {
-        isFilePaused = true
-        promise.resolve(true)
-    }
+    @Synchronized
+    private fun stopAudioFileInternal() {
+        isFileBroadcasting = false
+        try {
+            activeFileAudioTrack?.pause()
+            activeFileAudioTrack?.flush()
+            activeFileAudioTrack?.stop()
+            activeFileAudioTrack?.release()
+        } catch (e: Exception) {}
+        activeFileAudioTrack = null
 
-    @ReactMethod
-    fun resumeAudioFile(promise: Promise) {
-        isFilePaused = false
-        promise.resolve(true)
-    }
+        try {
+            fileBroadcasterThread?.interrupt()
+        } catch (e: Exception) {}
+        fileBroadcasterThread = null
 
-    @ReactMethod
-    fun seekAudioFile(positionSeconds: Double, promise: Promise) {
-        seekRequestedUs = (positionSeconds * 1_000_000.0).toLong()
-        currentFilePositionSec = positionSeconds
-        promise.resolve(true)
-    }
+        seekRequestedUs = -1L
+        currentFilePositionSec = 0.0
+        currentFileDurationSec = 0.0
 
-    @ReactMethod
-    fun getAudioPlaybackState(promise: Promise) {
-        val map = Arguments.createMap()
-        map.putBoolean("isPlaying", isFileBroadcasting && !isFilePaused)
-        map.putDouble("position", currentFilePositionSec)
-        map.putDouble("duration", currentFileDurationSec)
-        promise.resolve(map)
+        try {
+            com.syncbuddy.media.Media3Manager.stop()
+        } catch (e: Exception) {}
     }
 
     private fun formatFileSize(bytes: Long): String {
@@ -1316,10 +1314,120 @@ class SyncNetworkModule(
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Google Media3 (ExoPlayer) Unified Audio & Video Engine
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @ReactMethod
+    fun playMediaFile(uriString: String, isVideo: Boolean, promise: Promise) {
+        try {
+            stopAudioFileInternal()
+            stopAudioBroadcasterInternal()
+            com.syncbuddy.media.Media3Manager.play(reactApplicationContext, uriString, isVideo)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_PLAY_MEDIA", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun pauseMediaFile(promise: Promise) {
+        try {
+            com.syncbuddy.media.Media3Manager.pause()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_PAUSE_MEDIA", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun resumeMediaFile(promise: Promise) {
+        try {
+            com.syncbuddy.media.Media3Manager.resume()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_RESUME_MEDIA", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun stopMediaFile(promise: Promise) {
+        try {
+            stopAudioFileInternal()
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_STOP_MEDIA", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun seekMediaFile(positionSeconds: Double, promise: Promise) {
+        try {
+            com.syncbuddy.media.Media3Manager.seekTo(positionSeconds)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_SEEK_MEDIA", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun getMediaPlaybackState(promise: Promise) {
+        try {
+            val map = Arguments.createMap()
+            map.putBoolean("isPlaying", com.syncbuddy.media.Media3Manager.isPlaying())
+            map.putDouble("position", com.syncbuddy.media.Media3Manager.getPosition())
+            map.putDouble("duration", com.syncbuddy.media.Media3Manager.getDuration())
+            map.putBoolean("isVideo", com.syncbuddy.media.Media3Manager.isVideo)
+            promise.resolve(map)
+        } catch (e: Exception) {
+            promise.reject("ERR_GET_PLAYBACK_STATE", e.message)
+        }
+    }
+
+    @ReactMethod
+    fun launchFullscreenVideo(promise: Promise) {
+        try {
+            val activity = currentActivity
+            if (activity != null) {
+                val intent = Intent(activity, com.syncbuddy.media.Media3FullscreenActivity::class.java)
+                activity.startActivity(intent)
+                promise.resolve(true)
+            } else {
+                promise.reject("ERR_NO_ACTIVITY", "Current activity not available")
+            }
+        } catch (e: Exception) {
+            promise.reject("ERR_FULLSCREEN", e.message)
+        }
+    }
+
+    // Backward-compatible delegates
     @ReactMethod
     fun playAudioFile(uriString: String, promise: Promise) {
+        playMediaFile(uriString, false, promise)
+    }
+
+    @ReactMethod
+    fun pauseAudioFile(promise: Promise) {
+        pauseMediaFile(promise)
+    }
+
+    @ReactMethod
+    fun resumeAudioFile(promise: Promise) {
+        resumeMediaFile(promise)
+    }
+
+    @ReactMethod
+    fun seekAudioFile(positionSeconds: Double, promise: Promise) {
+        seekMediaFile(positionSeconds, promise)
+    }
+
+    @ReactMethod
+    fun getAudioPlaybackState(promise: Promise) {
+        getMediaPlaybackState(promise)
+    }
+
+    private fun legacyStreamAudioFile(uriString: String) {
         try {
-            stopAudioBroadcasterInternal()
             acquireMulticastLock()
             isFileBroadcasting = true
             isFilePaused = false
@@ -1580,18 +1688,13 @@ class SyncNetworkModule(
             fileBroadcasterThread?.start()
             promise.resolve(true)
         } catch (e: Exception) {
-            promise.reject("ERR_PLAY_FILE", e.message)
+            e.printStackTrace()
         }
     }
 
     @ReactMethod
     fun stopAudioFile(promise: Promise) {
-        isFileBroadcasting = false
-        fileBroadcasterThread = null
-        seekRequestedUs = -1L
-        currentFilePositionSec = 0.0
-        currentFileDurationSec = 0.0
-        promise.resolve(true)
+        stopMediaFile(promise)
     }
 
     @ReactMethod
@@ -1913,6 +2016,8 @@ class SyncNetworkModule(
     override fun onCatalystInstanceDestroy() {
         dismissStatusNotificationInternal()
         stopAudioBroadcasterInternal()
+        stopAudioFileInternal()
+        com.syncbuddy.media.Media3Manager.release()
         super.onCatalystInstanceDestroy()
     }
 }

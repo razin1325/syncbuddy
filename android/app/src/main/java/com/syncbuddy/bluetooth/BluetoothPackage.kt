@@ -27,6 +27,8 @@ class BluetoothPackage : ReactPackage {
 
     override fun createViewManagers(
         reactContext: ReactApplicationContext
-    ): List<ViewManager<*, *>> = emptyList()
+    ): List<ViewManager<*, *>> = listOf(
+        com.syncbuddy.media.Media3PlayerViewManager()
+    )
 }
 

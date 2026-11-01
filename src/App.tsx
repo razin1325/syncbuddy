@@ -23,7 +23,10 @@ import {
   Modal,
   Animated,
   PermissionsAndroid,
+  requireNativeComponent,
 } from 'react-native';
+
+const Media3PlayerView = Platform.OS === 'android' ? requireNativeComponent<any>('Media3PlayerView') : View;
 import {
   NativeBluetooth,
   NativeAuracast,
@@ -364,16 +367,18 @@ export default function App(): React.JSX.Element {
   }, [activePage, showToast]);
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 4. Unified Audio Receiver (Runs for Host & Listener whenever in room or on Walkie-Talkie)
+  // 4. Unified Audio Receiver (Runs only for Listeners or Walkie-Talkie; Host is the source)
   // ─────────────────────────────────────────────────────────────────────────────
   useEffect(() => {
-    const shouldReceiveAudio = !!joinedRoom || isHostBroadcasting || activePage === 'walkie' || hostParticipants.length > 0;
+    // Only listeners (joined a room) or users in walkie-talkie mode (when not transmitting) should receive audio.
+    // Host is the broadcast source and should NEVER receive its own broadcast audio!
+    const shouldReceiveAudio = !!joinedRoom || (activePage === 'walkie' && !isTalking);
     if (shouldReceiveAudio) {
       NativeNetwork.startAudioReceiver().catch(() => {});
     } else {
       NativeNetwork.stopAudioReceiver().catch(() => {});
     }
-  }, [joinedRoom, isHostBroadcasting, activePage, hostParticipants.length]);
+  }, [joinedRoom, activePage, isTalking]);
 
   // Listener Heartbeat Polling Loop
   useEffect(() => {
@@ -1081,8 +1086,13 @@ export default function App(): React.JSX.Element {
         setIsHostBroadcasting(true);
         NativeNetwork.updateBroadcastState(true, item.title, masterVolume).catch(() => {});
       }
-      await NativeNetwork.playAudioFile(item.uri);
-      showToast(`▶️ ${item.title} প্লে হচ্ছে! [${item.format}]`, 'success');
+      await NativeNetwork.playMediaFile(item.uri, item.type === 'video');
+      showToast(
+        item.type === 'video'
+          ? `🎬 ${item.title} ভিডিও প্লে হচ্ছে! [${item.format}]`
+          : `▶️ ${item.title} অডিও প্লে হচ্ছে! [${item.format}]`,
+        'success',
+      );
     } catch {
       showToast('মিডিয়া প্লে করতে সমস্যা হয়েছে', 'error');
     }
@@ -1091,18 +1101,18 @@ export default function App(): React.JSX.Element {
   const handleTogglePlayPause = async () => {
     if (!currentMedia) return;
     if (isMediaPlaying) {
-      await NativeNetwork.pauseAudioFile();
+      await NativeNetwork.pauseMediaFile();
       setIsMediaPlaying(false);
       showToast('⏸️ পজ করা হয়েছে', 'info');
     } else {
-      await NativeNetwork.resumeAudioFile();
+      await NativeNetwork.resumeMediaFile();
       setIsMediaPlaying(true);
       showToast('▶️ চালু করা হয়েছে', 'success');
     }
   };
 
   const handleStopMedia = async () => {
-    await NativeNetwork.stopAudioFile();
+    await NativeNetwork.stopMediaFile();
     setIsMediaPlaying(false);
     setPlaybackPos(0);
     if (isHostBroadcasting && !joinedRoom) {
@@ -1114,7 +1124,7 @@ export default function App(): React.JSX.Element {
 
   const handleSeek = async (newPosSec: number) => {
     setPlaybackPos(newPosSec);
-    await NativeNetwork.seekAudioFile(newPosSec);
+    await NativeNetwork.seekMediaFile(newPosSec);
   };
 
   const handleRewind10 = async () => {
@@ -1153,11 +1163,11 @@ export default function App(): React.JSX.Element {
     if (isMediaPlaying) {
       timer = setInterval(async () => {
         try {
-          const state = await NativeNetwork.getAudioPlaybackState();
+          const state = await NativeNetwork.getMediaPlaybackState();
           if (state) {
             setPlaybackPos(state.position);
             if (state.duration > 0) setPlaybackDur(state.duration);
-            if (!state.isPlaying && state.duration > 0 && state.position >= state.duration - 1) {
+            if (!state.isPlaying && state.duration > 0 && state.position >= state.duration - 0.5) {
               setIsMediaPlaying(false);
             }
           }
@@ -1784,21 +1794,67 @@ export default function App(): React.JSX.Element {
 
             {/* Now Playing Floating / Sticky Deck (If an item is selected or playing) */}
             {currentMedia && (
-              <View style={[styles.card, { borderColor: '#06B6D4', backgroundColor: '#091528' }]}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 10 }}>
-                  <View style={{ width: 44, height: 44, borderRadius: 8, backgroundColor: currentMedia.type === 'video' ? '#581C87' : '#0E7490', justifyContent: 'center', alignItems: 'center', marginRight: 12 }}>
-                    <Text style={{ fontSize: 22 }}>{currentMedia.type === 'video' ? '🎬' : '🎵'}</Text>
+              <View style={[styles.card, { borderColor: '#06B6D4', backgroundColor: '#091528', padding: 12 }]}>
+                {/* ── Real Google Media3 Video Player Surface (If Video file) ── */}
+                {currentMedia.type === 'video' ? (
+                  <View style={{ width: '100%', height: 210, backgroundColor: '#000000', borderRadius: 12, overflow: 'hidden', position: 'relative', marginBottom: 12 }}>
+                    <Media3PlayerView
+                      style={{ width: '100%', height: '100%' }}
+                      uri={currentMedia.uri}
+                      isPlaying={isMediaPlaying}
+                      resizeMode="fit"
+                      useController={false}
+                    />
+                    {/* Fullscreen Overlay Pill */}
+                    <TouchableOpacity
+                      style={{
+                        position: 'absolute',
+                        top: 10,
+                        right: 10,
+                        backgroundColor: '#000000B0',
+                        borderColor: '#06B6D4',
+                        borderWidth: 1,
+                        paddingHorizontal: 10,
+                        paddingVertical: 5,
+                        borderRadius: 8,
+                        flexDirection: 'row',
+                        alignItems: 'center',
+                        gap: 6,
+                      }}
+                      onPress={() => NativeNetwork.launchFullscreenVideo()}>
+                      <Text style={{ color: '#06B6D4', fontSize: 13, fontWeight: 'bold' }}>⛶ Fullscreen</Text>
+                    </TouchableOpacity>
                   </View>
-                  <View style={{ flex: 1 }}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                      <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: 'bold' }} numberOfLines={1}>{currentMedia.title}</Text>
-                      <View style={{ backgroundColor: currentMedia.type === 'video' ? '#9333EA' : '#06B6D4', paddingHorizontal: 5, paddingVertical: 1, borderRadius: 4 }}>
-                        <Text style={{ color: '#FFFFFF', fontSize: 9, fontWeight: 'bold' }}>{currentMedia.format}</Text>
-                      </View>
+                ) : (
+                  /* ── Audio Deck (If Audio file) ── */
+                  <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 10 }}>
+                    <View style={{ width: 48, height: 48, borderRadius: 10, backgroundColor: '#0E7490', justifyContent: 'center', alignItems: 'center', marginRight: 12 }}>
+                      <Text style={{ fontSize: 24 }}>🎵</Text>
                     </View>
-                    <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 2 }}>{currentMedia.artist} • {currentMedia.size}</Text>
+                    <View style={{ flex: 1 }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: 'bold', flex: 1 }} numberOfLines={1}>{currentMedia.title}</Text>
+                        <View style={{ backgroundColor: '#06B6D4', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
+                          <Text style={{ color: '#FFFFFF', fontSize: 9, fontWeight: 'bold' }}>{currentMedia.format}</Text>
+                        </View>
+                      </View>
+                      <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 2 }}>{currentMedia.artist} • {currentMedia.size}</Text>
+                    </View>
                   </View>
-                </View>
+                )}
+
+                {/* If video, also show Title & Format underneath video */}
+                {currentMedia.type === 'video' && (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                    <View style={{ flex: 1, marginRight: 8 }}>
+                      <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: 'bold' }} numberOfLines={1}>{currentMedia.title}</Text>
+                      <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 2 }}>{currentMedia.artist} • {currentMedia.size}</Text>
+                    </View>
+                    <View style={{ backgroundColor: '#9333EA', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}>
+                      <Text style={{ color: '#FFFFFF', fontSize: 10, fontWeight: 'bold' }}>{currentMedia.format} HD</Text>
+                    </View>
+                  </View>
+                )}
 
                 {/* Interactive Scrubbable Seek Bar */}
                 <View style={{ marginVertical: 6 }}>
@@ -1820,7 +1876,7 @@ export default function App(): React.JSX.Element {
                 {/* Playback Controls Row */}
                 <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 16, marginTop: 8 }}>
                   <TouchableOpacity
-                    style={{ backgroundColor: '#1E293B', width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' }}
+                    style={{ backgroundColor: '#1E293B', width: 42, height: 42, borderRadius: 21, justifyContent: 'center', alignItems: 'center' }}
                     onPress={handleRewind10}>
                     <Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: 'bold' }}>-10s</Text>
                   </TouchableOpacity>
@@ -1832,13 +1888,13 @@ export default function App(): React.JSX.Element {
                   </TouchableOpacity>
 
                   <TouchableOpacity
-                    style={{ backgroundColor: '#1E293B', width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' }}
+                    style={{ backgroundColor: '#1E293B', width: 42, height: 42, borderRadius: 21, justifyContent: 'center', alignItems: 'center' }}
                     onPress={handleForward10}>
                     <Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: 'bold' }}>+10s</Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity
-                    style={{ backgroundColor: '#EF4444', width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' }}
+                    style={{ backgroundColor: '#EF4444', width: 42, height: 42, borderRadius: 21, justifyContent: 'center', alignItems: 'center' }}
                     onPress={handleStopMedia}>
                     <Text style={{ color: '#FFFFFF', fontSize: 16, fontWeight: 'bold' }}>⏹</Text>
                   </TouchableOpacity>

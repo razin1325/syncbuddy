@@ -248,6 +248,92 @@ export const NativeNetwork = {
   },
 
   /**
+   * Play an offline audio or video file with Google Media3
+   */
+  async playMediaFile(uri: string, isVideo: boolean = false): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.playMediaFile) return false;
+    try {
+      return await SyncNetworkModule.playMediaFile(uri, isVideo);
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Pause media playback
+   */
+  async pauseMediaFile(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.pauseMediaFile) return false;
+    try {
+      return await SyncNetworkModule.pauseMediaFile();
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Resume media playback
+   */
+  async resumeMediaFile(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.resumeMediaFile) return false;
+    try {
+      return await SyncNetworkModule.resumeMediaFile();
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Stop media playback
+   */
+  async stopMediaFile(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.stopMediaFile) return false;
+    try {
+      return await SyncNetworkModule.stopMediaFile();
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Seek media playback to a specific timestamp in seconds
+   */
+  async seekMediaFile(positionSeconds: number): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.seekMediaFile) return false;
+    try {
+      return await SyncNetworkModule.seekMediaFile(positionSeconds);
+    } catch {
+      return false;
+    }
+  },
+
+  /**
+   * Get live media playback progress and duration in seconds
+   */
+  async getMediaPlaybackState(): Promise<{ isPlaying: boolean; position: number; duration: number; isVideo: boolean }> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.getMediaPlaybackState) {
+      return { isPlaying: false, position: 0, duration: 0, isVideo: false };
+    }
+    try {
+      return await SyncNetworkModule.getMediaPlaybackState();
+    } catch {
+      return { isPlaying: false, position: 0, duration: 0, isVideo: false };
+    }
+  },
+
+  /**
+   * Launch native edge-to-edge fullscreen video player activity (VLC Style)
+   */
+  async launchFullscreenVideo(): Promise<boolean> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.launchFullscreenVideo) return false;
+    try {
+      return await SyncNetworkModule.launchFullscreenVideo();
+    } catch {
+      return false;
+    }
+  },
+
+  /**
    * Play an offline audio file and stream its decoded PCM frames to all listeners
    */
   async playAudioFile(uri: string): Promise<boolean> {
