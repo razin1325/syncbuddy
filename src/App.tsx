@@ -8,7 +8,7 @@
  *   └── Page 4: 📱 Devices (BLE Hardware Manager, On-Demand 10s Scan, Real Battery)
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   SafeAreaView,
   ScrollView,
@@ -22,6 +22,8 @@ import {
   Platform,
   Modal,
   Animated,
+  Image,
+  PanResponder,
   PermissionsAndroid,
   requireNativeComponent,
 } from 'react-native';
@@ -77,10 +79,10 @@ export interface AudioTrack {
 }
 
 const AUDIO_TRACKS: AudioTrack[] = [
-  { id: 't0', title: 'Cyber Sync Beat (Auto Melody)', artist: 'টেস্ট ট্র্যাক • কোনো ফাইল ছাড়া সরাসরি টেস্ট করুন', duration: 'Loop', source: 'synth' },
-  { id: 't1', title: 'Local Audio File (ডাউনলোড করা গান)', artist: 'মেমোরি থেকে যেকোনো MP3/গান সিলেক্ট করুন', duration: 'File', source: 'file' },
-  { id: 't2', title: 'Live Mic Pass-through', artist: 'ফোনের মাইক দিয়ে কথা বা সাউন্ড', duration: 'Live', source: 'mic' },
-  { id: 't3', title: 'System Audio Loopback (Spotify / YouTube)', artist: 'অন্যান্য অ্যাপের ব্যাকগ্রাউন্ড সাউন্ড', duration: 'Live', source: 'music' },
+  { id: 't0', title: 'Cyber Sync Beat (Auto Melody)', artist: 'Test track • Plays a built-in melody, no file needed', duration: 'Loop', source: 'synth' },
+  { id: 't1', title: 'Local Audio File (downloaded music)', artist: 'Pick any MP3 or song from your storage', duration: 'File', source: 'file' },
+  { id: 't2', title: 'Live Mic Pass-through', artist: 'Talk or play sound through the phone mic', duration: 'Live', source: 'mic' },
+  { id: 't3', title: 'System Audio Loopback (Spotify / YouTube)', artist: 'Background sound from other apps', duration: 'Live', source: 'music' },
 ];
 
 function detectDeviceType(name: string): DeviceType {
@@ -113,10 +115,10 @@ function detectDeviceType(name: string): DeviceType {
 }
 
 function getSignalInfo(rssi: number) {
-  if (rssi >= -50) return { label: 'Excellent', color: '#10B981', dots: '••••' };
-  if (rssi >= -65) return { label: 'Good', color: '#06B6D4', dots: '•••○' };
-  if (rssi >= -78) return { label: 'Fair', color: '#F59E0B', dots: '••○○' };
-  return { label: 'Weak', color: '#EF4444', dots: '•○○○' };
+  if (rssi >= -50) return { label: 'Excellent', color: '#34D399', dots: '••••' };
+  if (rssi >= -65) return { label: 'Good', color: '#22D3EE', dots: '•••○' };
+  if (rssi >= -78) return { label: 'Fair', color: '#FBBF24', dots: '••○○' };
+  return { label: 'Weak', color: '#F87171', dots: '•○○○' };
 }
 
 // ─── Real Scannable ISO QR Code Matrix Component ─────────────────────────────
@@ -172,13 +174,371 @@ const qrS = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderRadius: 12,
     borderWidth: 2,
-    borderColor: '#06B6D4',
+    borderColor: '#22D3EE',
     padding: 10,
     alignItems: 'center',
     justifyContent: 'center',
     elevation: 8,
   },
 });
+
+// ─── Media Library: helpers ──────────────────────────────────────────────────
+
+/**
+ * Containers the bundled Media3 extractors cannot demux. They are still listed
+ * (so nothing on the phone is hidden) but are handed to an installed player
+ * instead of failing silently inside the app.
+ */
+const EXTERNAL_ONLY_VIDEO = [
+  'AVI', 'WMV', 'ASF', 'FLV', 'F4V', 'MPG', 'MPEG', 'M2TS', 'TS', 'TSV',
+  'RM', 'RMVB', 'VOB', 'OGV', 'DIVX', '3G2',
+];
+const EXTERNAL_ONLY_AUDIO = [
+  'APE', 'WV', 'MPC', 'AIFF', 'AIF', 'DSF', 'DFF', 'WMA', 'TAK', 'TTA',
+];
+
+function needsExternalPlayer(item: DeviceMediaItem): boolean {
+  const fmt = (item.format || '').toUpperCase();
+  const list = item.type === 'video' ? EXTERNAL_ONLY_VIDEO : EXTERNAL_ONLY_AUDIO;
+  return list.indexOf(fmt) >= 0;
+}
+
+/** 3:07 or 1:02:44 — input is milliseconds. */
+function formatDurationMs(ms: number): string {
+  if (!ms || ms <= 0 || !isFinite(ms)) return '--:--';
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function mediaDayLabel(ts: number): string {
+  const d = new Date(ts);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const that = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((today - that) / 86400000);
+  if (days === 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days > 1 && days < 7) return d.toLocaleDateString('en-GB', { weekday: 'long' });
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+interface MediaGroup {
+  key: string;
+  label: string;
+  items: DeviceMediaItem[];
+}
+
+function groupMediaByDate(items: DeviceMediaItem[]): MediaGroup[] {
+  const groups: MediaGroup[] = [];
+  items.forEach(item => {
+    const ts = item.dateAdded || 0;
+    const key = ts > 0 ? new Date(ts).toDateString() : 'unknown';
+    const last = groups[groups.length - 1];
+    if (last && last.key === key) {
+      last.items.push(item);
+    } else {
+      groups.push({ key, label: ts > 0 ? mediaDayLabel(ts) : 'Older files', items: [item] });
+    }
+  });
+  return groups;
+}
+
+// ─── Media Library: components ───────────────────────────────────────────────
+
+/** Album art / video poster with a graceful icon fallback. */
+const MediaArt: React.FC<{
+  uri?: string;
+  type: 'audio' | 'video';
+  size?: number;
+  radius?: number;
+}> = ({ uri, type, size = 50, radius = 12 }) => {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setFailed(false);
+  }, [uri]);
+
+  if (uri && !failed) {
+    return (
+      <Image
+        source={{ uri }}
+        style={{ width: size, height: size, borderRadius: radius, backgroundColor: '#101017' }}
+        onError={() => setFailed(true)}
+        resizeMode="cover"
+      />
+    );
+  }
+  return (
+    <View
+      style={{
+        width: size,
+        height: size,
+        borderRadius: radius,
+        backgroundColor: type === 'video' ? '#2E1065' : '#0E7490',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}>
+      <Text style={{ fontSize: Math.round(size * 0.4) }}>{type === 'video' ? '🎬' : '🎵'}</Text>
+    </View>
+  );
+};
+
+/** One library row: art, title, meta, format badge, duration, play state. */
+const MediaRow: React.FC<{
+  item: DeviceMediaItem;
+  active: boolean;
+  playing: boolean;
+  onPress: () => void;
+}> = ({ item, active, playing, onPress }) => {
+  const external = needsExternalPlayer(item);
+  return (
+    <TouchableOpacity
+      style={[styles.mediaRow, active && styles.mediaRowActive]}
+      onPress={onPress}
+      activeOpacity={0.75}>
+      <MediaArt uri={item.albumArt} type={item.type} size={50} />
+      <View style={{ flex: 1, marginLeft: 12 }}>
+        <Text style={[styles.mediaRowTitle, active && { color: '#22D3EE' }]} numberOfLines={2}>
+          {item.title}
+        </Text>
+        <Text style={styles.mediaRowMeta} numberOfLines={1}>
+          {item.type === 'video' ? item.folder || 'Video' : item.artist || 'Unknown artist'} · {item.size}
+        </Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4 }}>
+          <View style={styles.mediaFmtBadge}>
+            <Text style={styles.mediaFmtBadgeText}>{item.format}</Text>
+          </View>
+          {external && (
+            <View style={styles.mediaExtBadge}>
+              <Text style={styles.mediaExtBadgeText}>↗ EXTERNAL</Text>
+            </View>
+          )}
+          {active && (
+            <Text style={{ color: '#34D399', fontSize: 10, fontWeight: '800' }}>
+              {playing ? '● PLAYING' : '❚❚ PAUSED'}
+            </Text>
+          )}
+        </View>
+      </View>
+      <View style={{ alignItems: 'center', marginLeft: 8 }}>
+        <Text style={styles.mediaRowDuration}>{formatDurationMs(item.duration)}</Text>
+        <View style={[styles.mediaPlayPill, active && styles.mediaPlayPillActive]}>
+          <Text style={styles.mediaPlayPillText}>{active && playing ? '❚❚' : '▶'}</Text>
+        </View>
+      </View>
+    </TouchableOpacity>
+  );
+};
+
+/** Draggable progress bar. Values are seconds. */
+const SeekBar: React.FC<{
+  position: number;
+  duration: number;
+  onSeek: (seconds: number) => void;
+}> = ({ position, duration, onSeek }) => {
+  const [width, setWidth] = useState(0);
+  const [drag, setDrag] = useState<number | null>(null);
+  const widthRef = useRef(0);
+  widthRef.current = width;
+  const durationRef = useRef(duration);
+  durationRef.current = duration;
+  const seekRef = useRef(onSeek);
+  seekRef.current = onSeek;
+  const startFrac = useRef(0);
+
+  const responder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: e => {
+          const w = widthRef.current || 1;
+          const f = Math.min(1, Math.max(0, e.nativeEvent.locationX / w));
+          startFrac.current = f;
+          setDrag(f);
+        },
+        onPanResponderMove: (_e, g) => {
+          const w = widthRef.current || 1;
+          setDrag(Math.min(1, Math.max(0, startFrac.current + g.dx / w)));
+        },
+        onPanResponderRelease: (_e, g) => {
+          const w = widthRef.current || 1;
+          const f = Math.min(1, Math.max(0, startFrac.current + g.dx / w));
+          setDrag(null);
+          if (durationRef.current > 0) seekRef.current(f * durationRef.current);
+        },
+        onPanResponderTerminate: () => setDrag(null),
+      }),
+    [],
+  );
+
+  const frac =
+    drag !== null ? drag : duration > 0 ? Math.min(1, Math.max(0, position / duration)) : 0;
+
+  return (
+    <View
+      style={styles.seekBarHit}
+      onLayout={e => setWidth(e.nativeEvent.layout.width)}
+      {...responder.panHandlers}>
+      <View style={styles.seekTrack}>
+        <View style={[styles.seekFill, { width: `${frac * 100}%` }]} />
+      </View>
+      <View style={[styles.seekKnob, { left: Math.max(0, frac * width - 7) }]} />
+    </View>
+  );
+};
+
+/** Full player sheet: artwork / video surface, scrubber, transport controls. */
+const NowPlayingSheet: React.FC<{
+  visible: boolean;
+  item: DeviceMediaItem | null;
+  isPlaying: boolean;
+  position: number;
+  duration: number;
+  error: string | null;
+  broadcastToRoom: boolean;
+  shuffle: boolean;
+  onClose: () => void;
+  onToggle: () => void;
+  onSeek: (seconds: number) => void;
+  onNext: () => void;
+  onPrev: () => void;
+  onStop: () => void;
+  onToggleBroadcast: () => void;
+  onToggleShuffle: () => void;
+  onOpenExternal: () => void;
+}> = p => {
+  const item = p.item;
+  const forward = p.duration > 0 ? Math.min(p.duration, p.position + 10) : p.position + 10;
+  return (
+    <Modal visible={p.visible && !!item} transparent animationType="slide" onRequestClose={p.onClose}>
+      <View style={styles.sheetBackdrop}>
+        <View style={styles.sheet}>
+          <View style={styles.sheetHandle} />
+          {item && (
+            <>
+              <View style={styles.sheetTopRow}>
+                <Text style={styles.sheetBadge}>
+                  {item.type === 'video' ? 'VIDEO PLAYER' : 'NOW PLAYING'}
+                </Text>
+                <TouchableOpacity
+                  onPress={p.onClose}
+                  hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+                  <Text style={styles.sheetClose}>✕</Text>
+                </TouchableOpacity>
+              </View>
+
+              {item.type === 'video' ? (
+                <View style={styles.videoSurface}>
+                  {Platform.OS === 'android' ? (
+                    <Media3PlayerView
+                      style={{ width: '100%', height: '100%' }}
+                      uri={item.uri}
+                      isPlaying={p.isPlaying}
+                      resizeMode="fit"
+                      useController={false}
+                    />
+                  ) : (
+                    // Browser preview has no Media3 surface, so show the poster
+                    // instead of an unexplained black rectangle.
+                    <View style={styles.videoPoster}>
+                      <Text style={styles.videoPosterIcon}>🎬</Text>
+                      <Text style={styles.videoPosterTitle} numberOfLines={2}>
+                        {item.title}
+                      </Text>
+                      <Text style={styles.videoPosterHint}>
+                        {item.format} video — plays on device with Media3
+                      </Text>
+                    </View>
+                  )}
+                  <TouchableOpacity
+                    style={styles.fullscreenPill}
+                    onPress={() => NativeNetwork.launchFullscreenVideo()}>
+                    <Text style={styles.fullscreenPillText}>⛶ Fullscreen</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <MediaArt uri={item.albumArt} type="audio" size={196} radius={18} />
+              )}
+
+              <Text style={styles.sheetTitle} numberOfLines={2}>
+                {item.title}
+              </Text>
+              <Text style={styles.sheetArtist} numberOfLines={1}>
+                {item.artist}
+                {item.album ? ` • ${item.album}` : ''} • {item.format} • {item.size}
+              </Text>
+
+              {p.error ? (
+                <View style={styles.mediaErrorBox}>
+                  <Text style={styles.mediaErrorText}>
+                    This file won't play in the built-in player.
+                  </Text>
+                  <TouchableOpacity style={styles.mediaErrorBtn} onPress={p.onOpenExternal}>
+                    <Text style={styles.mediaErrorBtnText}>Open in another player ↗</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : null}
+
+              <SeekBar position={p.position} duration={p.duration} onSeek={p.onSeek} />
+              <View style={styles.sheetTimeRow}>
+                <Text style={styles.sheetTime}>{formatDurationMs(p.position * 1000)}</Text>
+                <Text style={styles.sheetTime}>{formatDurationMs(p.duration * 1000)}</Text>
+              </View>
+
+              <View style={styles.sheetControls}>
+                <TouchableOpacity style={styles.sheetSideBtn} onPress={p.onPrev}>
+                  <Text style={styles.sheetSideBtnText}>⏮</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.sheetSkipBtn}
+                  onPress={() => p.onSeek(Math.max(0, p.position - 10))}>
+                  <Text style={styles.sheetSkipText}>-10</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.sheetPlayBtn} onPress={p.onToggle}>
+                  <Text style={styles.sheetPlayText}>{p.isPlaying ? '⏸' : '▶'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.sheetSkipBtn} onPress={() => p.onSeek(forward)}>
+                  <Text style={styles.sheetSkipText}>+10</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.sheetSideBtn} onPress={p.onNext}>
+                  <Text style={styles.sheetSideBtnText}>⏭</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.sheetSideBtn} onPress={p.onStop}>
+                  <Text style={[styles.sheetSideBtnText, { color: '#F87171' }]}>⏹</Text>
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.sheetFooter}>
+                <TouchableOpacity
+                  style={[styles.sheetChip, p.shuffle && styles.sheetChipOn]}
+                  onPress={p.onToggleShuffle}>
+                  <Text style={[styles.sheetChipText, p.shuffle && styles.sheetChipTextOn]}>
+                    🔀 Shuffle
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.sheetChip, p.broadcastToRoom && styles.sheetChipOn]}
+                  onPress={p.onToggleBroadcast}>
+                  <Text style={[styles.sheetChipText, p.broadcastToRoom && styles.sheetChipTextOn]}>
+                    {p.broadcastToRoom ? '📡 Room Sync' : '🔕 Room Sync'}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.sheetChip} onPress={p.onOpenExternal}>
+                  <Text style={styles.sheetChipText}>↗ Another app</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+        </View>
+      </View>
+    </Modal>
+  );
+};
 
 // ─── Main Application ─────────────────────────────────────────────────────────
 
@@ -225,6 +585,10 @@ export default function App(): React.JSX.Element {
   const [playbackPos, setPlaybackPos] = useState<number>(0);
   const [playbackDur, setPlaybackDur] = useState<number>(0);
   const [broadcastToRoom, setBroadcastToRoom] = useState<boolean>(true);
+  const [mediaRenderLimit, setMediaRenderLimit] = useState<number>(60);
+  const [showPlayer, setShowPlayer] = useState<boolean>(false);
+  const [mediaError, setMediaError] = useState<string | null>(null);
+  const [isShuffle, setIsShuffle] = useState<boolean>(false);
 
   // Join Room State (Listener)
   const [inputRoomCode, setInputRoomCode] = useState<string>('');
@@ -307,12 +671,12 @@ export default function App(): React.JSX.Element {
   // Listen to Host Events (Listener Joined / Left / PTT)
   useEffect(() => {
     const subJoined = NativeNetwork.onListenerJoined((e: ListenerJoinedEvent) => {
-      showToast(`🔔 ${e.name} (${e.ip}) রুমে যুক্ত হয়েছে!`, 'success');
+      showToast(`🔔 ${e.name} (${e.ip}) joined the room!`, 'success');
       NativeNetwork.getParticipants().then(setHostParticipants).catch(() => { });
     });
 
     const subLeft = NativeNetwork.onListenerLeft((e: ListenerLeftEvent) => {
-      showToast(`ℹ️ ${e.name} রুম থেকে বের হয়েছে`, 'info');
+      showToast(`ℹ️ ${e.name} left the room`, 'info');
       NativeNetwork.getParticipants().then(setHostParticipants).catch(() => { });
     });
 
@@ -354,7 +718,7 @@ export default function App(): React.JSX.Element {
         setDiscoveredRooms(prev => {
           const exists = prev.some(item => item.hostIp === r.hostIp && item.roomCode === r.roomCode);
           if (exists) return prev;
-          showToast(`🌟 লোকাল রুমে পাওয়া গেছে: ${r.hostName} (#${r.roomCode})!`, 'info');
+          showToast(`🌟 Room found on your network: ${r.hostName} (#${r.roomCode})`, 'info');
           return [...prev, { ...r, lastDiscovered: Date.now() }];
         });
       });
@@ -430,29 +794,29 @@ export default function App(): React.JSX.Element {
       return;
     }
 
-    let title = 'SyncBuddy • সক্রিয় 🟢';
-    let msg = 'অফলাইন অডিও সিঙ্ক ব্যাকগ্রাউন্ডে সক্রিয়';
+    let title = 'SyncBuddy • Active 🟢';
+    let msg = 'Offline audio sync is running in the background';
 
     if (isTalking) {
-      title = 'SyncBuddy • ওয়াকি-টকি কথা বলছেন... 🎙️';
-      msg = 'আপনার ভয়েস লাইভ সম্প্রচার হচ্ছে';
+      title = 'SyncBuddy • You are speaking… 🎙️';
+      msg = 'Your voice is being broadcast live';
     } else if (activeSpeaker) {
-      title = `SyncBuddy • ${activeSpeaker} কথা বলছেন 🔊`;
-      msg = 'ওয়াকি-টকি ভয়েস লাইভ শোনা যাচ্ছে';
+      title = `SyncBuddy • ${activeSpeaker} is speaking 🔊`;
+      msg = 'Live walkie-talkie voice';
     } else if (isHostBroadcasting) {
       const count = hostParticipants.length;
-      title = `SyncBuddy • ব্রডকাস্ট চলছে 🔴 (রুম #${roomCode})`;
-      msg = `মিউজিক সবার হেডফোনে বাজছে • ${count > 0 ? `${count} জন শুনছেন` : 'লিসেনারদের অপেক্ষা'}`;
+      title = `SyncBuddy • Broadcasting 🔴 (Room #${roomCode})`;
+      msg = `Music playing on every headphone • ${count > 0 ? `${count} listening` : 'waiting for listeners'}`;
     } else if (isStreamingMedia) {
-      title = 'SyncBuddy • মিডিয়া প্লেয়ার স্ট্রিম 🎵';
-      msg = `অডিও/ভিডিও সবার ডিভাইসে প্লে হচ্ছে (${hostParticipants.length} জন সংযুক্ত)`;
+      title = 'SyncBuddy • Media streaming 🎵';
+      msg = `Audio/video playing on every device (${hostParticipants.length} connected)`;
     } else if (isHostingWithGuests) {
       const count = hostParticipants.length;
-      title = `SyncBuddy • হোস্ট রুম #${roomCode} 📡`;
-      msg = `${count} টি ডিভাইস সংযুক্ত • অডিও ব্রডকাস্ট প্রস্তুত`;
+      title = `SyncBuddy • Host room #${roomCode} 📡`;
+      msg = `${count} devices connected • ready to broadcast`;
     } else if (joinedRoom) {
-      title = `SyncBuddy • সংযুক্ত 🎧 (রুম #${joinedRoom.code})`;
-      msg = `হোস্ট: ${joinedRoom.hostName} • অডিও সিঙ্ক ও ওয়াকি-টকি অন`;
+      title = `SyncBuddy • Connected 🎧 (Room #${joinedRoom.code})`;
+      msg = `Host: ${joinedRoom.hostName} • audio sync and walkie-talkie on`;
     }
 
     NativeNetwork.showPersistentNotification(title, msg).catch(() => {});
@@ -546,7 +910,7 @@ export default function App(): React.JSX.Element {
               }),
             );
             showToast(
-              connected ? 'হেডফোন কানেক্টেড হয়েছে!' : 'হেডফোন ডিসকানেক্টেড হয়েছে',
+              connected ? 'Headphones connected!' : 'Headphones disconnected',
               connected ? 'success' : 'warn',
             );
           },
@@ -611,14 +975,14 @@ export default function App(): React.JSX.Element {
   // ─────────────────────────────────────────────────────────────────────────────
   const handleStartScan = async () => {
     if (!btEnabled) {
-      showToast('আগে ব্লুটুথ অন করুন', 'warn');
+      showToast('Turn on Bluetooth first', 'warn');
       return;
     }
     if (isScanning) return;
 
     setIsScanning(true);
     setScanCountdown(10);
-    showToast('১০ সেকেন্ডের জন্য স্ক্যান চলছে (ব্যাটারি সেভিং মোড)...', 'info');
+    showToast('Scanning for 10 seconds (battery saver mode)…', 'info');
 
     if (scanTimer.current) clearInterval(scanTimer.current);
     scanTimer.current = setInterval(() => {
@@ -626,7 +990,7 @@ export default function App(): React.JSX.Element {
         if (prev <= 1) {
           clearInterval(scanTimer.current);
           setIsScanning(false);
-          showToast('স্ক্যান সম্পন্ন! ব্লুটুথ রেডিও স্লিপ মোডে গেছে।', 'info');
+          showToast('Scan complete. Bluetooth radio is back in sleep mode.', 'info');
           return 0;
         }
         return prev - 1;
@@ -656,7 +1020,7 @@ export default function App(): React.JSX.Element {
   };
 
   const handleConnectDevice = async (device: BluetoothDevice) => {
-    showToast(`${device.name}-এর সাথে কানেক্ট করার চেষ্টা করা হচ্ছে...`, 'info');
+    showToast(`Connecting to ${device.name}…`, 'info');
     setDevices(prev =>
       prev.map(d => (d.id === device.id ? { ...d, status: 'Connecting' as DeviceStatus } : d)),
     );
@@ -668,7 +1032,7 @@ export default function App(): React.JSX.Element {
           setDevices(prev =>
             prev.map(d => (d.id === device.id ? { ...d, status: 'Connected', isSelected: true, rssi: -42 } : d)),
           );
-          showToast(`${device.name} অ্যাক্টিভ এবং কানেক্টেড!`, 'success');
+          showToast(`${device.name} is active and connected!`, 'success');
           return;
         }
 
@@ -681,7 +1045,7 @@ export default function App(): React.JSX.Element {
                 : d,
             ),
           );
-          showToast(`${device.name} সফলভাবে কানেক্টেড!`, 'success');
+          showToast(`${device.name} connected successfully!`, 'success');
           return;
         }
 
@@ -699,18 +1063,18 @@ export default function App(): React.JSX.Element {
           setDevices(prev =>
             prev.map(d => (d.id === device.id ? { ...d, status: 'Connected', isSelected: true, rssi: -42 } : d)),
           );
-          showToast(`${device.name} সফলভাবে কানেক্টেড!`, 'success');
+          showToast(`${device.name} connected successfully!`, 'success');
         } else {
           setDevices(prev =>
             prev.map(d => (d.id === device.id ? { ...d, status: 'Paired', isSelected: false, rssi: -85 } : d)),
           );
-          showToast(`${device.name} চালু নেই বা ব্লুটুথ রেঞ্জে পাওয়া যায়নি! হেডফোন অন করুন।`, 'error');
+          showToast(`${device.name} is off or out of range — turn it on first.`, 'error');
         }
       } catch (err: any) {
         setDevices(prev =>
           prev.map(d => (d.id === device.id ? { ...d, status: 'Paired', isSelected: false } : d)),
         );
-        showToast(`কানেকশন ব্যর্থ: ${err?.message || 'Device unreachable'}`, 'error');
+        showToast(`Connection failed: ${err?.message || 'Device unreachable'}`, 'error');
       }
     }
   };
@@ -730,7 +1094,7 @@ export default function App(): React.JSX.Element {
     const code = Math.floor(1000 + Math.random() * 9000).toString();
     setRoomCode(code);
     NativeNetwork.startRoomServer(code, 8942).catch(() => { });
-    showToast(`নতুন ৪ ডিজিটের রুম নম্বর: #${code}`, 'success');
+    showToast(`New 4-digit room code: #${code}`, 'success');
   };
 
   const handleToggleHostBroadcast = async () => {
@@ -743,7 +1107,7 @@ export default function App(): React.JSX.Element {
           if (!uriToPlay) {
             const picked = await NativeNetwork.pickAudioFile();
             if (!picked || !picked.uri) {
-              showToast('অনুগ্রহ করে একটি গান সিলেক্ট করুন', 'warn');
+              showToast('Please select a song first', 'warn');
               return;
             }
             setSelectedFileUri(picked.uri);
@@ -759,12 +1123,12 @@ export default function App(): React.JSX.Element {
         NativeNetwork.updateBroadcastState(true, activeTrack.title, masterVolume).catch(() => {});
         showToast(
           activeTrack.source === 'synth'
-            ? `রুম #${roomCode} সাইবার সিঙ্ক বিট লাইভ বাজা শুরু হয়েছে! ⚡`
+          ? `Room #${roomCode} — Cyber Sync Beat is live! ⚡`
             : activeTrack.source === 'file'
-            ? `রুম #${roomCode} ডাউনলোড করা গান সবার ফোনে বাজা শুরু হয়েছে! 🎵`
+          ? `Room #${roomCode} — your saved song is playing on every phone! 🎵`
             : activeTrack.source === 'mic'
-            ? `রুম #${roomCode} মাইক লাইভ ব্রডকাস্ট শুরু হয়েছে! 🎙️`
-            : `রুম #${roomCode} সিস্টেম অডিও ব্রডকাস্ট শুরু হয়েছে! 📱`,
+          ? `Room #${roomCode} — live mic broadcast started! 🎙️`
+          : `Room #${roomCode} — system audio broadcast started! 📱`,
           'success',
         );
         if (Platform.OS === 'android') {
@@ -772,10 +1136,10 @@ export default function App(): React.JSX.Element {
         }
       } catch (err: any) {
         const msg = err?.message || '';
-        if (msg.includes('DENIED') || msg.includes('অনুমতি')) {
-          showToast('অডিও ক্যাপচার অনুমতি দেওয়া হয়নি', 'warn');
+        if (msg.includes('DENIED') || msg.toLowerCase().includes('permission')) {
+          showToast('Audio capture permission was not granted', 'warn');
         } else {
-          showToast('ব্রডকাস্ট শুরু করতে সমস্যা হয়েছে', 'error');
+          showToast('Could not start the broadcast', 'error');
         }
       }
     } else {
@@ -785,7 +1149,7 @@ export default function App(): React.JSX.Element {
         NativeNetwork.stopAudioFile().catch(() => {});
       }
       NativeNetwork.stopAudioBroadcaster().catch(() => {});
-      showToast('ব্রডকাস্ট বন্ধ করা হয়েছে', 'info');
+      showToast('Broadcast stopped', 'info');
     }
   };
 
@@ -794,9 +1158,9 @@ export default function App(): React.JSX.Element {
     if (!targetIp || targetIp.trim().length === 0) {
       setJoinFeedback({
         type: 'warn',
-        message: 'অনুগ্রহ করে হোস্টের ৪-ডিজিটের রুম নম্বর বা IP লিখুন।',
+        message: 'Enter the host’s 4-digit room code or IP address.',
       });
-      showToast('হোস্টের IP অ্যাড্রেস লিখুন', 'warn');
+      showToast('Enter the host’s IP address', 'warn');
       return;
     }
 
@@ -804,20 +1168,20 @@ export default function App(): React.JSX.Element {
     if (networkInfo?.ipAddress && targetIp.trim() === networkInfo.ipAddress.trim()) {
       setJoinFeedback({
         type: 'warn',
-        message: 'এটি আপনার নিজের ফোন! অন্য কোনো ফোনের রুমে যুক্ত হোন।',
+        message: 'That is this phone. Join from another device.',
       });
-      showToast('⚠️ এটি আপনার নিজের ফোন! অন্য কোনো ফোনের রুমে যুক্ত হোন।', 'warn');
+      showToast('⚠️ That is this phone — join from another device.', 'warn');
       return;
     }
 
     // Never join own phone's room!
     if (networkInfo?.ipAddress && targetIp.trim() === networkInfo.ipAddress.trim()) {
-      showToast('⚠️ এটি আপনার নিজের ফোন! অন্য কোনো ফোনের রুমে যুক্ত হোন।', 'warn');
+      showToast('⚠️ That is this phone — join from another device.', 'warn');
       return;
     }
 
     setIsJoining(true);
-    showToast(`হোস্টে সংযোগ খোঁজা হচ্ছে...`, 'info');
+    showToast(`Looking for the host…`, 'info');
 
     try {
       const myName = networkInfo?.deviceName || 'SyncBuddy Listener';
@@ -827,15 +1191,15 @@ export default function App(): React.JSX.Element {
         if (res.reason === 'ROOM_CODE_MISMATCH') {
           setJoinFeedback({
             type: 'error',
-            message: 'রুম কোডটি মেলেনি! হোস্টের স্ক্রিনে থাকা ৪-ডিজিট কোডটি দেখে আবার চেষ্টা করুন।',
+            message: 'Wrong room code. Check the 4-digit code on the host screen and try again.',
           });
-          showToast('🔐 রুম কোড মেলেনি! হোস্টের কোডটি মিলিয়ে নিন।', 'warn');
+        showToast('🔐 Wrong room code — match the code shown on the host.', 'warn');
         } else {
           setJoinFeedback({
             type: 'error',
-            message: res.message || 'রুমে যুক্ত হওয়া সম্ভব হয়নি।',
+            message: res.message || 'Could not join this room.',
           });
-          showToast(res.message || 'হোস্টে কানেক্ট করা সম্ভব হয়নি', 'warn');
+            showToast(res.message || 'Could not connect to the host', 'warn');
         }
         return;
       }
@@ -851,13 +1215,13 @@ export default function App(): React.JSX.Element {
       // Immediately spin up audio receiver so sound plays without waiting
       NativeNetwork.startAudioReceiver().catch(() => {});
 
-      showToast(`✅ ${res.hostName || 'হোস্ট'} এর রুমে সফলভাবে যুক্ত হয়েছেন!`, 'success');
+      showToast(`✅ Joined ${res.hostName || 'the host'}'s room!`, 'success');
     } catch (e: any) {
       setJoinFeedback({
         type: 'warn',
-        message: 'হোস্ট পাওয়া যায়নি। উভয় ফোন একই Wi-Fi বা অফলাইন Hotspot-এ আছেন কি না নিশ্চিত করুন।',
+        message: 'Host not found. Make sure both phones are on the same Wi-Fi or offline hotspot.',
       });
-      showToast('🔍 হোস্টের সন্ধান পাওয়া যায়নি। একই Wi-Fi/হটস্পটে আছেন কি?', 'warn');
+      showToast('🔍 Host not found. Are both phones on the same Wi-Fi or hotspot?', 'warn');
     } finally {
       setIsJoining(false);
     }
@@ -915,21 +1279,21 @@ export default function App(): React.JSX.Element {
       }
     }
 
-    showToast(`স্ক্যান করা ডাটা: ${trimmed}`, 'info');
+    showToast(`Scanned data: ${trimmed}`, 'info');
   };
 
   const handleOpenQrScanner = async () => {
     try {
       const scanned = await NativeNetwork.openCameraScanner();
       if (scanned) {
-        showToast('QR কোড সফলভাবে স্ক্যান হয়েছে!', 'success');
+        showToast('QR code scanned successfully!', 'success');
         handleQrScanResult(scanned);
       }
     } catch (err: any) {
       const msg = err?.message || '';
       if (err?.code !== 'CANCELLED' && !msg.toLowerCase().includes('cancel')) {
         setShowQRScanner(true);
-        showToast('ক্যামেরা ওপেন করা যায়নি, সরাসরি কোড বা IP লিখুন', 'info');
+        showToast('Camera unavailable — type the code or IP instead', 'info');
       }
     }
   };
@@ -939,9 +1303,9 @@ export default function App(): React.JSX.Element {
     if (!target) {
       setJoinFeedback({
         type: 'warn',
-        message: 'অনুগ্রহ করে ৪-ডিজিটের রুম নম্বর অথবা হোস্টের IP লিখুন।',
+        message: 'Enter the 4-digit room code or the host’s IP address.',
       });
-      showToast('হোস্টের ৪-ডিজিটের রুম নম্বর লিখুন', 'warn');
+      showToast('Enter the host’s 4-digit room code', 'warn');
       return;
     }
 
@@ -963,10 +1327,10 @@ export default function App(): React.JSX.Element {
       const topRoom = otherDiscoveredRooms[0];
       setJoinFeedback({
         type: 'warn',
-        message: `রুম #${target} পাওয়া যায়নি। কাছাকাছি পাওয়া সক্রিয় রুম হলো #${topRoom.roomCode} (${topRoom.hostName})।`,
+        message: `Room #${target} not found. The nearest active room is #${topRoom.roomCode} (${topRoom.hostName}).`,
         suggestedRoom: topRoom,
       });
-      showToast(`🔍 রুম #${target} পাওয়া যায়নি! হোস্টের কোড মিলিয়ে দেখুন।`, 'warn');
+      showToast(`🔍 Room #${target} not found. Double-check the host code.`, 'warn');
       return;
     }
 
@@ -983,9 +1347,9 @@ export default function App(): React.JSX.Element {
     // 5. Professional friendly fallback message
     setJoinFeedback({
       type: 'warn',
-      message: `রুম #${target} লোকাল নেটওয়ার্কে পাওয়া যায়নি। হোস্টের স্ক্রিন দেখে কোডটি আবার লিখুন।`,
+      message: `Room #${target} is not on this network. Re-check the code on the host screen.`,
     });
-    showToast(`🔍 রুম #${target} সক্রিয় নেই। হোস্টের স্ক্রিন চেক করুন।`, 'warn');
+    showToast(`🔍 Room #${target} is not active. Check the host screen.`, 'warn');
   };
 
   const handleLeaveRoom = async () => {
@@ -997,7 +1361,7 @@ export default function App(): React.JSX.Element {
     setJoinedRoom(null);
     setInputRoomCode('');
     setInputHostIp('');
-    showToast('রুম ত্যাগ করা হয়েছে', 'info');
+    showToast('You left the room', 'info');
   };
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1010,7 +1374,7 @@ export default function App(): React.JSX.Element {
         if (!hasMic) {
           const res = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
           if (res !== PermissionsAndroid.RESULTS.GRANTED) {
-            showToast('মাইক্রোফোন পারমিশন প্রয়োজন!', 'error');
+      showToast('Microphone permission is required!', 'error');
             return;
           }
         }
@@ -1019,7 +1383,7 @@ export default function App(): React.JSX.Element {
       setIsTalking(true);
       const myName = networkInfo?.deviceName || 'This Phone';
       setActiveSpeaker(`${myName} (You)`);
-      showToast('🎙️ কথা বলুন... সবাই শুনছে!', 'info');
+      showToast('🎙️ You are live — everyone can hear you!', 'info');
 
       // 1. Start real low-latency microphone voice stream over UDP
       await NativeNetwork.startAudioBroadcaster('mic');
@@ -1033,7 +1397,7 @@ export default function App(): React.JSX.Element {
       }
     } catch (err: any) {
       setIsTalking(false);
-      showToast(`মাইক শুরু করতে সমস্যা: ${err?.message || ''}`, 'error');
+      showToast(`Could not start the mic: ${err?.message || ''}`, 'error');
     }
   };
 
@@ -1076,25 +1440,90 @@ export default function App(): React.JSX.Element {
     }
   }, []);
 
+  // ── Media library derivation: filtered, newest-first, progressively paged ──
+  const sortedMedia = useMemo(() => {
+    const q = mediaSearch.trim().toLowerCase();
+    return mediaFiles
+      .filter(m => {
+        if (mediaCategory !== 'all' && m.type !== mediaCategory) return false;
+        if (!q) return true;
+        return (
+          (m.title || '').toLowerCase().includes(q) ||
+          (m.artist || '').toLowerCase().includes(q) ||
+          (m.album || '').toLowerCase().includes(q) ||
+          (m.format || '').toLowerCase().includes(q)
+        );
+      })
+      .sort((a, b) => (b.dateAdded || 0) - (a.dateAdded || 0));
+  }, [mediaFiles, mediaCategory, mediaSearch]);
+
+  const visibleMedia = useMemo(
+    () => sortedMedia.slice(0, mediaRenderLimit),
+    [sortedMedia, mediaRenderLimit],
+  );
+  const mediaGroups = useMemo(() => groupMediaByDate(visibleMedia), [visibleMedia]);
+
+  const audioCount = useMemo(() => mediaFiles.filter(m => m.type === 'audio').length, [mediaFiles]);
+  const videoCount = useMemo(() => mediaFiles.filter(m => m.type === 'video').length, [mediaFiles]);
+  const librarySizeLabel = useMemo(() => {
+    const bytes = mediaFiles.reduce((sum, m) => sum + (m.sizeBytes || 0), 0);
+    if (bytes <= 0) return '—';
+    return bytes >= 1073741824
+      ? `${(bytes / 1073741824).toFixed(2)} GB`
+      : `${(bytes / 1048576).toFixed(1)} MB`;
+  }, [mediaFiles]);
+
+  const nextMediaRef = useRef<(() => void) | null>(null);
+  const mediaCountRef = useRef(0);
+  mediaCountRef.current = sortedMedia.length;
+
   const handlePlayMedia = async (item: DeviceMediaItem) => {
     try {
+      setMediaError(null);
       setCurrentMedia(item);
       setPlaybackPos(0);
       setPlaybackDur(item.duration > 0 ? item.duration / 1000 : 0);
       setIsMediaPlaying(true);
+      if (item.type === 'video') setShowPlayer(true);
+
+      // Containers Media3 cannot demux (AVI, MPEG-TS, WMV, RM...) are handed to a
+      // real external player instead of failing silently inside the app.
+      if (needsExternalPlayer(item)) {
+        setIsMediaPlaying(false);
+        setCurrentMedia(null);
+        setShowPlayer(false);
+        await NativeNetwork.stopMediaFile();
+        const opened = await NativeNetwork.openWithExternalPlayer(item.uri, item.mimeType || '');
+        showToast(
+          opened
+            ? `↗ Opening ${item.title} in another player`
+            : 'No installed player can open this format',
+          opened ? 'info' : 'error',
+        );
+        return;
+      }
+
       if (broadcastToRoom) {
         setIsHostBroadcasting(true);
         NativeNetwork.updateBroadcastState(true, item.title, masterVolume).catch(() => {});
       }
-      await NativeNetwork.playMediaFile(item.uri, item.type === 'video', broadcastToRoom);
+
+      await NativeNetwork.playMediaFile(
+        item.uri,
+        item.type === 'video',
+        broadcastToRoom,
+        item.mimeType || '',
+        item.duration > 0 ? item.duration / 1000 : 0,
+      );
+
       showToast(
         item.type === 'video'
-          ? `🎬 ${item.title} ভিডিও ${broadcastToRoom ? 'লাইভ সম্প্রচার' : 'প্লে'} হচ্ছে! [${item.format}]`
-          : `▶️ ${item.title} অডিও ${broadcastToRoom ? 'লাইভ সম্প্রচার' : 'প্লে'} হচ্ছে! [${item.format}]`,
+          ? `🎬 ${item.title} — ${broadcastToRoom ? 'live in room' : 'this phone only'} [${item.format}]`
+          : `▶️ ${item.title} — ${broadcastToRoom ? 'live in room' : 'this phone only'} [${item.format}]`,
         'success',
       );
     } catch {
-      showToast('মিডিয়া প্লে করতে সমস্যা হয়েছে', 'error');
+      showToast('Could not play this media', 'error');
     }
   };
 
@@ -1103,11 +1532,11 @@ export default function App(): React.JSX.Element {
     if (isMediaPlaying) {
       await NativeNetwork.pauseMediaFile();
       setIsMediaPlaying(false);
-      showToast('⏸️ পজ করা হয়েছে', 'info');
+      showToast('⏸️ Paused', 'info');
     } else {
       await NativeNetwork.resumeMediaFile();
       setIsMediaPlaying(true);
-      showToast('▶️ চালু করা হয়েছে', 'success');
+      showToast('▶️ Playing', 'success');
     }
   };
 
@@ -1115,11 +1544,13 @@ export default function App(): React.JSX.Element {
     await NativeNetwork.stopMediaFile();
     setIsMediaPlaying(false);
     setPlaybackPos(0);
+    setShowPlayer(false);
+    setCurrentMedia(null);
     if (isHostBroadcasting && !joinedRoom) {
       setIsHostBroadcasting(false);
       NativeNetwork.updateBroadcastState(false, '', masterVolume).catch(() => {});
     }
-    showToast('⏹️ মিডিয়া বন্ধ করা হয়েছে', 'info');
+    showToast('⏹️ Playback stopped', 'info');
   };
 
   const handleSeek = async (newPosSec: number) => {
@@ -1128,20 +1559,78 @@ export default function App(): React.JSX.Element {
   };
 
   const handleRewind10 = async () => {
-    const target = Math.max(0, playbackPos - 10);
-    await handleSeek(target);
+    await handleSeek(Math.max(0, playbackPos - 10));
   };
 
   const handleForward10 = async () => {
     const maxDur = playbackDur > 0 ? playbackDur : 999999;
-    const target = Math.min(maxDur, playbackPos + 10);
-    await handleSeek(target);
+    await handleSeek(Math.min(maxDur, playbackPos + 10));
+  };
+
+  const handleNextMedia = (direction: 1 | -1 = 1) => {
+    if (!currentMedia || sortedMedia.length === 0) return;
+    const idx = sortedMedia.findIndex(m => m.id === currentMedia.id);
+    if (idx < 0) return;
+    let nextIdx: number;
+    if (isShuffle && sortedMedia.length > 1) {
+      do {
+        nextIdx = Math.floor(Math.random() * sortedMedia.length);
+      } while (nextIdx === idx);
+    } else {
+      nextIdx = (idx + direction + sortedMedia.length) % sortedMedia.length;
+    }
+    handlePlayMedia(sortedMedia[nextIdx]);
+  };
+
+  // Auto-advance keeps playback continuous across the whole library.
+  nextMediaRef.current = () => handleNextMedia(1);
+
+  const handleOpenExternal = async () => {
+    if (!currentMedia) return;
+    const opened = await NativeNetwork.openWithExternalPlayer(
+      currentMedia.uri,
+      currentMedia.mimeType || '',
+    );
+    if (!opened) showToast('No external player found', 'error');
+  };
+
+  const toggleBroadcastToRoom = async () => {
+    const next = !broadcastToRoom;
+    setBroadcastToRoom(next);
+    if (currentMedia) {
+      if (next) {
+        setIsHostBroadcasting(true);
+        NativeNetwork.updateBroadcastState(true, currentMedia.title, masterVolume).catch(() => {});
+      } else {
+        setIsHostBroadcasting(false);
+        NativeNetwork.updateBroadcastState(false, '', masterVolume).catch(() => {});
+      }
+      // Re-opening the file restarts the player at 0:00, so remember where the
+      // user actually was and jump straight back — switching room sync must not
+      // throw away their place in the track.
+      const resumeAt = playbackPos;
+      await NativeNetwork.playMediaFile(
+        currentMedia.uri,
+        currentMedia.type === 'video',
+        next,
+        currentMedia.mimeType || '',
+        currentMedia.duration > 0 ? currentMedia.duration / 1000 : 0,
+      );
+      if (resumeAt > 0.5) {
+        await NativeNetwork.seekMediaFile(resumeAt);
+        setPlaybackPos(resumeAt);
+      }
+      if (isMediaPlaying) await NativeNetwork.resumeMediaFile();
+    }
+    showToast(next ? '📡 Broadcasting live to the room' : '🔕 Playing on this phone only', 'info');
   };
 
   const handlePickCustomMedia = async () => {
     const picked = await NativeNetwork.pickAudioFile();
     if (picked && picked.uri) {
-      const ext = picked.name.includes('.') ? picked.name.substring(picked.name.lastIndexOf('.') + 1).toUpperCase() : 'MEDIA';
+      const ext = picked.name.includes('.')
+        ? picked.name.substring(picked.name.lastIndexOf('.') + 1).toUpperCase()
+        : 'MEDIA';
       const isVideo = ['MP4', 'MKV', 'WEBM', '3GP', 'MOV', 'AVI'].includes(ext);
       const customItem: DeviceMediaItem = {
         id: 'picked_' + Date.now(),
@@ -1152,9 +1641,25 @@ export default function App(): React.JSX.Element {
         type: isVideo ? 'video' : 'audio',
         format: ext,
         size: 'Custom File',
+        dateAdded: Date.now(),
+        mimeType: '',
       };
       await handlePlayMedia(customItem);
     }
+  };
+
+  const handleRequestMediaPermissions = async () => {
+    if (Platform.OS !== 'android') return;
+    try {
+      const reqs: any[] = [];
+      if (typeof Platform.Version === 'number' && Platform.Version >= 33) {
+        reqs.push('android.permission.READ_MEDIA_AUDIO', 'android.permission.READ_MEDIA_VIDEO');
+      } else {
+        reqs.push(PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE);
+      }
+      await PermissionsAndroid.requestMultiple(reqs);
+      await loadDeviceMedia('all');
+    } catch {}
   };
 
   // Poll live playback position and duration
@@ -1168,7 +1673,12 @@ export default function App(): React.JSX.Element {
             setPlaybackPos(state.position);
             if (state.duration > 0) setPlaybackDur(state.duration);
             if (!state.isPlaying && state.duration > 0 && state.position >= state.duration - 0.5) {
-              setIsMediaPlaying(false);
+              // Track finished: roll on to the next file instead of going silent.
+              if (mediaCountRef.current > 1) {
+                nextMediaRef.current?.();
+              } else {
+                setIsMediaPlaying(false);
+              }
             }
           }
         } catch {}
@@ -1178,6 +1688,27 @@ export default function App(): React.JSX.Element {
       if (timer) clearInterval(timer);
     };
   }, [isMediaPlaying]);
+
+  // Surface native playback failures (unsupported codec / corrupt file) so the
+  // sheet can offer the external-player fallback instead of a silent dead end.
+  useEffect(() => {
+    const sub = NativeNetwork.onMediaError(e => {
+      setMediaError(e?.message || 'Playback failed');
+      setIsMediaPlaying(false);
+    });
+    return () => {
+      sub?.remove();
+    };
+  }, []);
+
+  // Load the library the first time the Media page is opened.
+  const mediaLoadedOnce = useRef(false);
+  useEffect(() => {
+    if (activePage === 'media' && !mediaLoadedOnce.current) {
+      mediaLoadedOnce.current = true;
+      loadDeviceMedia('all');
+    }
+  }, [activePage, mediaCategory, loadDeviceMedia]);
 
   const filteredDevices = devices.filter(d => {
     const q = searchQuery.toLowerCase();
@@ -1254,23 +1785,23 @@ export default function App(): React.JSX.Element {
         <View style={styles.netWarningBox}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 }}>
             <Text style={{ fontSize: 18 }}>⚠️</Text>
-            <Text style={styles.netWarningTitle}>কোনো অফলাইন নেটওয়ার্ক সক্রিয় নেই!</Text>
+          <Text style={styles.netWarningTitle}>No offline network is active</Text>
           </View>
           <Text style={styles.netWarningText}>
-            অফলাইনে গান ও কথা শেয়ার করতে নিচের যেকোনো একটি করুন:{'\n'}
-            ১. এই ফোনের Personal Hotspot চালু করুন (অন্য ফোন এতে কানেক্ট হবে){'\n'}
-            অথবা ২. একই Wi-Fi / অন্য ফোনের Hotspot-এ কানেক্ট করুন।
+            To share music and voice offline, do either of these:{'\n'}
+            1. Turn on this phone's Personal Hotspot (the other phone joins it){'\n'}
+            or 2. Connect both phones to the same Wi-Fi / hotspot.
           </Text>
           <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
             <TouchableOpacity
               style={styles.netActionBtn}
               onPress={() => NativeNetwork.openHotspotSettings()}>
-              <Text style={styles.netActionBtnText}>⚙️ Hotspot অন করুন</Text>
+              <Text style={styles.netActionBtnText}>⚙️ Turn on hotspot</Text>
             </TouchableOpacity>
             <TouchableOpacity
-              style={[styles.netActionBtn, { backgroundColor: '#1E293B' }]}
+              style={[styles.netActionBtn, { backgroundColor: '#17171F' }]}
               onPress={() => NativeNetwork.openWifiSettings()}>
-              <Text style={styles.netActionBtnText}>📶 Wi-Fi সেটিংস</Text>
+              <Text style={styles.netActionBtnText}>📶 Wi-Fi settings</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -1281,14 +1812,16 @@ export default function App(): React.JSX.Element {
         <View style={styles.netStatusStrip}>
           <View style={styles.netStatusDot} />
           <Text style={styles.netStatusText}>
-            {networkInfo.isHotspot ? 'মোবাইল হটস্পট' : 'লোকাল Wi-Fi'}: {networkInfo.ipAddress}:8942
+            {networkInfo.isHotspot ? 'Mobile hotspot' : 'Local Wi-Fi'}: {networkInfo.ipAddress}:8942
           </Text>
           <Text style={styles.netDeviceName}>({networkInfo.deviceName})</Text>
         </View>
       )}
 
       {/* ── Main Page Content ── */}
-      <ScrollView contentContainerStyle={styles.scrollBody} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={[styles.scrollBody, currentMedia && { paddingBottom: 150 }]}
+        showsVerticalScrollIndicator={false}>
         {/* ═══════════════════════════════════════════════════════════════════
             PAGE 1: 📡 HOST ROOM (REAL HTTP SERVER + PARTICIPANTS LIST)
         ═══════════════════════════════════════════════════════════════════ */}
@@ -1302,19 +1835,19 @@ export default function App(): React.JSX.Element {
                   <Text style={styles.roomCodeTitle}>{roomCode}</Text>
                 </View>
                 <TouchableOpacity style={styles.regenBtn} onPress={generateNewRoomCode}>
-                  <Text style={styles.regenBtnText}>⚡ নতুন কোড</Text>
+                  <Text style={styles.regenBtnText}>⚡ New code</Text>
                 </TouchableOpacity>
               </View>
 
               <Text style={styles.cardDesc}>
-                অন্য ফোন থেকে নিচের ৪-ডিজিটের রুম নম্বর ({roomCode}) লিখুন অথবা ক্যামেরা দিয়ে QR কোডটি স্ক্যান করে যুক্ত হোন।
+          On the other phone, enter the 4-digit room code ({roomCode}) or scan the QR code to join.
               </Text>
 
               {/* Real Standard ISO/IEC 18004 Scannable QR Code */}
               <View style={{ alignItems: 'center', marginVertical: 14 }}>
                 <RealQRMatrix value={qrPayload} size={180} />
-                <Text style={styles.qrHint}>📱 যেকোনো ক্যামেরা বা SyncBuddy দিয়ে স্ক্যান করুন</Text>
-                <Text style={styles.qrSubHint}>হোস্ট সার্ভার: {hostIp}:8942 (Zero Internet)</Text>
+          <Text style={styles.qrHint}>📱 Scan with any camera or the SyncBuddy app</Text>
+                <Text style={styles.qrSubHint}>Host server: {hostIp}:8942 (no internet needed)</Text>
               </View>
 
               {/* Real Live Connected Listeners Counter */}
@@ -1325,11 +1858,11 @@ export default function App(): React.JSX.Element {
                 <View style={{ flex: 1 }}>
                   <Text style={styles.listenerTitle}>
                     {connectedCount > 1
-                      ? `${connectedCount} জন ডিভাইসে অডিও সিঙ্ক হচ্ছে`
-                      : '১ জন (আপনি / হোস্ট)'}
+                      ? `Audio synced to ${connectedCount} devices`
+                      : '1 device (you / host)'}
                   </Text>
                   <Text style={styles.listenerSub}>
-                    {isHostBroadcasting ? '● অডিও লাইভ ব্রডকাস্ট হচ্ছে' : '○ ব্রডকাস্ট শুরু করতে নিচের বাটনে চাপ দিন'}
+                    {isHostBroadcasting ? '● Live audio broadcast running' : '○ Pick a source below to start broadcasting'}
                   </Text>
                 </View>
                 {isHostBroadcasting && (
@@ -1354,10 +1887,10 @@ export default function App(): React.JSX.Element {
             {/* ── Real Connected Participants List on Host ── */}
             <View style={styles.card}>
               <Text style={styles.sectionTitle}>
-                👥 সংযুক্ত ডিভাইসসমূহ ({connectedCount} জন)
+                👥 Connected devices ({connectedCount})
               </Text>
               <Text style={styles.cardDesc}>
-                যেসব ফোন আপনার রুমে যুক্ত হয়েছে তাদের তালিকা নিচে লাইভ দেখতে পাবেন:
+            Phones that join your room appear here live:
               </Text>
 
               {/* Host Phone */}
@@ -1365,9 +1898,9 @@ export default function App(): React.JSX.Element {
                 <Text style={{ fontSize: 20, marginRight: 10 }}>👑</Text>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.participantName}>
-                    {networkInfo?.deviceName || 'This Phone'} (হোস্ট / আপনি)
+                    {networkInfo?.deviceName || 'This Phone'} (host / you)
                   </Text>
-                  <Text style={styles.participantMeta}>IP: {hostIp}:8942 • প্রধান ব্রডকাস্টার</Text>
+                  <Text style={styles.participantMeta}>IP: {hostIp}:8942 • Primary broadcaster</Text>
                 </View>
                 <View style={styles.hostBadge}>
                   <Text style={styles.hostBadgeText}>HOST</Text>
@@ -1380,7 +1913,7 @@ export default function App(): React.JSX.Element {
                   <Text style={{ fontSize: 20, marginRight: 10 }}>📱</Text>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.participantName}>{p.name}</Text>
-                    <Text style={styles.participantMeta}>IP: {p.ip} • হেডফোনে লাইভ সিঙ্ক</Text>
+                    <Text style={styles.participantMeta}>IP: {p.ip} • Live sync to headphones</Text>
                   </View>
                   <View style={styles.syncedBadge}>
                     <Text style={styles.syncedBadgeText}>● SYNCED</Text>
@@ -1391,46 +1924,42 @@ export default function App(): React.JSX.Element {
               {hostParticipants.length === 0 && (
                 <View style={styles.noParticipantsBox}>
                   <Text style={styles.noParticipantsText}>
-                    এখনো কোনো লিসেনার যুক্ত হয়নি। অন্য ফোনে &quot;Join Room&quot; ওপেন করুন!
+                No listeners yet. Open "Join Room" on another phone!
                   </Text>
                 </View>
               )}
             </View>
 
-            {/* ─── Google Media3 & VLC Media Suite Card ─── */}
-            <View style={[styles.card, { borderColor: '#06B6D4' }]}>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                <View style={{ flex: 1, marginRight: 10 }}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                    <Text style={{ fontSize: 20 }}>🎬</Text>
-                    <Text style={styles.sectionTitle}>Google Media3 & VLC Player</Text>
-                  </View>
-                  <Text style={styles.cardDesc}>MP3, MP4 (ভিডিও অডিও), FLAC, WAV সব ফাইল আলাদা প্রফেশনাল পেজে চালান</Text>
+            {/* ─── Media player card ─── */}
+            <View style={styles.card}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                <View style={styles.cardIconTile}>
+                  <Text style={{ fontSize: 18 }}>🎬</Text>
                 </View>
-                <TouchableOpacity
-                  style={{ backgroundColor: '#06B6D4', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 }}
-                  onPress={() => setActivePage('media')}>
-                  <Text style={{ color: '#000000', fontSize: 12, fontWeight: 'bold' }}>প্লেয়ার খুলুন ➔</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.sectionTitle}>Media player</Text>
+                  <Text style={[styles.cardDesc, { marginBottom: 0, marginTop: 3 }]}>
+                    MP3, MP4, FLAC, WAV — one dedicated player
+                  </Text>
+                </View>
+                <TouchableOpacity style={styles.cardCta} onPress={() => setActivePage('media')}>
+                  <Text style={styles.cardCtaText}>Open ➔</Text>
                 </TouchableOpacity>
               </View>
 
               {currentMedia && isMediaPlaying && (
-                <View style={{ backgroundColor: '#0F172A', borderColor: '#06B6D4', borderWidth: 1, borderRadius: 10, padding: 10, marginTop: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <View style={{ flex: 1, marginRight: 8 }}>
-                    <Text style={{ color: '#06B6D4', fontSize: 10, fontWeight: 'bold' }}>NOW STREAMING [{currentMedia.format}]</Text>
-                    <Text style={{ color: '#FFFFFF', fontSize: 13, fontWeight: 'bold' }} numberOfLines={1}>{currentMedia.title}</Text>
-                    <Text style={{ color: '#94A3B8', fontSize: 11 }}>{formatTime(playbackPos)} / {formatTime(playbackDur)}</Text>
+                <View style={styles.nowStreamingBox}>
+                  <View style={{ flex: 1, marginRight: 10 }}>
+                    <Text style={styles.nowStreamingLabel}>NOW PLAYING · {currentMedia.format}</Text>
+                    <Text style={styles.nowStreamingTitle} numberOfLines={1}>{currentMedia.title}</Text>
+                    <Text style={styles.nowStreamingTime}>{formatTime(playbackPos)} / {formatTime(playbackDur)}</Text>
                   </View>
-                  <View style={{ flexDirection: 'row', gap: 6 }}>
-                    <TouchableOpacity
-                      style={{ backgroundColor: '#06B6D4', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}
-                      onPress={handleTogglePlayPause}>
-                      <Text style={{ color: '#000000', fontSize: 12, fontWeight: 'bold' }}>{isMediaPlaying ? '⏸' : '▶'}</Text>
+                  <View style={{ flexDirection: 'row', gap: 8 }}>
+                    <TouchableOpacity style={styles.nowStreamingBtn} onPress={handleTogglePlayPause}>
+                      <Text style={styles.nowStreamingBtnText}>{isMediaPlaying ? '⏸' : '▶'}</Text>
                     </TouchableOpacity>
-                    <TouchableOpacity
-                      style={{ backgroundColor: '#EF4444', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}
-                      onPress={handleStopMedia}>
-                      <Text style={{ color: '#FFFFFF', fontSize: 12, fontWeight: 'bold' }}>⏹</Text>
+                    <TouchableOpacity style={styles.nowStreamingStopBtn} onPress={handleStopMedia}>
+                      <Text style={styles.nowStreamingStopText}>⏹</Text>
                     </TouchableOpacity>
                   </View>
                 </View>
@@ -1469,17 +1998,17 @@ export default function App(): React.JSX.Element {
                             NativeNetwork.startAudioBroadcaster(t.source).catch(() => {});
                           }
                         }
-                        showToast(`সোর্স নির্বাচিত: ${t.title}`, 'info');
+                        showToast(`Source selected: ${t.title}`, 'info');
                       }}>
                       <Text style={{ fontSize: 20, marginRight: 10 }}>
                         {t.source === 'mic' ? '🎤' : t.source === 'synth' ? '⚡' : t.source === 'file' ? '🎵' : '📱'}
                       </Text>
                       <View style={{ flex: 1 }}>
-                        <Text style={[styles.trackTitle, isSelected && { color: '#06B6D4' }]}>{t.title}</Text>
+                        <Text style={[styles.trackTitle, isSelected && { color: '#22D3EE' }]}>{t.title}</Text>
                         <Text style={styles.trackArtist}>{t.artist}</Text>
                         {t.source === 'file' && selectedFileName && (
-                          <Text style={{ fontSize: 11, color: '#10B981', marginTop: 3 }}>
-                            ✓ গান সিলেক্টেড: {selectedFileName}
+                          <Text style={{ fontSize: 11, color: '#34D399', marginTop: 3 }}>
+                            ✓ Song selected: {selectedFileName}
                           </Text>
                         )}
                       </View>
@@ -1503,14 +2032,14 @@ export default function App(): React.JSX.Element {
                           if (picked && picked.uri) {
                             setSelectedFileUri(picked.uri);
                             setSelectedFileName(picked.name);
-                            showToast(`গান লোড হয়েছে: ${picked.name}`, 'success');
+            showToast(`Song loaded: ${picked.name}`, 'success');
                             if (isHostBroadcasting) {
                               NativeNetwork.playAudioFile(picked.uri).catch(() => {});
                             }
                           }
                         }}>
                         <Text style={{ color: '#FFFFFF', fontWeight: 'bold', fontSize: 13 }}>
-                          {selectedFileName ? `📂 গান পরিবর্তন করুন (${selectedFileName})` : '📂 মেমোরি থেকে যে কোনো গান সিলেক্ট করুন'}
+                          {selectedFileName ? `📂 Change song (${selectedFileName})` : '📂 Pick any song from storage'}
                         </Text>
                       </TouchableOpacity>
                     )}
@@ -1535,7 +2064,7 @@ export default function App(): React.JSX.Element {
                     <Text style={styles.volBtnText}>−</Text>
                   </TouchableOpacity>
                   <View style={styles.volTrack}>
-                    <View style={[styles.volFill, { width: `${masterVolume}%`, backgroundColor: '#06B6D4' }]} />
+                    <View style={[styles.volFill, { width: `${masterVolume}%`, backgroundColor: '#22D3EE' }]} />
                   </View>
                   <TouchableOpacity
                     style={styles.volBtn}
@@ -1559,13 +2088,13 @@ export default function App(): React.JSX.Element {
           <View style={styles.pageContainer}>
             {joinedRoom ? (
               /* Already Joined View */
-              <View style={[styles.card, { borderColor: '#10B981', backgroundColor: '#061715' }]}>
+              <View style={[styles.card, { borderColor: '#34D399', backgroundColor: '#05100D' }]}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 12 }}>
                   <View style={styles.liveGreenDot} />
                   <View style={{ flex: 1 }}>
                     <Text style={styles.joinedTitle}>Connected to {joinedRoom.hostName}</Text>
                     <Text style={styles.joinedSub}>
-                      রুম কোড: {joinedRoom.code} • হোস্ট IP: {joinedRoom.hostIp}:8942
+                      Room code: {joinedRoom.code} • Host IP: {joinedRoom.hostIp}:8942
                     </Text>
                   </View>
                   <View style={styles.syncedBadge}>
@@ -1576,23 +2105,23 @@ export default function App(): React.JSX.Element {
                 {/* Live Participants Indicator */}
                 <View style={styles.listenerStatusRow}>
                   <Text style={styles.listenerStatusText}>
-                    👥 রুমে মোট {joinedRoom.participantsCount} জন সক্রিয় আছেন
+                    👥 {joinedRoom.participantsCount} people active in this room
                   </Text>
                 </View>
 
                 {/* Audio Visualizer */}
                 <View style={styles.listenerVisualizerBox}>
-                  <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim2 }], backgroundColor: '#10B981' }]} />
-                  <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim4 }], backgroundColor: '#10B981' }]} />
-                  <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim1 }], backgroundColor: '#10B981' }]} />
-                  <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim3 }], backgroundColor: '#10B981' }]} />
+                  <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim2 }], backgroundColor: '#34D399' }]} />
+                  <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim4 }], backgroundColor: '#34D399' }]} />
+                  <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim1 }], backgroundColor: '#34D399' }]} />
+                  <Animated.View style={[styles.visualizerBar, { transform: [{ scaleY: waveAnim3 }], backgroundColor: '#34D399' }]} />
                 </View>
 
                 {/* Personal Volume */}
                 <View style={[styles.volumeBox, { marginTop: 14 }]}>
                   <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
                     <Text style={styles.volLabel}>Personal Headphone Volume</Text>
-                    <Text style={[styles.volValue, { color: '#10B981' }]}>{listenerVolume}%</Text>
+                    <Text style={[styles.volValue, { color: '#34D399' }]}>{listenerVolume}%</Text>
                   </View>
                   <View style={styles.volControlRow}>
                     <TouchableOpacity
@@ -1601,7 +2130,7 @@ export default function App(): React.JSX.Element {
                       <Text style={styles.volBtnText}>−</Text>
                     </TouchableOpacity>
                     <View style={styles.volTrack}>
-                      <View style={[styles.volFill, { width: `${listenerVolume}%`, backgroundColor: '#10B981' }]} />
+                      <View style={[styles.volFill, { width: `${listenerVolume}%`, backgroundColor: '#34D399' }]} />
                     </View>
                     <TouchableOpacity
                       style={styles.volBtn}
@@ -1612,22 +2141,22 @@ export default function App(): React.JSX.Element {
                 </View>
 
                 <TouchableOpacity style={styles.leaveBtn} onPress={handleLeaveRoom}>
-                  <Text style={styles.leaveBtnText}>রুম থেকে বের হন (Leave Room)</Text>
+                  <Text style={styles.leaveBtnText}>Leave room</Text>
                 </TouchableOpacity>
               </View>
             ) : (
               /* Join Form */
               <View style={styles.card}>
                 <Text style={styles.cardBadge}>JOIN BROADCAST ROOM</Text>
-                <Text style={styles.sectionTitle}>হোস্টের রুমে যুক্ত হন</Text>
+                <Text style={styles.sectionTitle}>Join the host's room</Text>
                 <Text style={styles.cardDesc}>
-                  একই Wi-Fi বা অফলাইন Hotspot-এ থাকলে নিচের পাওয়া রুমে এক ক্লিকে যুক্ত হতে পারবেন:
+                  On the same Wi-Fi or offline hotspot? Tap a room below to join instantly:
                 </Text>
 
                 {/* ── Auto-Discovered Other Rooms on LAN ── */}
                 {otherDiscoveredRooms.length > 0 && (
                   <View style={styles.discoveredContainer}>
-                    <Text style={styles.discoveredHeader}>🌟 অফলাইনে সক্রিয় রুম পাওয়া গেছে:</Text>
+                  <Text style={styles.discoveredHeader}>🌟 Active rooms found nearby:</Text>
                     {otherDiscoveredRooms.map((r, idx) => (
                       <TouchableOpacity
                         key={idx}
@@ -1637,11 +2166,11 @@ export default function App(): React.JSX.Element {
                         <View style={{ flex: 1 }}>
                           <Text style={styles.discoveredTitle}>{r.hostName}</Text>
                           <Text style={styles.discoveredMeta}>
-                            কোড: #{r.roomCode} • IP: {r.hostIp}:{r.port}
+                            Code: #{r.roomCode} • IP: {r.hostIp}:{r.port}
                           </Text>
                         </View>
                         <View style={styles.quickJoinBtn}>
-                          <Text style={styles.quickJoinBtnText}>যুক্ত হন ⚡</Text>
+                          <Text style={styles.quickJoinBtnText}>Join ⚡</Text>
                         </View>
                       </TouchableOpacity>
                     ))}
@@ -1650,16 +2179,16 @@ export default function App(): React.JSX.Element {
 
                 {/* 4-Digit Room Code or Host IP Input */}
                 <View style={{ marginTop: 12 }}>
-                  <Text style={styles.inputLabel}>হোস্টের ৪-ডিজিটের রুম নম্বর বা IP লিখুন:</Text>
+                  <Text style={styles.inputLabel}>Enter the host's 4-digit room code or IP:</Text>
                   <View style={styles.codeRow}>
                     <TextInput
                       style={[
                         styles.codeInput,
-                        joinFeedback?.type === 'error' && { borderColor: '#EF4444' },
-                        joinFeedback?.type === 'warn' && { borderColor: '#F59E0B' },
+                        joinFeedback?.type === 'error' && { borderColor: '#F87171' },
+                        joinFeedback?.type === 'warn' && { borderColor: '#FBBF24' },
                       ]}
-                      placeholder="৪-ডিজিট কোড (উদা: 8942)"
-                      placeholderTextColor="#64748B"
+                      placeholder="4-digit code (e.g. 8942)"
+                      placeholderTextColor="#6B6B76"
                       value={inputRoomCode}
                       onChangeText={val => {
                         setInputRoomCode(val);
@@ -1675,18 +2204,18 @@ export default function App(): React.JSX.Element {
                       {isJoining ? (
                         <ActivityIndicator color="#050811" size="small" />
                       ) : (
-                        <Text style={styles.joinActionBtnText}>যুক্ত হন</Text>
+                        <Text style={styles.joinActionBtnText}>Join</Text>
                       )}
                     </TouchableOpacity>
                   </View>
 
                   {/* Professional In-Line Helper & Guidance Card */}
                   {joinFeedback && (
-                    <View style={[styles.feedbackCard, joinFeedback.type === 'error' && { borderColor: '#EF4444', backgroundColor: 'rgba(239,68,68,0.08)' }]}>
+                    <View style={[styles.feedbackCard, joinFeedback.type === 'error' && { borderColor: '#F87171', backgroundColor: 'rgba(239,68,68,0.08)' }]}>
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 3 }}>
                         <Text style={{ fontSize: 14 }}>{joinFeedback.type === 'error' ? '🔐' : '💡'}</Text>
-                        <Text style={[styles.feedbackTitle, joinFeedback.type === 'error' && { color: '#EF4444' }]}>
-                          {joinFeedback.type === 'error' ? 'রুম কোড মেলেনি' : 'কোড চেক করুন'}
+                        <Text style={[styles.feedbackTitle, joinFeedback.type === 'error' && { color: '#F87171' }]}>
+                          {joinFeedback.type === 'error' ? 'Room code incorrect' : 'Check the code'}
                         </Text>
                       </View>
                       <Text style={styles.feedbackText}>{joinFeedback.message}</Text>
@@ -1700,7 +2229,7 @@ export default function App(): React.JSX.Element {
                             handleJoinHost(sug.hostIp, sug.port, sug.roomCode);
                           }}>
                           <Text style={styles.suggestionBtnText}>
-                            ⚡ {joinFeedback.suggestedRoom.hostName} (#{joinFeedback.suggestedRoom.roomCode})-এ যুক্ত হোন
+                            ⚡ Join {joinFeedback.suggestedRoom.hostName} (#{joinFeedback.suggestedRoom.roomCode})
                           </Text>
                         </TouchableOpacity>
                       )}
@@ -1711,7 +2240,7 @@ export default function App(): React.JSX.Element {
                 {/* Divider */}
                 <View style={styles.orDividerRow}>
                   <View style={styles.dividerLine} />
-                  <Text style={styles.orText}>অথবা</Text>
+                  <Text style={styles.orText}>or</Text>
                   <View style={styles.dividerLine} />
                 </View>
 
@@ -1720,313 +2249,162 @@ export default function App(): React.JSX.Element {
                   style={styles.qrScanBtn}
                   onPress={handleOpenQrScanner}>
                   <Text style={{ fontSize: 22, marginRight: 8 }}>📷</Text>
-                  <Text style={styles.qrScanBtnText}>ক্যামেরা দিয়ে QR কোড স্ক্যান করুন</Text>
+                  <Text style={styles.qrScanBtnText}>Scan QR code with camera</Text>
                 </TouchableOpacity>
               </View>
             )}
 
             {/* Quick Tips */}
             <View style={styles.tipBox}>
-              <Text style={styles.tipTitle}>💡 কীভাবে কাজ করে?</Text>
+              <Text style={styles.tipTitle}>💡 How it works</Text>
               <Text style={styles.tipText}>
-                ১. হোস্টের ফোনের সাথে একই অফলাইন হটস্পট বা Wi-Fi তে কানেক্ট থাকুন।{'\n'}
-                ২. কানে ব্লুটুথ হেডফোন বা তারের ইয়ারফোন লাগিয়ে রাখুন।{'\n'}
-                ৩. হোস্টের সব গান বা কথা সরাসরি আপনার হেডফোনে লাইভ বাজবে!
+                1. Join the same offline hotspot or Wi-Fi as the host phone.{'\n'}
+                2. Put on Bluetooth headphones or plug in earphones.{'\n'}
+                3. Every song and voice from the host plays live in your headphones!
               </Text>
             </View>
           </View>
         )}
 
         {/* ═══════════════════════════════════════════════════════════════════
-            PAGE: 🎬 MEDIA PLAYER (GOOGLE MEDIA3 / VLC / MY FILES STYLE)
+            PAGE: 🎬 MEDIA LIBRARY — every audio & video file on the device
         ═══════════════════════════════════════════════════════════════════ */}
         {activePage === 'media' && (
           <View style={styles.pageContainer}>
-            {/* Hero Banner Card */}
+            {/* ── Library header: stats, search, tabs, room sync ── */}
             <View style={styles.card}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                  <Text style={{ fontSize: 24 }}>🎬</Text>
-                  <View>
-                    <Text style={styles.sectionTitle}>SyncBuddy Media Player</Text>
-                    <Text style={styles.cardDesc}>Google Media3 & VLC স্টাইল হাই-পারফরম্যান্স প্লেয়ার</Text>
-                  </View>
-                </View>
-                <View style={{ backgroundColor: '#06B6D420', borderColor: '#06B6D4', borderWidth: 1, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 }}>
-                  <Text style={{ color: '#06B6D4', fontSize: 10, fontWeight: 'bold' }}>MEDIA3 PRO</Text>
-                </View>
-              </View>
-
-              {/* Supported Formats Pills */}
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginVertical: 8 }}>
-                {['MP3', 'MP4', 'FLAC', 'WAV', 'M4A', 'MKV', 'AAC'].map(fmt => (
-                  <View key={fmt} style={{ backgroundColor: '#1E293B', paddingHorizontal: 7, paddingVertical: 2, borderRadius: 4 }}>
-                    <Text style={{ color: '#94A3B8', fontSize: 10, fontWeight: '700' }}>{fmt}</Text>
-                  </View>
-                ))}
-              </View>
-
-              {/* Room Live Sync Status Banner */}
-              <View style={{ backgroundColor: isHostBroadcasting ? '#064E3B' : '#0F172A', borderColor: isHostBroadcasting ? '#10B981' : '#334155', borderWidth: 1, borderRadius: 8, padding: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                <View style={{ flex: 1, marginRight: 8 }}>
-                  <Text style={{ color: isHostBroadcasting ? '#10B981' : '#94A3B8', fontSize: 11, fontWeight: 'bold' }}>
-                    {isHostBroadcasting ? `📡 রুম #${roomCode} লাইভ সিঙ্ক চালু আছে` : '🎵 লোকাল মিডিয়া প্লেয়ার মোড'}
-                  </Text>
-                  <Text style={{ color: '#CBD5E1', fontSize: 11, marginTop: 2 }}>
-                    {isHostBroadcasting ? 'যা প্লে করবেন সব লিসেনারদের হেডফোনে একই সাথে বাজবে!' : 'রুমে ব্রডকাস্ট করতে পাশের টগল অন করুন।'}
+              <View style={{ flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+                <View style={{ flex: 1, marginRight: 10 }}>
+                  <Text style={styles.cardBadge}>ON-DEVICE LIBRARY</Text>
+                  <Text style={styles.mediaLibTitle}>My media</Text>
+                  <Text style={styles.mediaLibMeta}>
+                    {audioCount} audio • {videoCount} video • {librarySizeLabel}
                   </Text>
                 </View>
                 <TouchableOpacity
-                  style={{ backgroundColor: broadcastToRoom ? '#10B981' : '#334155', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}
-                  onPress={async () => {
-                    const next = !broadcastToRoom;
-                    setBroadcastToRoom(next);
-                    if (currentMedia && isMediaPlaying) {
-                      if (next) {
-                        setIsHostBroadcasting(true);
-                        NativeNetwork.updateBroadcastState(true, currentMedia.title, masterVolume).catch(() => {});
-                      } else {
-                        setIsHostBroadcasting(false);
-                        NativeNetwork.updateBroadcastState(false, '', masterVolume).catch(() => {});
-                      }
-                      await NativeNetwork.playMediaFile(currentMedia.uri, currentMedia.type === 'video', next);
-                    }
-                    showToast(next ? '📡 রুমে লাইভ ব্রডকাস্ট অন করা হয়েছে' : '🔕 ব্রডকাস্ট অফ (শুধু নিজের ফোনে বাজবে)', 'info');
-                  }}>
-                  <Text style={{ color: '#FFFFFF', fontSize: 11, fontWeight: 'bold' }}>{broadcastToRoom ? 'BROADCAST: ON' : 'BROADCAST: OFF'}</Text>
+                  style={styles.mediaIconBtn}
+                  onPress={() => loadDeviceMedia('all')}
+                  disabled={isLoadingMedia}>
+                  {isLoadingMedia ? (
+                    <ActivityIndicator size="small" color="#22D3EE" />
+                  ) : (
+                    <Text style={{ fontSize: 16 }}>🔄</Text>
+                  )}
                 </TouchableOpacity>
               </View>
-            </View>
 
-            {/* Now Playing Floating / Sticky Deck (If an item is selected or playing) */}
-            {currentMedia && (
-              <View style={[styles.card, { borderColor: '#06B6D4', backgroundColor: '#091528', padding: 12 }]}>
-                {/* ── Real Google Media3 Video Player Surface (If Video file) ── */}
-                {currentMedia.type === 'video' ? (
-                  <View style={{ width: '100%', height: 210, backgroundColor: '#000000', borderRadius: 12, overflow: 'hidden', position: 'relative', marginBottom: 12 }}>
-                    <Media3PlayerView
-                      style={{ width: '100%', height: '100%' }}
-                      uri={currentMedia.uri}
-                      isPlaying={isMediaPlaying}
-                      resizeMode="fit"
-                      useController={false}
-                    />
-                    {/* Fullscreen Overlay Pill */}
-                    <TouchableOpacity
-                      style={{
-                        position: 'absolute',
-                        top: 10,
-                        right: 10,
-                        backgroundColor: '#000000B0',
-                        borderColor: '#06B6D4',
-                        borderWidth: 1,
-                        paddingHorizontal: 10,
-                        paddingVertical: 5,
-                        borderRadius: 8,
-                        flexDirection: 'row',
-                        alignItems: 'center',
-                        gap: 6,
-                      }}
-                      onPress={() => NativeNetwork.launchFullscreenVideo()}>
-                      <Text style={{ color: '#06B6D4', fontSize: 13, fontWeight: 'bold' }}>⛶ Fullscreen</Text>
-                    </TouchableOpacity>
-                  </View>
-                ) : (
-                  /* ── Audio Deck (If Audio file) ── */
-                  <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 10 }}>
-                    <View style={{ width: 48, height: 48, borderRadius: 10, backgroundColor: '#0E7490', justifyContent: 'center', alignItems: 'center', marginRight: 12 }}>
-                      <Text style={{ fontSize: 24 }}>🎵</Text>
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                        <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: 'bold', flex: 1 }} numberOfLines={1}>{currentMedia.title}</Text>
-                        <View style={{ backgroundColor: '#06B6D4', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
-                          <Text style={{ color: '#FFFFFF', fontSize: 9, fontWeight: 'bold' }}>{currentMedia.format}</Text>
-                        </View>
-                      </View>
-                      <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 2 }}>{currentMedia.artist} • {currentMedia.size}</Text>
-                    </View>
-                  </View>
+              <View style={styles.searchBox}>
+                <Text style={{ fontSize: 14, marginRight: 8 }}>🔍</Text>
+                <TextInput
+                  style={styles.searchInput}
+                  placeholder="Search songs, videos, albums or formats…"
+                  placeholderTextColor="#6B6B76"
+                  value={mediaSearch}
+                  onChangeText={setMediaSearch}
+                  returnKeyType="search"
+                />
+                {mediaSearch.length > 0 && (
+                  <TouchableOpacity
+                    onPress={() => setMediaSearch('')}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                    <Text style={{ color: '#6B6B76', fontSize: 14 }}>✕</Text>
+                  </TouchableOpacity>
                 )}
-
-                {/* If video, also show Title & Format underneath video */}
-                {currentMedia.type === 'video' && (
-                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                    <View style={{ flex: 1, marginRight: 8 }}>
-                      <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: 'bold' }} numberOfLines={1}>{currentMedia.title}</Text>
-                      <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 2 }}>{currentMedia.artist} • {currentMedia.size}</Text>
-                    </View>
-                    <View style={{ backgroundColor: '#9333EA', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}>
-                      <Text style={{ color: '#FFFFFF', fontSize: 10, fontWeight: 'bold' }}>{currentMedia.format} HD</Text>
-                    </View>
-                  </View>
-                )}
-
-                {/* Interactive Scrubbable Seek Bar */}
-                <View style={{ marginVertical: 6 }}>
-                  <View style={{ height: 6, backgroundColor: '#1E293B', borderRadius: 3, overflow: 'hidden', position: 'relative' }}>
-                    <View
-                      style={{
-                        height: '100%',
-                        backgroundColor: '#06B6D4',
-                        width: playbackDur > 0 ? `${Math.min(100, Math.max(0, (playbackPos / playbackDur) * 100))}%` : '0%',
-                      }}
-                    />
-                  </View>
-                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}>
-                    <Text style={{ color: '#06B6D4', fontSize: 11, fontWeight: '700' }}>{formatTime(playbackPos)}</Text>
-                    <Text style={{ color: '#64748B', fontSize: 11 }}>{formatTime(playbackDur)}</Text>
-                  </View>
-                </View>
-
-                {/* Playback Controls Row */}
-                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 16, marginTop: 8 }}>
-                  <TouchableOpacity
-                    style={{ backgroundColor: '#1E293B', width: 42, height: 42, borderRadius: 21, justifyContent: 'center', alignItems: 'center' }}
-                    onPress={handleRewind10}>
-                    <Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: 'bold' }}>-10s</Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={{ backgroundColor: '#06B6D4', width: 56, height: 56, borderRadius: 28, justifyContent: 'center', alignItems: 'center', elevation: 6 }}
-                    onPress={handleTogglePlayPause}>
-                    <Text style={{ color: '#000000', fontSize: 24, fontWeight: 'bold' }}>{isMediaPlaying ? '⏸' : '▶'}</Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={{ backgroundColor: '#1E293B', width: 42, height: 42, borderRadius: 21, justifyContent: 'center', alignItems: 'center' }}
-                    onPress={handleForward10}>
-                    <Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: 'bold' }}>+10s</Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={{ backgroundColor: '#EF4444', width: 42, height: 42, borderRadius: 21, justifyContent: 'center', alignItems: 'center' }}
-                    onPress={handleStopMedia}>
-                    <Text style={{ color: '#FFFFFF', fontSize: 16, fontWeight: 'bold' }}>⏹</Text>
-                  </TouchableOpacity>
-                </View>
               </View>
-            )}
 
-            {/* Category Filter Tabs & Toolbar */}
-            <View style={styles.card}>
-              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
-                {[
-                  { key: 'all', label: `🌟 All (${mediaFiles.length})` },
-                  { key: 'audio', label: `🎵 Audio (${mediaFiles.filter(m => m.type === 'audio').length})` },
-                  { key: 'video', label: `🎬 Video (${mediaFiles.filter(m => m.type === 'video').length})` },
-                ].map(tab => (
+              {/* Live result count while searching — instant feedback that the filter worked. */}
+              {mediaSearch.trim().length > 0 && (
+                <Text style={styles.mediaSearchMeta}>
+                  {sortedMedia.length === 0
+                    ? `No matches for “${mediaSearch.trim()}”`
+                    : `${sortedMedia.length} match${sortedMedia.length === 1 ? '' : 'es'} for “${mediaSearch.trim()}”`}
+                </Text>
+              )}
+
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                {([
+                  { key: 'all', label: 'All', icon: '🌟', count: mediaFiles.length },
+                  { key: 'audio', label: 'Audio', icon: '🎵', count: audioCount },
+                  { key: 'video', label: 'Video', icon: '🎬', count: videoCount },
+                ] as Array<{ key: 'all' | 'audio' | 'video'; label: string; icon: string; count: number }>).map(tab => (
                   <TouchableOpacity
                     key={tab.key}
-                    style={{
-                      flex: 1,
-                      backgroundColor: mediaCategory === tab.key ? '#06B6D4' : '#1E293B',
-                      paddingVertical: 8,
-                      borderRadius: 8,
-                      alignItems: 'center',
-                    }}
+                    style={[styles.mediaTab, mediaCategory === tab.key && styles.mediaTabActive]}
                     onPress={() => {
-                      setMediaCategory(tab.key as any);
-                      loadDeviceMedia(tab.key as any);
+                      setMediaCategory(tab.key);
+                      setMediaRenderLimit(60);
                     }}>
-                    <Text style={{ color: mediaCategory === tab.key ? '#000000' : '#CBD5E1', fontSize: 12, fontWeight: 'bold' }}>
-                      {tab.label}
+                    <Text style={[styles.mediaTabText, mediaCategory === tab.key && styles.mediaTabTextActive]}>
+                      {tab.icon} {tab.label}{tab.count > 0 ? ` ${tab.count}` : ''}
                     </Text>
                   </TouchableOpacity>
                 ))}
               </View>
 
-              {/* Search Box */}
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-                <TextInput
-                  style={{ flex: 1, backgroundColor: '#0F172A', borderColor: '#334155', borderWidth: 1, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, color: '#FFFFFF', fontSize: 13 }}
-                  placeholder="গান বা ভিডিও খুঁজুন... (Search Media)"
-                  placeholderTextColor="#64748B"
-                  value={mediaSearch}
-                  onChangeText={setMediaSearch}
-                />
+              <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
                 <TouchableOpacity
-                  style={{ backgroundColor: '#1E293B', paddingHorizontal: 12, paddingVertical: 9, borderRadius: 8 }}
-                  onPress={() => loadDeviceMedia(mediaCategory)}>
-                  <Text style={{ color: '#06B6D4', fontSize: 13, fontWeight: 'bold' }}>🔄</Text>
+                  style={[styles.mediaSyncToggle, broadcastToRoom && styles.mediaSyncToggleOn]}
+                  onPress={toggleBroadcastToRoom}>
+                  <Text style={[styles.mediaSyncToggleText, broadcastToRoom && { color: '#00212B' }]}>
+                    {broadcastToRoom ? '📡 ROOM SYNC ON' : '🔕 ROOM SYNC OFF'}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.mediaOpenBtn} onPress={handlePickCustomMedia}>
+                  <Text style={styles.mediaOpenBtnText}>📂 Open file</Text>
                 </TouchableOpacity>
               </View>
-
-              {/* Pick from My Files / Storage Button */}
-              <TouchableOpacity
-                style={{ backgroundColor: '#0891B2', paddingVertical: 11, borderRadius: 8, alignItems: 'center', marginBottom: 14 }}
-                onPress={handlePickCustomMedia}>
-                <Text style={{ color: '#FFFFFF', fontWeight: 'bold', fontSize: 13 }}>📂 ফোনের মেমোরি / My Files থেকে যেকোনো ফাইল খুলুন</Text>
-              </TouchableOpacity>
-
-              {/* Media Files List */}
-              {isLoadingMedia ? (
-                <View style={{ paddingVertical: 30, alignItems: 'center' }}>
-                  <ActivityIndicator size="large" color="#06B6D4" />
-                  <Text style={{ color: '#94A3B8', fontSize: 13, marginTop: 10 }}>ডিভাইসের মিডিয়া ফাইল স্ক্যান করা হচ্ছে...</Text>
-                </View>
-              ) : (
-                <View>
-                  {mediaFiles
-                    .filter(m => {
-                      if (mediaCategory !== 'all' && m.type !== mediaCategory) return false;
-                      if (!mediaSearch.trim()) return true;
-                      const q = mediaSearch.toLowerCase();
-                      return m.title.toLowerCase().includes(q) || m.artist.toLowerCase().includes(q) || m.format.toLowerCase().includes(q);
-                    })
-                    .slice(0, 50)
-                    .map(item => {
-                      const isCurrent = currentMedia?.uri === item.uri && isMediaPlaying;
-                      return (
-                        <TouchableOpacity
-                          key={item.id}
-                          style={{
-                            flexDirection: 'row',
-                            alignItems: 'center',
-                            paddingVertical: 10,
-                            paddingHorizontal: 8,
-                            borderRadius: 8,
-                            backgroundColor: isCurrent ? '#06B6D415' : 'transparent',
-                            borderBottomColor: '#1E293B',
-                            borderBottomWidth: 1,
-                            marginBottom: 2,
-                          }}
-                          onPress={() => handlePlayMedia(item)}>
-                          <View style={{ width: 38, height: 38, borderRadius: 8, backgroundColor: item.type === 'video' ? '#581C87' : '#0E7490', justifyContent: 'center', alignItems: 'center', marginRight: 10 }}>
-                            <Text style={{ fontSize: 18 }}>{item.type === 'video' ? '🎬' : '🎧'}</Text>
-                          </View>
-                          <View style={{ flex: 1, marginRight: 8 }}>
-                            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                              <Text style={{ color: isCurrent ? '#06B6D4' : '#FFFFFF', fontSize: 13, fontWeight: '600' }} numberOfLines={1}>
-                                {item.title}
-                              </Text>
-                              <View style={{ backgroundColor: item.type === 'video' ? '#9333EA25' : '#06B6D425', borderColor: item.type === 'video' ? '#9333EA' : '#06B6D4', borderWidth: 1, paddingHorizontal: 4, paddingVertical: 1, borderRadius: 3 }}>
-                                <Text style={{ color: item.type === 'video' ? '#C084FC' : '#67E8F9', fontSize: 8, fontWeight: 'bold' }}>{item.format}</Text>
-                              </View>
-                            </View>
-                            <Text style={{ color: '#64748B', fontSize: 11, marginTop: 2 }}>
-                              {item.artist} {item.duration > 0 ? `• ${formatTime(item.duration / 1000)}` : ''} • {item.size}
-                            </Text>
-                          </View>
-                          <View style={{ backgroundColor: isCurrent ? '#10B981' : '#06B6D4', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 6 }}>
-                            <Text style={{ color: '#000000', fontSize: 11, fontWeight: 'bold' }}>{isCurrent ? 'LIVE ⏸' : 'PLAY ▶'}</Text>
-                          </View>
-                        </TouchableOpacity>
-                      );
-                    })}
-
-                  {mediaFiles.length === 0 && !isLoadingMedia && (
-                    <View style={{ paddingVertical: 24, alignItems: 'center' }}>
-                      <Text style={{ fontSize: 32, marginBottom: 8 }}>📁</Text>
-                      <Text style={{ color: '#94A3B8', fontSize: 14, fontWeight: 'bold', textAlign: 'center' }}>কোনো মিডিয়া ফাইল পাওয়া যায়নি</Text>
-                      <Text style={{ color: '#64748B', fontSize: 12, textAlign: 'center', marginTop: 4 }}>
-                        ওপরের "My Files থেকে খুলুন" বাটন চেপে আপনার ফোনের যেকোনো ফোল্ডার থেকে গান বা ভিডিও বেছে নিন
-                      </Text>
-                    </View>
-                  )}
-                </View>
-              )}
             </View>
+
+            {/* ── Library list, grouped by day ── */}
+            {isLoadingMedia && mediaFiles.length === 0 ? (
+              <View style={styles.mediaLoadingBox}>
+                <ActivityIndicator size="large" color="#22D3EE" />
+                <Text style={styles.mediaLoadingText}>Scanning your device for audio and video…</Text>
+              </View>
+            ) : mediaGroups.length === 0 ? (
+              <View style={styles.emptyCard}>
+                <Text style={{ fontSize: 34, marginBottom: 8 }}>📁</Text>
+                <Text style={styles.emptyTitle}>No media found</Text>
+                <Text style={styles.emptySub}>
+                  {mediaSearch
+                    ? 'Nothing matches that name. Try another title or format.'
+                    : 'Grant media permission, or tap "Open file" to pick one directly.'}
+                </Text>
+                {!mediaSearch && (
+                  <TouchableOpacity style={styles.mediaPermBtn} onPress={handleRequestMediaPermissions}>
+                    <Text style={styles.mediaPermBtnText}>Grant media permission</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            ) : (
+              mediaGroups.map(group => (
+                <View key={group.key}>
+                  <View style={styles.mediaGroupHeader}>
+                    <Text style={styles.mediaGroupLabel}>{group.label}</Text>
+                    <Text style={styles.mediaGroupCount}>{group.items.length}</Text>
+                  </View>
+                  {group.items.map(item => (
+                    <MediaRow
+                      key={item.id}
+                      item={item}
+                      active={currentMedia?.id === item.id}
+                      playing={currentMedia?.id === item.id && isMediaPlaying}
+                      onPress={() => handlePlayMedia(item)}
+                    />
+                  ))}
+                </View>
+              ))
+            )}
+
+            {sortedMedia.length > mediaRenderLimit && (
+              <TouchableOpacity
+                style={styles.mediaMoreBtn}
+                onPress={() => setMediaRenderLimit(n => n + 100)}>
+                <Text style={styles.mediaMoreBtnText}>
+                  Show more • {sortedMedia.length - mediaRenderLimit} remaining
+                </Text>
+              </TouchableOpacity>
+            )}
           </View>
         )}
 
@@ -2041,18 +2419,18 @@ export default function App(): React.JSX.Element {
                 <View>
                   <Text style={styles.cardBadge}>OFFLINE ROOM WALKIE-TALKIE</Text>
                   <Text style={styles.roomVoiceTitle}>
-                    রুম #{joinedRoom ? joinedRoom.code : roomCode}
+                  Room #{joinedRoom ? joinedRoom.code : roomCode}
                   </Text>
                 </View>
                 <View style={styles.roomMemberBadge}>
                   <Text style={styles.roomMemberBadgeText}>
-                    👥 {joinedRoom ? joinedRoom.participantsCount : connectedCount} জন সংযুক্ত
+                    👥 {joinedRoom ? joinedRoom.participantsCount : connectedCount} connected
                   </Text>
                 </View>
               </View>
 
               <Text style={styles.cardDesc}>
-                এই রুমে থাকা সবাই একসাথে কথা বলতে ও শুনতে পারবেন। কোনো চ্যানেল পরিবর্তন করতে হবে না।
+                Everyone in this room can talk and listen together — no channel switching needed.
               </Text>
 
               {/* Live Speaker Transmission Bar */}
@@ -2072,21 +2450,21 @@ export default function App(): React.JSX.Element {
                   <Text
                     style={[
                       styles.speakerBannerTitle,
-                      isTalking && { color: '#EF4444' },
-                      activeSpeaker && !isTalking && { color: '#06B6D4' },
+                      isTalking && { color: '#F87171' },
+                      activeSpeaker && !isTalking && { color: '#22D3EE' },
                     ]}>
                     {isTalking
-                      ? `আপনি কথা বলছেন (${networkInfo?.deviceName || 'This Phone'})`
+                      ? `You are speaking (${networkInfo?.deviceName || 'This phone'})`
                       : activeSpeaker
-                      ? `${activeSpeaker} কথা বলছেন...`
-                      : 'রুম প্রস্তুত • কথা বলতে চেপে ধরুন'}
+                      ? `${activeSpeaker} is speaking…`
+                      : 'Room ready • hold the button to talk'}
                   </Text>
                   <Text style={styles.speakerBannerSub}>
                     {isTalking
-                      ? 'রুমের সবাই এখন আপনার কথা লাইভ শুনছে'
+                      ? 'Everyone in the room is hearing you live'
                       : activeSpeaker
-                      ? 'সবাই এখন ওনার কথা শুনছে'
-                      : 'নিচের বড় বাটনে চাপ দিয়ে ধরে কথা বলুন'}
+                      ? 'Everyone is listening to them now'
+                      : 'Sound goes to every connected phone at once'}
                   </Text>
                 </View>
               </View>
@@ -2107,7 +2485,7 @@ export default function App(): React.JSX.Element {
                   onPressOut={handlePttPressOut}>
                   <Text style={styles.pttIcon}>{isTalking ? '🎙️' : '📻'}</Text>
                   <Text style={styles.pttText}>{isTalking ? 'TRANSMITTING' : 'HOLD TO TALK'}</Text>
-                  <Text style={styles.pttSubtext}>{isTalking ? 'কথা বলুন...' : 'চেপে ধরে রাখুন'}</Text>
+                  <Text style={styles.pttSubtext}>{isTalking ? 'Release to stop' : 'Live to the room'}</Text>
                 </TouchableOpacity>
               </Animated.View>
 
@@ -2116,15 +2494,15 @@ export default function App(): React.JSX.Element {
                 <View
                   style={[
                     styles.activeSpeakerDot,
-                    { backgroundColor: isTalking ? '#EF4444' : activeSpeaker ? '#06B6D4' : '#10B981' },
+                    { backgroundColor: isTalking ? '#F87171' : activeSpeaker ? '#22D3EE' : '#34D399' },
                   ]}
                 />
                 <Text style={styles.speakerStatusText}>
                   {isTalking
-                    ? `মাইক্রোফোন সক্রিয়: ${networkInfo?.deviceName || 'This Phone'}`
+                    ? `Microphone active: ${networkInfo?.deviceName || 'This phone'}`
                     : activeSpeaker
-                    ? `কথা বলছেন: ${activeSpeaker}`
-                    : 'রুম প্রস্তুত • কথা বলতে বাটন চেপে ধরুন'}
+                    ? `Speaking: ${activeSpeaker}`
+                    : 'Room ready • hold the button to talk'}
                 </Text>
               </View>
             </View>
@@ -2161,7 +2539,7 @@ export default function App(): React.JSX.Element {
               </View>
 
               <Text style={styles.cardDesc}>
-                স্মার্ট অন-ডিমান্ড স্ক্যানার: চার্জ বাঁচাতে এটি সারাক্ষণ স্ক্যান করে না; শুধু বাটন চাপলে ১০ সেকেন্ড স্ক্যান করে অটো-অফ হয়।
+                Smart on-demand scanner: it does not scan constantly, which saves battery. Tap the button and it scans for 10 seconds, then switches itself off.
               </Text>
 
               {/* Search Box */}
@@ -2170,7 +2548,7 @@ export default function App(): React.JSX.Element {
                 <TextInput
                   style={styles.searchInput}
                   placeholder="Search device name or MAC address..."
-                  placeholderTextColor="#64748B"
+                  placeholderTextColor="#6B6B76"
                   value={searchQuery}
                   onChangeText={setSearchQuery}
                 />
@@ -2199,7 +2577,7 @@ export default function App(): React.JSX.Element {
               return (
                 <View
                   key={dev.id}
-                  style={[styles.deviceCard, isConn && { borderColor: '#10B981', borderWidth: 1.5 }]}>
+                  style={[styles.deviceCard, isConn && { borderColor: '#34D399', borderWidth: 1.5 }]}>
                   <View style={styles.deviceCardTop}>
                     <View style={{ flex: 1, marginRight: 10 }}>
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 }}>
@@ -2253,7 +2631,7 @@ export default function App(): React.JSX.Element {
                 <Text style={{ fontSize: 32, marginBottom: 8 }}>🎧</Text>
                 <Text style={styles.emptyTitle}>No Devices Found</Text>
                 <Text style={styles.emptySub}>
-                  হেডফোন পেয়ারিং মোডে রেখে উপরের &quot;Scan Nearby&quot; বাটনে চাপুন।
+                  Put your headphones in pairing mode, then tap &quot;Scan nearby&quot; above.
                 </Text>
               </View>
             )}
@@ -2305,12 +2683,12 @@ export default function App(): React.JSX.Element {
           <View style={styles.qrModalCard}>
             <Text style={{ fontSize: 36, marginBottom: 8 }}>📷</Text>
             <Text style={styles.modalTitle}>QR Code & Quick Join</Text>
-            <Text style={styles.modalSub}>হোস্টের IP অ্যাড্রেস লিখুন অথবা পাওয়া রুমে ট্যাপ করুন</Text>
+            <Text style={styles.modalSub}>Enter the host's IP address, or tap a discovered room</Text>
 
             {otherDiscoveredRooms.length > 0 && (
               <View style={{ width: '100%', marginBottom: 14 }}>
-                <Text style={{ color: '#06B6D4', fontSize: 12, fontWeight: '700', marginBottom: 6 }}>
-                  অফলাইনে পাওয়া সক্রিয় রুম:
+                <Text style={{ color: '#22D3EE', fontSize: 12, fontWeight: '700', marginBottom: 6 }}>
+              <Text style={styles.inputLabel}>Active rooms found nearby:</Text>
                 </Text>
                 {otherDiscoveredRooms.map((r, i) => (
                   <TouchableOpacity
@@ -2330,8 +2708,8 @@ export default function App(): React.JSX.Element {
 
             <TextInput
               style={styles.modalIpInput}
-              placeholder="৪-ডিজিট রুম কোড (উদা: 8942) বা IP"
-              placeholderTextColor="#64748B"
+              placeholder="4-digit room code (e.g. 8942) or IP"
+              placeholderTextColor="#6B6B76"
               value={inputRoomCode || inputHostIp}
               onChangeText={val => {
                 setInputRoomCode(val);
@@ -2346,488 +2724,692 @@ export default function App(): React.JSX.Element {
                 setShowQRScanner(false);
                 handleManualJoin();
               }}>
-              <Text style={styles.modalActionBtnText}>⚡ রুমে যুক্ত হোন (Join Host)</Text>
+              <Text style={styles.modalActionBtnText}>⚡ Join host room</Text>
             </TouchableOpacity>
 
             <TouchableOpacity style={styles.modalCloseBtn} onPress={() => setShowQRScanner(false)}>
-              <Text style={styles.modalCloseBtnText}>বন্ধ করুন</Text>
+              <Text style={styles.modalCloseBtnText}>Close</Text>
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
+
+      {/* ── Floating mini player (visible on every page while media is loaded) ── */}
+      {currentMedia && !showPlayer && (
+        <TouchableOpacity
+          style={styles.miniPlayer}
+          activeOpacity={0.92}
+          onPress={() => setShowPlayer(true)}>
+          <MediaArt uri={currentMedia.albumArt} type={currentMedia.type} size={40} radius={8} />
+          <View style={{ flex: 1, marginLeft: 10, marginRight: 8 }}>
+            <Text style={styles.miniTitle} numberOfLines={1}>
+              {currentMedia.title}
+            </Text>
+            <Text style={styles.miniSub} numberOfLines={1}>
+              {formatDurationMs(playbackPos * 1000)} / {formatDurationMs(playbackDur * 1000)}
+              {broadcastToRoom ? ' • 📡 LIVE' : ''}
+            </Text>
+            <View style={styles.miniProgressTrack}>
+              <View
+                style={[
+                  styles.miniProgressFill,
+                  {
+                    width:
+                      playbackDur > 0
+                        ? `${Math.min(100, Math.max(0, (playbackPos / playbackDur) * 100))}%`
+                        : '0%',
+                  },
+                ]}
+              />
+            </View>
+          </View>
+          <TouchableOpacity
+            style={styles.miniBtn}
+            onPress={handleTogglePlayPause}
+            hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}>
+            <Text style={styles.miniBtnText}>{isMediaPlaying ? '⏸' : '▶'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.miniBtn}
+            onPress={handleStopMedia}
+            hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}>
+            <Text style={[styles.miniBtnText, { color: '#F87171' }]}>✕</Text>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      )}
+
+      <NowPlayingSheet
+        visible={showPlayer}
+        item={currentMedia}
+        isPlaying={isMediaPlaying}
+        position={playbackPos}
+        duration={playbackDur}
+        error={mediaError}
+        broadcastToRoom={broadcastToRoom}
+        shuffle={isShuffle}
+        onClose={() => setShowPlayer(false)}
+        onToggle={handleTogglePlayPause}
+        onSeek={handleSeek}
+        onNext={() => handleNextMedia(1)}
+        onPrev={() => handleNextMedia(-1)}
+        onStop={handleStopMedia}
+        onToggleBroadcast={toggleBroadcastToRoom}
+        onToggleShuffle={() => setIsShuffle(v => !v)}
+        onOpenExternal={handleOpenExternal}
+      />
     </SafeAreaView>
   );
 }
 
-// ─── Futuristic Cyber Stylesheet ──────────────────────────────────────────────
+// ─── Design tokens ───────────────────────────────────────────────────────────
+// True-black canvas, layered neutral surfaces, hairline borders and a single
+// cyan accent. Numbers use tabular figures so timers don't jitter.
+const C = {
+  bg: '#000000',
+  surf: '#0A0A0E',
+  surf2: '#101017',
+  surf3: '#17171F',
+  line: 'rgba(255,255,255,0.07)',
+  lineStrong: 'rgba(255,255,255,0.14)',
+  text: '#FAFAFA',
+  textDim: '#A1A1AA',
+  textMute: '#6B6B76',
+  accent: '#22D3EE',
+  accentDeep: '#0891B2',
+  green: '#34D399',
+  red: '#F87171',
+  amber: '#FBBF24',
+};
+
+const SHADOW = {
+  shadowColor: '#000000',
+  shadowOffset: { width: 0, height: 10 },
+  shadowOpacity: 0.55,
+  shadowRadius: 24,
+  elevation: 10,
+};
+
+const GLOW = {
+  shadowColor: C.accent,
+  shadowOffset: { width: 0, height: 6 },
+  shadowOpacity: 0.4,
+  shadowRadius: 18,
+  elevation: 8,
+};
 
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: '#050811',
+    backgroundColor: C.bg,
   },
   scrollBody: {
     paddingHorizontal: 16,
-    paddingBottom: 90,
+    paddingBottom: 96,
   },
   pageContainer: {
-    gap: 14,
-    paddingTop: 6,
+    gap: 16,
+    paddingTop: 8,
   },
 
-  // Toast
+  // ── Toast ──────────────────────────────────────────────────────────────────
   toast: {
     position: 'absolute',
-    top: 48,
+    top: 52,
     left: 16,
     right: 16,
     zIndex: 9999,
-    backgroundColor: '#0F172A',
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 12,
+    backgroundColor: C.surf3,
+    paddingVertical: 13,
+    paddingHorizontal: 18,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#1E293B',
-    elevation: 10,
+    borderColor: C.lineStrong,
+    ...SHADOW,
   },
-  toastSuccess: { backgroundColor: '#064E3B', borderColor: '#10B981' },
-  toastError: { backgroundColor: '#7F1D1D', borderColor: '#EF4444' },
-  toastWarn: { backgroundColor: '#78350F', borderColor: '#F59E0B' },
-  toastText: { color: '#F8FAFC', fontSize: 13, fontWeight: '600', textAlign: 'center' },
+  toastSuccess: { backgroundColor: '#052E22', borderColor: C.green },
+  toastError: { backgroundColor: '#3A1214', borderColor: C.red },
+  toastWarn: { backgroundColor: '#3A2A08', borderColor: C.amber },
+  toastText: {
+    color: C.text,
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+    lineHeight: 18,
+  },
 
-  // Header
+  // ── Header ─────────────────────────────────────────────────────────────────
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingTop: 10,
-    paddingBottom: 10,
+    paddingHorizontal: 18,
+    paddingTop: 12,
+    paddingBottom: 12,
     borderBottomWidth: 1,
-    borderBottomColor: '#0F172A',
+    borderBottomColor: C.line,
+    backgroundColor: C.bg,
   },
   appTitle: {
-    fontSize: 22,
+    fontSize: 21,
     fontWeight: '900',
-    color: '#F8FAFC',
-    letterSpacing: -0.5,
+    color: C.text,
+    letterSpacing: 1.5,
   },
   proPill: {
-    backgroundColor: 'rgba(6,182,212,0.15)',
-    paddingHorizontal: 6,
+    backgroundColor: 'rgba(34,211,238,0.12)',
+    paddingHorizontal: 7,
     paddingVertical: 2,
-    borderRadius: 4,
+    borderRadius: 6,
     borderWidth: 1,
-    borderColor: '#06B6D4',
+    borderColor: 'rgba(34,211,238,0.35)',
   },
   proPillText: {
-    color: '#06B6D4',
-    fontSize: 10,
+    color: C.accent,
+    fontSize: 9.5,
     fontWeight: '800',
+    letterSpacing: 0.5,
   },
   subTitle: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 11,
     fontWeight: '500',
-    marginTop: 1,
+    marginTop: 3,
+    letterSpacing: 0.2,
   },
   netBadge: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 20,
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    borderRadius: 999,
     borderWidth: 1,
   },
   netBadgeOn: {
-    backgroundColor: 'rgba(16,185,129,0.12)',
-    borderColor: '#10B981',
+    backgroundColor: 'rgba(52,211,153,0.1)',
+    borderColor: 'rgba(52,211,153,0.5)',
   },
   netBadgeOff: {
-    backgroundColor: 'rgba(239,68,68,0.12)',
-    borderColor: '#EF4444',
+    backgroundColor: 'rgba(248,113,113,0.1)',
+    borderColor: 'rgba(248,113,113,0.5)',
   },
   netBadgeText: {
-    fontSize: 11,
+    fontSize: 10.5,
     fontWeight: '800',
+    letterSpacing: 0.6,
   },
-  netBadgeTextOn: { color: '#10B981' },
-  netBadgeTextOff: { color: '#EF4444' },
+  netBadgeTextOn: { color: C.green },
+  netBadgeTextOff: { color: C.red },
 
-  // Network Warning Box
+  // ── Network warning ────────────────────────────────────────────────────────
   netWarningBox: {
-    backgroundColor: 'rgba(245,158,11,0.12)',
-    borderWidth: 1.5,
-    borderColor: '#F59E0B',
-    borderRadius: 14,
+    backgroundColor: 'rgba(251,191,36,0.07)',
+    borderWidth: 1,
+    borderColor: 'rgba(251,191,36,0.35)',
+    borderRadius: 18,
     marginHorizontal: 16,
-    marginTop: 10,
-    padding: 14,
+    marginTop: 12,
+    padding: 16,
   },
   netWarningTitle: {
-    color: '#F59E0B',
+    color: C.amber,
     fontSize: 14,
     fontWeight: '800',
   },
   netWarningText: {
-    color: '#F8FAFC',
+    color: C.textDim,
     fontSize: 12,
-    lineHeight: 18,
-    marginTop: 2,
+    lineHeight: 19,
+    marginTop: 6,
   },
   netActionBtn: {
-    backgroundColor: '#F59E0B',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 8,
+    backgroundColor: C.amber,
+    paddingHorizontal: 15,
+    paddingVertical: 9,
+    borderRadius: 10,
   },
   netActionBtnText: {
-    color: '#050811',
+    color: '#1A1200',
     fontSize: 12,
     fontWeight: '800',
   },
 
-  // Active Network Strip
+  // ── Network strip ──────────────────────────────────────────────────────────
   netStatusStrip: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    backgroundColor: '#0A1220',
-    paddingHorizontal: 16,
-    paddingVertical: 6,
+    gap: 9,
+    backgroundColor: C.surf,
+    paddingHorizontal: 18,
+    paddingVertical: 8,
     borderBottomWidth: 1,
-    borderBottomColor: '#162238',
+    borderBottomColor: C.line,
   },
   netStatusDot: {
-    width: 8,
-    height: 8,
+    width: 7,
+    height: 7,
     borderRadius: 4,
-    backgroundColor: '#10B981',
+    backgroundColor: C.green,
   },
   netStatusText: {
-    color: '#06B6D4',
-    fontSize: 12,
+    color: C.accent,
+    fontSize: 11.5,
     fontWeight: '700',
     fontFamily: 'monospace',
+    letterSpacing: 0.2,
   },
   netDeviceName: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 11,
   },
 
-  // Card
+  // ── Cards ──────────────────────────────────────────────────────────────────
   card: {
-    backgroundColor: '#0A101D',
-    borderRadius: 16,
-    padding: 16,
+    backgroundColor: C.surf,
+    borderRadius: 20,
+    padding: 18,
     borderWidth: 1,
-    borderColor: '#162238',
+    borderColor: C.line,
+    ...SHADOW,
   },
   cardHeaderRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 8,
+    marginBottom: 10,
   },
   cardBadge: {
-    color: '#06B6D4',
-    fontSize: 10.5,
+    color: C.accent,
+    fontSize: 10,
     fontWeight: '800',
-    letterSpacing: 1.2,
+    letterSpacing: 1.6,
     textTransform: 'uppercase',
   },
   cardDesc: {
-    color: '#94A3B8',
+    color: C.textDim,
     fontSize: 12.5,
-    lineHeight: 18,
-    marginBottom: 10,
+    lineHeight: 19,
+    marginBottom: 12,
+  },
+  cardCtaText: {
+    color: '#00212B',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.2,
+  },
+  cardCta: {
+    backgroundColor: C.accent,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 11,
+    ...GLOW,
+  },
+  cardIconTile: {
+    width: 40,
+    height: 40,
+    borderRadius: 13,
+    backgroundColor: 'rgba(34,211,238,0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(34,211,238,0.28)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  nowStreamingBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: C.surf2,
+    borderWidth: 1,
+    borderColor: 'rgba(34,211,238,0.3)',
+    borderRadius: 14,
+    padding: 12,
+    marginTop: 14,
+  },
+  nowStreamingLabel: {
+    color: C.accent,
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+  nowStreamingTitle: {
+    color: C.text,
+    fontSize: 12.5,
+    fontWeight: '700',
+    marginTop: 3,
+  },
+  nowStreamingTime: {
+    color: C.textMute,
+    fontSize: 10.5,
+    fontFamily: 'monospace',
+    marginTop: 3,
+  },
+  nowStreamingBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: C.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  nowStreamingBtnText: {
+    color: '#00212B',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  nowStreamingStopBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: 'rgba(248,113,113,0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.45)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  nowStreamingStopText: {
+    color: C.red,
+    fontSize: 12,
+    fontWeight: '900',
   },
 
-  // Host Room Styles
+  // ── Host room ──────────────────────────────────────────────────────────────
   roomCodeTitle: {
-    color: '#F8FAFC',
-    fontSize: 28,
+    color: C.text,
+    fontSize: 34,
     fontWeight: '900',
-    letterSpacing: 2,
-    fontFamily: 'monospace',
-  },
-  regenBtn: {
-    backgroundColor: 'rgba(6,182,212,0.12)',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#06B6D4',
-  },
-  regenBtnText: {
-    color: '#06B6D4',
-    fontSize: 11.5,
-    fontWeight: '700',
-  },
-  qrHint: {
-    color: '#06B6D4',
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 8,
-  },
-  qrSubHint: {
-    color: '#64748B',
-    fontSize: 11,
+    letterSpacing: 7,
     fontFamily: 'monospace',
     marginTop: 2,
+  },
+  regenBtn: {
+    backgroundColor: 'rgba(34,211,238,0.1)',
+    paddingHorizontal: 13,
+    paddingVertical: 7,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(34,211,238,0.35)',
+  },
+  regenBtnText: {
+    color: C.accent,
+    fontSize: 11.5,
+    fontWeight: '800',
+  },
+  qrHint: {
+    color: C.accent,
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 12,
+  },
+  qrSubHint: {
+    color: C.textMute,
+    fontSize: 10.5,
+    fontFamily: 'monospace',
+    marginTop: 4,
   },
   listenerCounterRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
-    backgroundColor: '#0F172A',
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 14,
+    gap: 13,
+    backgroundColor: C.surf2,
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 16,
     borderWidth: 1,
-    borderColor: '#1E293B',
+    borderColor: C.line,
   },
   listenerNumberBox: {
-    width: 44,
-    height: 44,
-    borderRadius: 10,
-    backgroundColor: 'rgba(6,182,212,0.15)',
-    borderWidth: 1.5,
-    borderColor: '#06B6D4',
+    width: 46,
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: 'rgba(34,211,238,0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(34,211,238,0.35)',
     alignItems: 'center',
     justifyContent: 'center',
   },
   listenerNumber: {
-    color: '#06B6D4',
+    color: C.accent,
     fontSize: 20,
     fontWeight: '900',
   },
   listenerTitle: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 13.5,
     fontWeight: '700',
   },
   listenerSub: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 11,
-    marginTop: 1,
+    marginTop: 2,
   },
   liveTimerBadge: {
-    backgroundColor: '#EF4444',
-    paddingHorizontal: 8,
+    backgroundColor: 'rgba(248,113,113,0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.5)',
+    paddingHorizontal: 9,
     paddingVertical: 4,
-    borderRadius: 6,
+    borderRadius: 8,
   },
   liveTimerText: {
-    color: '#fff',
-    fontSize: 11,
+    color: C.red,
+    fontSize: 10.5,
     fontWeight: '800',
-    fontFamily: 'monospace',
+    letterSpacing: 0.5,
   },
   startBtn: {
-    backgroundColor: '#06B6D4',
-    paddingVertical: 13,
-    borderRadius: 10,
+    backgroundColor: C.accent,
+    paddingVertical: 15,
+    borderRadius: 14,
     alignItems: 'center',
+    ...GLOW,
   },
   startBtnText: {
-    color: '#050811',
+    color: '#00212B',
     fontSize: 14,
-    fontWeight: '800',
+    fontWeight: '900',
+    letterSpacing: 0.3,
   },
   stopBtn: {
-    backgroundColor: '#EF4444',
-    paddingVertical: 13,
-    borderRadius: 10,
+    backgroundColor: 'rgba(248,113,113,0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.5)',
+    paddingVertical: 15,
+    borderRadius: 14,
     alignItems: 'center',
   },
   stopBtnText: {
-    color: '#FFFFFF',
+    color: C.red,
     fontSize: 14,
     fontWeight: '800',
   },
 
-  // Participant List on Host
+  // ── Participants ───────────────────────────────────────────────────────────
   participantItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#0F172A',
-    padding: 10,
-    borderRadius: 10,
+    backgroundColor: C.surf2,
+    padding: 12,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#1E293B',
+    borderColor: C.line,
     marginBottom: 8,
   },
   participantName: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 13,
     fontWeight: '700',
   },
   participantMeta: {
-    color: '#64748B',
-    fontSize: 11,
+    color: C.textMute,
+    fontSize: 10.5,
     fontFamily: 'monospace',
-    marginTop: 1,
+    marginTop: 2,
   },
   hostBadge: {
-    backgroundColor: 'rgba(6,182,212,0.15)',
+    backgroundColor: 'rgba(34,211,238,0.12)',
     borderWidth: 1,
-    borderColor: '#06B6D4',
+    borderColor: 'rgba(34,211,238,0.4)',
     paddingHorizontal: 8,
     paddingVertical: 3,
-    borderRadius: 6,
+    borderRadius: 7,
   },
   hostBadgeText: {
-    color: '#06B6D4',
-    fontSize: 10,
+    color: C.accent,
+    fontSize: 9.5,
     fontWeight: '800',
+    letterSpacing: 0.5,
   },
   syncedBadge: {
-    backgroundColor: 'rgba(16,185,129,0.15)',
+    backgroundColor: 'rgba(52,211,153,0.12)',
     borderWidth: 1,
-    borderColor: '#10B981',
+    borderColor: 'rgba(52,211,153,0.4)',
     paddingHorizontal: 8,
     paddingVertical: 3,
-    borderRadius: 6,
+    borderRadius: 7,
   },
   syncedBadgeText: {
-    color: '#10B981',
-    fontSize: 10,
+    color: C.green,
+    fontSize: 9.5,
     fontWeight: '800',
+    letterSpacing: 0.5,
   },
   noParticipantsBox: {
-    paddingVertical: 14,
+    paddingVertical: 18,
     alignItems: 'center',
   },
   noParticipantsText: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 12,
     textAlign: 'center',
+    lineHeight: 18,
   },
 
-  // Audio Visualizer
+  // ── Visualizer ─────────────────────────────────────────────────────────────
   visualizerRow: {
     flexDirection: 'row',
     alignItems: 'flex-end',
-    gap: 4,
+    gap: 3,
     height: 20,
   },
   visualizerBar: {
-    width: 4,
+    width: 3,
     height: 18,
-    backgroundColor: '#06B6D4',
+    backgroundColor: C.accent,
     borderRadius: 2,
   },
 
-  // Tracks
+  // ── Section + tracks ───────────────────────────────────────────────────────
   sectionTitle: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 15,
     fontWeight: '800',
+    letterSpacing: 0.2,
   },
   trackItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    backgroundColor: '#0F172A',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: C.surf2,
     borderWidth: 1,
-    borderColor: '#1E293B',
+    borderColor: C.line,
     marginBottom: 8,
   },
   trackItemActive: {
-    borderColor: '#06B6D4',
-    backgroundColor: 'rgba(6,182,212,0.08)',
+    borderColor: 'rgba(34,211,238,0.6)',
+    backgroundColor: 'rgba(34,211,238,0.08)',
   },
   trackTitle: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 13,
     fontWeight: '700',
   },
   trackArtist: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 11,
-    marginTop: 1,
+    marginTop: 2,
   },
   trackDuration: {
-    color: '#94A3B8',
-    fontSize: 11,
+    color: C.textDim,
+    fontSize: 10.5,
     fontFamily: 'monospace',
   },
 
-  // Volume
+  // ── Volume ─────────────────────────────────────────────────────────────────
   volumeBox: {
-    marginTop: 6,
-    paddingTop: 10,
+    marginTop: 8,
+    paddingTop: 12,
     borderTopWidth: 1,
-    borderTopColor: '#162238',
+    borderTopColor: C.line,
   },
   volLabel: {
-    color: '#94A3B8',
+    color: C.textDim,
     fontSize: 11.5,
     fontWeight: '600',
   },
   volValue: {
-    color: '#06B6D4',
+    color: C.accent,
     fontSize: 12,
     fontWeight: '800',
+    fontFamily: 'monospace',
   },
   volControlRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 11,
   },
   volBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    backgroundColor: '#0F172A',
+    width: 34,
+    height: 34,
+    borderRadius: 11,
+    backgroundColor: C.surf3,
     borderWidth: 1,
-    borderColor: '#1E293B',
+    borderColor: C.line,
     alignItems: 'center',
     justifyContent: 'center',
   },
   volBtnText: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 16,
     fontWeight: '800',
   },
   volTrack: {
     flex: 1,
-    height: 8,
-    backgroundColor: '#0F172A',
-    borderRadius: 4,
+    height: 6,
+    backgroundColor: C.surf3,
+    borderRadius: 3,
     overflow: 'hidden',
   },
   volFill: {
     height: '100%',
   },
 
-  // Join Room Styles
+  // ── Join room ──────────────────────────────────────────────────────────────
   liveGreenDot: {
-    width: 12,
-    height: 12,
+    width: 11,
+    height: 11,
     borderRadius: 6,
-    backgroundColor: '#10B981',
+    backgroundColor: C.green,
   },
   joinedTitle: {
-    color: '#10B981',
+    color: C.green,
     fontSize: 16,
     fontWeight: '800',
   },
   joinedSub: {
-    color: '#94A3B8',
-    fontSize: 11.5,
-    marginTop: 2,
+    color: C.textDim,
+    fontSize: 11,
+    marginTop: 3,
     fontFamily: 'monospace',
   },
   listenerStatusRow: {
-    backgroundColor: 'rgba(16,185,129,0.1)',
-    borderRadius: 8,
-    padding: 8,
-    marginVertical: 10,
+    backgroundColor: 'rgba(52,211,153,0.08)',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(52,211,153,0.25)',
+    padding: 10,
+    marginVertical: 12,
   },
   listenerStatusText: {
-    color: '#10B981',
+    color: C.green,
     fontSize: 12.5,
     fontWeight: '700',
     textAlign: 'center',
@@ -2836,81 +3418,84 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'flex-end',
-    gap: 8,
-    height: 36,
-    backgroundColor: '#0A1E1B',
-    borderRadius: 10,
+    gap: 7,
+    height: 38,
+    backgroundColor: '#04120E',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(52,211,153,0.2)',
     padding: 8,
   },
   leaveBtn: {
-    backgroundColor: 'rgba(239,68,68,0.15)',
+    backgroundColor: 'rgba(248,113,113,0.1)',
     borderWidth: 1,
-    borderColor: '#EF4444',
-    paddingVertical: 12,
-    borderRadius: 10,
+    borderColor: 'rgba(248,113,113,0.45)',
+    paddingVertical: 13,
+    borderRadius: 14,
     alignItems: 'center',
-    marginTop: 14,
+    marginTop: 16,
   },
   leaveBtnText: {
-    color: '#EF4444',
+    color: C.red,
     fontSize: 13,
     fontWeight: '800',
   },
 
-  // Discovered Rooms
+  // ── Discovered rooms ───────────────────────────────────────────────────────
   discoveredContainer: {
-    backgroundColor: '#0F1B2B',
-    borderRadius: 12,
-    padding: 12,
+    backgroundColor: C.surf2,
+    borderRadius: 16,
+    padding: 14,
     borderWidth: 1,
-    borderColor: '#06B6D4',
-    marginBottom: 10,
+    borderColor: 'rgba(34,211,238,0.3)',
+    marginBottom: 12,
   },
   discoveredHeader: {
-    color: '#06B6D4',
-    fontSize: 12.5,
+    color: C.accent,
+    fontSize: 12,
     fontWeight: '800',
-    marginBottom: 8,
+    marginBottom: 10,
+    letterSpacing: 0.3,
   },
   discoveredItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#0A1220',
-    padding: 10,
-    borderRadius: 8,
+    backgroundColor: C.surf3,
+    padding: 11,
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#1E293B',
-    marginBottom: 6,
+    borderColor: C.line,
+    marginBottom: 7,
   },
   discoveredTitle: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 13.5,
     fontWeight: '700',
   },
   discoveredMeta: {
-    color: '#64748B',
-    fontSize: 11,
+    color: C.textMute,
+    fontSize: 10.5,
     fontFamily: 'monospace',
-    marginTop: 1,
+    marginTop: 2,
   },
   quickJoinBtn: {
-    backgroundColor: '#06B6D4',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
+    backgroundColor: C.accent,
+    paddingHorizontal: 13,
+    paddingVertical: 7,
+    borderRadius: 9,
   },
   quickJoinBtnText: {
-    color: '#050811',
+    color: '#00212B',
     fontSize: 11.5,
     fontWeight: '800',
   },
 
-  // Form Inputs
+  // ── Inputs ─────────────────────────────────────────────────────────────────
   inputLabel: {
-    color: '#94A3B8',
+    color: C.textDim,
     fontSize: 12,
     fontWeight: '600',
-    marginBottom: 6,
+    marginBottom: 8,
   },
   codeRow: {
     flexDirection: 'row',
@@ -2918,290 +3503,295 @@ const styles = StyleSheet.create({
   },
   codeInput: {
     flex: 1,
-    backgroundColor: '#0F172A',
-    borderRadius: 10,
+    backgroundColor: C.surf2,
+    borderRadius: 13,
     borderWidth: 1,
-    borderColor: '#1E293B',
-    color: '#F8FAFC',
-    fontSize: 14,
+    borderColor: C.line,
+    color: C.text,
+    fontSize: 15,
     fontWeight: '700',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    paddingHorizontal: 15,
+    paddingVertical: 12,
     fontFamily: 'monospace',
+    letterSpacing: 1.5,
   },
   joinActionBtn: {
-    backgroundColor: '#06B6D4',
-    paddingHorizontal: 18,
-    borderRadius: 10,
+    backgroundColor: C.accent,
+    paddingHorizontal: 20,
+    borderRadius: 13,
     alignItems: 'center',
     justifyContent: 'center',
+    ...GLOW,
   },
   joinActionBtnText: {
-    color: '#050811',
+    color: '#00212B',
     fontSize: 13,
     fontWeight: '800',
   },
   feedbackCard: {
-    backgroundColor: 'rgba(245,158,11,0.08)',
-    borderRadius: 12,
+    backgroundColor: 'rgba(251,191,36,0.07)',
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#F59E0B',
-    padding: 12,
-    marginTop: 10,
+    borderColor: 'rgba(251,191,36,0.35)',
+    padding: 13,
+    marginTop: 12,
   },
   feedbackTitle: {
-    color: '#F59E0B',
+    color: C.amber,
     fontSize: 12.5,
     fontWeight: '800',
+    marginBottom: 3,
   },
   feedbackText: {
-    color: '#CBD5E1',
+    color: C.textDim,
     fontSize: 12,
     lineHeight: 18,
   },
   suggestionBtn: {
-    backgroundColor: '#06B6D4',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    marginTop: 8,
+    backgroundColor: C.accent,
+    paddingVertical: 9,
+    paddingHorizontal: 13,
+    borderRadius: 10,
+    marginTop: 10,
     alignItems: 'center',
   },
   suggestionBtnText: {
-    color: '#050811',
+    color: '#00212B',
     fontSize: 12,
     fontWeight: '800',
   },
   orDividerRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginVertical: 14,
+    marginVertical: 16,
   },
   dividerLine: {
     flex: 1,
     height: 1,
-    backgroundColor: '#1E293B',
+    backgroundColor: C.line,
   },
   orText: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 11,
-    marginHorizontal: 12,
+    marginHorizontal: 14,
     fontWeight: '600',
   },
   qrScanBtn: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#0F172A',
-    borderWidth: 1.5,
-    borderColor: '#06B6D4',
-    paddingVertical: 12,
-    borderRadius: 10,
+    backgroundColor: C.surf2,
+    borderWidth: 1,
+    borderColor: 'rgba(34,211,238,0.4)',
+    paddingVertical: 14,
+    borderRadius: 14,
   },
   qrScanBtnText: {
-    color: '#06B6D4',
+    color: C.accent,
     fontSize: 13,
     fontWeight: '800',
   },
   tipBox: {
-    backgroundColor: 'rgba(6,182,212,0.05)',
+    backgroundColor: C.surf,
     borderWidth: 1,
-    borderColor: 'rgba(6,182,212,0.2)',
-    borderRadius: 12,
-    padding: 12,
+    borderColor: C.line,
+    borderRadius: 16,
+    padding: 14,
   },
   tipTitle: {
-    color: '#06B6D4',
+    color: C.accent,
     fontSize: 12.5,
     fontWeight: '800',
-    marginBottom: 4,
+    marginBottom: 6,
   },
   tipText: {
-    color: '#94A3B8',
+    color: C.textDim,
     fontSize: 11.5,
-    lineHeight: 18,
+    lineHeight: 19,
   },
 
-  // Walkie-Talkie Styles
+  // ── Walkie-talkie ──────────────────────────────────────────────────────────
   roomVoiceTitle: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 22,
     fontWeight: '900',
-    letterSpacing: 0.5,
+    letterSpacing: 0.4,
   },
   roomMemberBadge: {
-    backgroundColor: 'rgba(6,182,212,0.15)',
+    backgroundColor: 'rgba(34,211,238,0.1)',
     borderWidth: 1,
-    borderColor: '#06B6D4',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 8,
+    borderColor: 'rgba(34,211,238,0.35)',
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    borderRadius: 999,
   },
   roomMemberBadgeText: {
-    color: '#06B6D4',
-    fontSize: 11.5,
+    color: C.accent,
+    fontSize: 11,
     fontWeight: '800',
   },
   speakerBanner: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 12,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    marginTop: 6,
+    padding: 14,
+    borderRadius: 16,
+    borderWidth: 1,
+    marginTop: 8,
   },
   speakerBannerIdle: {
-    backgroundColor: '#0F172A',
-    borderColor: '#1E293B',
+    backgroundColor: C.surf2,
+    borderColor: C.line,
   },
   speakerBannerTalking: {
-    backgroundColor: 'rgba(239,68,68,0.12)',
-    borderColor: '#EF4444',
+    backgroundColor: 'rgba(248,113,113,0.09)',
+    borderColor: 'rgba(248,113,113,0.45)',
   },
   speakerBannerActive: {
-    backgroundColor: 'rgba(6,182,212,0.12)',
-    borderColor: '#06B6D4',
+    backgroundColor: 'rgba(34,211,238,0.09)',
+    borderColor: 'rgba(34,211,238,0.45)',
   },
   speakerBannerTitle: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 13.5,
     fontWeight: '800',
   },
   speakerBannerSub: {
-    color: '#94A3B8',
+    color: C.textDim,
     fontSize: 11,
-    marginTop: 1,
+    marginTop: 2,
+    lineHeight: 16,
   },
   pttContainer: {
     alignItems: 'center',
-    paddingVertical: 28,
+    paddingVertical: 30,
   },
   pttOuterRing: {
-    width: 200,
-    height: 200,
-    borderRadius: 100,
-    backgroundColor: 'rgba(6,182,212,0.1)',
-    borderWidth: 2,
-    borderColor: 'rgba(6,182,212,0.3)',
+    width: 208,
+    height: 208,
+    borderRadius: 104,
+    backgroundColor: 'rgba(34,211,238,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(34,211,238,0.22)',
     alignItems: 'center',
     justifyContent: 'center',
   },
   pttOuterRingActive: {
-    backgroundColor: 'rgba(239,68,68,0.15)',
-    borderColor: '#EF4444',
+    backgroundColor: 'rgba(248,113,113,0.1)',
+    borderColor: 'rgba(248,113,113,0.4)',
   },
   pttButton: {
-    width: 160,
-    height: 160,
-    borderRadius: 80,
-    backgroundColor: '#0A1220',
-    borderWidth: 3,
-    borderColor: '#06B6D4',
+    width: 164,
+    height: 164,
+    borderRadius: 82,
+    backgroundColor: C.surf2,
+    borderWidth: 2,
+    borderColor: 'rgba(34,211,238,0.55)',
     alignItems: 'center',
     justifyContent: 'center',
-    elevation: 12,
+    ...GLOW,
   },
   pttButtonActive: {
-    backgroundColor: '#7F1D1D',
-    borderColor: '#EF4444',
+    backgroundColor: '#3A1214',
+    borderColor: C.red,
   },
   pttIcon: {
     fontSize: 38,
-    marginBottom: 4,
+    marginBottom: 6,
   },
   pttText: {
-    color: '#F8FAFC',
-    fontSize: 14,
+    color: C.text,
+    fontSize: 13.5,
     fontWeight: '900',
     letterSpacing: 1,
   },
   pttSubtext: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 10.5,
-    marginTop: 2,
+    marginTop: 3,
   },
   speakerStatusBox: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    marginTop: 20,
-    backgroundColor: '#0A101D',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 20,
+    gap: 9,
+    marginTop: 22,
+    backgroundColor: C.surf,
+    paddingHorizontal: 15,
+    paddingVertical: 9,
+    borderRadius: 999,
     borderWidth: 1,
-    borderColor: '#162238',
+    borderColor: C.line,
   },
   activeSpeakerDot: {
-    width: 8,
-    height: 8,
+    width: 7,
+    height: 7,
     borderRadius: 4,
   },
   speakerStatusText: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 12,
     fontWeight: '600',
   },
 
-  // Bluetooth Manager Styles
+  // ── Bluetooth ──────────────────────────────────────────────────────────────
   scanBtn: {
-    backgroundColor: '#06B6D4',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8,
+    backgroundColor: C.accent,
+    paddingHorizontal: 13,
+    paddingVertical: 7,
+    borderRadius: 10,
   },
   scanBtnActive: {
-    backgroundColor: '#3B82F6',
+    backgroundColor: C.textMute,
   },
   scanBtnText: {
-    color: '#050811',
+    color: '#00212B',
     fontSize: 11.5,
     fontWeight: '800',
   },
   searchBox: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#0F172A',
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    backgroundColor: C.surf2,
+    borderRadius: 13,
+    paddingHorizontal: 13,
+    paddingVertical: 10,
     borderWidth: 1,
-    borderColor: '#1E293B',
-    marginBottom: 10,
+    borderColor: C.line,
+    marginBottom: 12,
   },
   searchInput: {
     flex: 1,
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 12.5,
     padding: 0,
   },
   filterPill: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 20,
-    backgroundColor: '#0F172A',
+    paddingHorizontal: 13,
+    paddingVertical: 7,
+    borderRadius: 999,
+    backgroundColor: C.surf2,
     borderWidth: 1,
-    borderColor: '#1E293B',
+    borderColor: C.line,
   },
   filterPillActive: {
-    backgroundColor: '#06B6D4',
-    borderColor: '#06B6D4',
+    backgroundColor: C.accent,
+    borderColor: C.accent,
   },
   filterPillText: {
-    color: '#94A3B8',
+    color: C.textDim,
     fontSize: 11.5,
     fontWeight: '600',
   },
   filterPillTextActive: {
-    color: '#050811',
+    color: '#00212B',
     fontWeight: '800',
   },
   deviceCard: {
-    backgroundColor: '#0A101D',
-    borderRadius: 12,
-    padding: 14,
+    backgroundColor: C.surf,
+    borderRadius: 18,
+    padding: 16,
     borderWidth: 1,
-    borderColor: '#162238',
+    borderColor: C.line,
+    ...SHADOW,
   },
   deviceCardTop: {
     flexDirection: 'row',
@@ -3209,25 +3799,25 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
   },
   deviceName: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 14.5,
     fontWeight: '700',
   },
   battBadge: {
-    backgroundColor: 'rgba(16,185,129,0.12)',
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 6,
+    backgroundColor: 'rgba(52,211,153,0.1)',
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 7,
   },
   battText: {
-    color: '#10B981',
+    color: C.green,
     fontSize: 10.5,
     fontWeight: '700',
   },
   deviceMeta: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 11.5,
-    marginTop: 2,
+    marginTop: 3,
   },
   signalDots: {
     fontSize: 11,
@@ -3239,65 +3829,67 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   connectBtn: {
-    backgroundColor: '#06B6D4',
-    paddingHorizontal: 14,
-    paddingVertical: 7,
-    borderRadius: 8,
+    backgroundColor: C.accent,
+    paddingHorizontal: 15,
+    paddingVertical: 8,
+    borderRadius: 10,
+    ...GLOW,
   },
   connectBtnText: {
-    color: '#050811',
+    color: '#00212B',
     fontSize: 12,
     fontWeight: '800',
   },
   connectingBox: {
-    paddingHorizontal: 14,
-    paddingVertical: 7,
+    paddingHorizontal: 15,
+    paddingVertical: 8,
   },
   disconnectBtn: {
-    backgroundColor: 'rgba(239,68,68,0.1)',
+    backgroundColor: 'rgba(248,113,113,0.1)',
     borderWidth: 1,
-    borderColor: '#EF4444',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8,
+    borderColor: 'rgba(248,113,113,0.45)',
+    paddingHorizontal: 13,
+    paddingVertical: 7,
+    borderRadius: 10,
   },
   disconnectBtnText: {
-    color: '#EF4444',
+    color: C.red,
     fontSize: 11.5,
     fontWeight: '700',
   },
   emptyCard: {
-    backgroundColor: '#0A101D',
-    borderRadius: 14,
-    padding: 24,
+    backgroundColor: C.surf,
+    borderRadius: 18,
+    padding: 28,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#162238',
+    borderColor: C.line,
   },
   emptyTitle: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 15,
     fontWeight: '700',
-    marginBottom: 4,
+    marginBottom: 5,
   },
   emptySub: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 12,
     textAlign: 'center',
+    lineHeight: 18,
   },
 
-  // Bottom Navigation
+  // ── Bottom navigation ──────────────────────────────────────────────────────
   bottomNav: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
-    height: 72,
-    backgroundColor: '#080E1B',
+    height: 74,
+    backgroundColor: C.surf,
     borderTopWidth: 1,
-    borderTopColor: '#162238',
+    borderTopColor: C.line,
     flexDirection: 'row',
-    paddingHorizontal: 6,
+    paddingHorizontal: 8,
     paddingBottom: 8,
     alignItems: 'center',
   },
@@ -3305,34 +3897,35 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 6,
-    borderRadius: 10,
+    paddingVertical: 7,
+    borderRadius: 14,
   },
   navItemActive: {
-    backgroundColor: 'rgba(6,182,212,0.1)',
+    backgroundColor: 'rgba(34,211,238,0.08)',
   },
   navIcon: {
-    fontSize: 20,
-    opacity: 0.5,
+    fontSize: 19,
+    opacity: 0.42,
   },
   navIconActive: {
     opacity: 1,
   },
   navLabel: {
-    fontSize: 10,
-    color: '#64748B',
+    fontSize: 9.5,
+    color: C.textMute,
     fontWeight: '600',
-    marginTop: 2,
+    marginTop: 3,
+    letterSpacing: 0.2,
   },
   navLabelActive: {
-    color: '#06B6D4',
+    color: C.accent,
     fontWeight: '800',
   },
 
-  // QR Modal
+  // ── QR modal ───────────────────────────────────────────────────────────────
   modalBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.85)',
+    backgroundColor: 'rgba(0,0,0,0.88)',
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
@@ -3340,71 +3933,599 @@ const styles = StyleSheet.create({
   qrModalCard: {
     width: '100%',
     maxWidth: 340,
-    backgroundColor: '#0A101D',
-    borderRadius: 20,
-    padding: 20,
+    backgroundColor: C.surf,
+    borderRadius: 22,
+    padding: 22,
     alignItems: 'center',
-    borderWidth: 1.5,
-    borderColor: '#06B6D4',
+    borderWidth: 1,
+    borderColor: C.lineStrong,
+    ...SHADOW,
   },
   modalTitle: {
-    color: '#F8FAFC',
+    color: C.text,
     fontSize: 18,
     fontWeight: '800',
-    marginBottom: 4,
+    marginBottom: 5,
   },
   modalSub: {
-    color: '#94A3B8',
+    color: C.textDim,
     fontSize: 12,
     textAlign: 'center',
-    marginBottom: 16,
+    marginBottom: 18,
+    lineHeight: 18,
   },
   modalRoomPill: {
-    backgroundColor: '#0F1B2B',
+    backgroundColor: C.surf2,
     borderWidth: 1,
-    borderColor: '#06B6D4',
-    borderRadius: 8,
-    padding: 10,
-    marginBottom: 6,
+    borderColor: 'rgba(34,211,238,0.3)',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 8,
   },
   modalRoomPillText: {
-    color: '#06B6D4',
+    color: C.accent,
     fontSize: 12.5,
     fontWeight: '700',
   },
   modalIpInput: {
     width: '100%',
-    backgroundColor: '#0F172A',
-    borderRadius: 10,
+    backgroundColor: C.surf2,
+    borderRadius: 13,
     borderWidth: 1,
-    borderColor: '#1E293B',
-    color: '#F8FAFC',
+    borderColor: C.line,
+    color: C.text,
     fontSize: 14,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    marginBottom: 14,
+    paddingHorizontal: 15,
+    paddingVertical: 12,
+    marginBottom: 16,
     fontFamily: 'monospace',
     textAlign: 'center',
+    letterSpacing: 1.2,
   },
   modalActionBtn: {
     width: '100%',
-    backgroundColor: '#06B6D4',
-    paddingVertical: 12,
-    borderRadius: 10,
+    backgroundColor: C.accent,
+    paddingVertical: 14,
+    borderRadius: 13,
     alignItems: 'center',
     marginBottom: 10,
+    ...GLOW,
   },
   modalActionBtnText: {
-    color: '#050811',
+    color: '#00212B',
     fontSize: 13.5,
     fontWeight: '800',
   },
   modalCloseBtn: {
-    paddingVertical: 8,
+    paddingVertical: 9,
   },
   modalCloseBtnText: {
-    color: '#64748B',
+    color: C.textMute,
     fontSize: 12.5,
     fontWeight: '600',
+  },
+
+  // ── Media library ──────────────────────────────────────────────────────────
+  mediaLibTitle: {
+    color: C.text,
+    fontSize: 21,
+    fontWeight: '900',
+    marginTop: 3,
+    letterSpacing: -0.2,
+  },
+  mediaLibMeta: {
+    color: C.textMute,
+    fontSize: 11,
+    marginTop: 4,
+    fontFamily: 'monospace',
+    letterSpacing: 0.2,
+  },
+  mediaIconBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 12,
+    backgroundColor: C.surf3,
+    borderWidth: 1,
+    borderColor: C.line,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  mediaTab: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: C.surf2,
+    borderWidth: 1,
+    borderColor: C.line,
+    alignItems: 'center',
+  },
+  mediaTabActive: {
+    backgroundColor: 'rgba(34,211,238,0.12)',
+    borderColor: 'rgba(34,211,238,0.55)',
+  },
+  mediaTabText: {
+    color: C.textDim,
+    fontSize: 11.5,
+    fontWeight: '700',
+  },
+  mediaTabTextActive: {
+    color: C.accent,
+    fontWeight: '800',
+  },
+  mediaSyncToggle: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: C.surf2,
+    borderWidth: 1,
+    borderColor: C.line,
+    alignItems: 'center',
+  },
+  mediaSyncToggleOn: {
+    backgroundColor: 'rgba(52,211,153,0.14)',
+    borderColor: 'rgba(52,211,153,0.5)',
+  },
+  mediaSyncToggleText: {
+    color: C.textMute,
+    fontSize: 10.5,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+  },
+  mediaOpenBtn: {
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: C.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...GLOW,
+  },
+  mediaOpenBtnText: {
+    color: '#00212B',
+    fontSize: 11.5,
+    fontWeight: '800',
+  },
+  mediaLoadingBox: {
+    paddingVertical: 38,
+    alignItems: 'center',
+  },
+  mediaLoadingText: {
+    color: C.textDim,
+    fontSize: 12.5,
+    marginTop: 12,
+  },
+  mediaPermBtn: {
+    marginTop: 14,
+    backgroundColor: C.accent,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 11,
+  },
+  mediaPermBtnText: {
+    color: '#00212B',
+    fontSize: 12.5,
+    fontWeight: '800',
+  },
+  mediaSearchMeta: {
+    color: C.accent,
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: -2,
+    marginBottom: 4,
+  },
+  mediaGroupHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 4,
+    paddingTop: 14,
+    paddingBottom: 8,
+  },
+  mediaGroupLabel: {
+    color: C.textDim,
+    fontSize: 11.5,
+    fontWeight: '800',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+  },
+  mediaGroupCount: {
+    color: C.textMute,
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  mediaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: C.surf,
+    borderRadius: 16,
+    padding: 11,
+    marginBottom: 7,
+    borderWidth: 1,
+    borderColor: C.line,
+  },
+  mediaRowActive: {
+    borderColor: 'rgba(34,211,238,0.55)',
+    backgroundColor: 'rgba(34,211,238,0.06)',
+  },
+  mediaRowTitle: {
+    color: C.text,
+    fontSize: 13.5,
+    fontWeight: '700',
+    lineHeight: 18,
+  },
+  mediaRowMeta: {
+    color: C.textMute,
+    fontSize: 10.5,
+    marginTop: 3,
+  },
+  mediaFmtBadge: {
+    backgroundColor: 'rgba(34,211,238,0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(34,211,238,0.28)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 5,
+  },
+  mediaFmtBadgeText: {
+    color: C.accent,
+    fontSize: 8.5,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+  },
+  mediaExtBadge: {
+    backgroundColor: 'rgba(251,191,36,0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(251,191,36,0.35)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 5,
+  },
+  mediaExtBadgeText: {
+    color: C.amber,
+    fontSize: 8.5,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+  },
+  mediaRowDuration: {
+    color: C.textDim,
+    fontSize: 10.5,
+    fontFamily: 'monospace',
+    marginBottom: 6,
+  },
+  mediaPlayPill: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(34,211,238,0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(34,211,238,0.4)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  mediaPlayPillActive: {
+    backgroundColor: C.green,
+    borderColor: C.green,
+  },
+  mediaPlayPillText: {
+    color: '#00212B',
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  mediaMoreBtn: {
+    marginTop: 10,
+    paddingVertical: 13,
+    borderRadius: 13,
+    backgroundColor: C.surf2,
+    borderWidth: 1,
+    borderColor: C.line,
+    alignItems: 'center',
+  },
+  mediaMoreBtnText: {
+    color: C.accent,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  // ── Player sheet ───────────────────────────────────────────────────────────
+  sheetBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.86)',
+    justifyContent: 'flex-end',
+  },
+  sheet: {
+    backgroundColor: C.surf,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    borderWidth: 1,
+    borderColor: C.lineStrong,
+    paddingHorizontal: 22,
+    paddingTop: 12,
+    paddingBottom: 28,
+    alignItems: 'center',
+    ...SHADOW,
+  },
+  sheetHandle: {
+    width: 42,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: C.lineStrong,
+    marginBottom: 12,
+  },
+  sheetTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+    marginBottom: 12,
+  },
+  sheetBadge: {
+    color: C.accent,
+    fontSize: 9.5,
+    fontWeight: '800',
+    letterSpacing: 1.5,
+  },
+  sheetClose: {
+    color: C.textMute,
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  videoSurface: {
+    width: '100%',
+    height: 208,
+    backgroundColor: '#000000',
+    borderRadius: 18,
+    overflow: 'hidden',
+    position: 'relative',
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: C.line,
+  },
+  fullscreenPill: {
+    position: 'absolute',
+    top: 10,
+    right: 10,
+    backgroundColor: 'rgba(0,0,0,0.72)',
+    borderColor: 'rgba(34,211,238,0.5)',
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 9,
+  },
+  fullscreenPillText: {
+    color: C.accent,
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  videoPoster: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+    backgroundColor: C.surf2,
+  },
+  videoPosterIcon: {
+    fontSize: 38,
+    marginBottom: 8,
+  },
+  videoPosterTitle: {
+    color: C.text,
+    fontSize: 13,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  videoPosterHint: {
+    color: C.textMute,
+    fontSize: 10.5,
+    marginTop: 5,
+    textAlign: 'center',
+  },
+  sheetTitle: {
+    color: C.text,
+    fontSize: 17,
+    fontWeight: '800',
+    textAlign: 'center',
+    marginTop: 14,
+    letterSpacing: -0.2,
+  },
+  sheetArtist: {
+    color: C.textMute,
+    fontSize: 11,
+    textAlign: 'center',
+    marginTop: 5,
+    marginBottom: 8,
+  },
+  mediaErrorBox: {
+    width: '100%',
+    backgroundColor: 'rgba(248,113,113,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.4)',
+    borderRadius: 13,
+    padding: 12,
+    marginTop: 10,
+  },
+  mediaErrorText: {
+    color: '#FECACA',
+    fontSize: 11.5,
+    marginBottom: 8,
+    lineHeight: 17,
+  },
+  mediaErrorBtn: {
+    backgroundColor: C.red,
+    paddingVertical: 8,
+    borderRadius: 9,
+    alignItems: 'center',
+  },
+  mediaErrorBtnText: {
+    color: '#2A0808',
+    fontSize: 11.5,
+    fontWeight: '800',
+  },
+  seekBarHit: {
+    width: '100%',
+    height: 30,
+    justifyContent: 'center',
+    marginTop: 12,
+  },
+  seekTrack: {
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: C.surf3,
+    overflow: 'hidden',
+  },
+  seekFill: {
+    height: '100%',
+    backgroundColor: C.accent,
+    borderRadius: 2,
+  },
+  seekKnob: {
+    position: 'absolute',
+    width: 13,
+    height: 13,
+    borderRadius: 7,
+    backgroundColor: C.accent,
+    borderWidth: 2,
+    borderColor: C.bg,
+    shadowColor: C.accent,
+    shadowOpacity: 0.8,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  sheetTimeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    width: '100%',
+    marginTop: 4,
+  },
+  sheetTime: {
+    color: C.textMute,
+    fontSize: 10.5,
+    fontFamily: 'monospace',
+  },
+  sheetControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+    marginTop: 18,
+  },
+  sheetSideBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: C.surf3,
+    borderWidth: 1,
+    borderColor: C.line,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sheetSideBtnText: {
+    color: C.text,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  sheetSkipBtn: {
+    width: 46,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: C.surf3,
+    borderWidth: 1,
+    borderColor: C.line,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sheetSkipText: {
+    color: C.textDim,
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  sheetPlayBtn: {
+    width: 66,
+    height: 66,
+    borderRadius: 33,
+    backgroundColor: C.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...GLOW,
+  },
+  sheetPlayText: {
+    color: '#00212B',
+    fontSize: 24,
+    fontWeight: '900',
+  },
+  sheetFooter: {
+    flexDirection: 'row',
+    gap: 9,
+    width: '100%',
+    marginTop: 20,
+  },
+  sheetChip: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: C.surf2,
+    borderWidth: 1,
+    borderColor: C.line,
+    alignItems: 'center',
+  },
+  sheetChipOn: {
+    backgroundColor: 'rgba(34,211,238,0.12)',
+    borderColor: 'rgba(34,211,238,0.5)',
+  },
+  sheetChipText: {
+    color: C.textMute,
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  sheetChipTextOn: {
+    color: C.accent,
+  },
+
+  // ── Mini player ────────────────────────────────────────────────────────────
+  miniPlayer: {
+    position: 'absolute',
+    left: 12,
+    right: 12,
+    bottom: 84,
+    zIndex: 900,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: C.surf3,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: C.lineStrong,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+    ...SHADOW,
+  },
+  miniTitle: {
+    color: C.text,
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  miniSub: {
+    color: C.textMute,
+    fontSize: 10,
+    marginTop: 2,
+    fontFamily: 'monospace',
+  },
+  miniProgressTrack: {
+    height: 2.5,
+    borderRadius: 2,
+    backgroundColor: C.surf3,
+    marginTop: 6,
+    overflow: 'hidden',
+  },
+  miniProgressFill: {
+    height: '100%',
+    backgroundColor: C.accent,
+  },
+  miniBtn: {
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+  miniBtnText: {
+    color: C.accent,
+    fontSize: 14,
+    fontWeight: '900',
   },
 });

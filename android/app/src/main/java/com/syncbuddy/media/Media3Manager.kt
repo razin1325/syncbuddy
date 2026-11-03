@@ -7,6 +7,7 @@ import android.os.Looper
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
@@ -25,6 +26,14 @@ object Media3Manager {
 
     @Volatile var currentUri: String? = null
     @Volatile var isVideo: Boolean = false
+    @Volatile var lastError: String? = null
+
+    /**
+     * Set by SyncNetworkModule so decode/container failures reach the React UI,
+     * which then offers the external-player fallback for exotic formats.
+     * Signature: (errorCode, message, uri)
+     */
+    var onPlaybackError: ((Int, String, String?) -> Unit)? = null
 
     fun getPlayer(context: Context): ExoPlayer {
         if (exoPlayer == null) {
@@ -37,20 +46,47 @@ object Media3Manager {
                 .setAudioAttributes(audioAttrs, true)
                 .build().apply {
                     repeatMode = Player.REPEAT_MODE_OFF
+                    addListener(object : Player.Listener {
+                        override fun onPlayerError(error: PlaybackException) {
+                            lastError = error.message
+                            try {
+                                onPlaybackError?.invoke(
+                                    error.errorCode,
+                                    error.message ?: "Playback failed",
+                                    currentUri
+                                )
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+                        }
+
+                        override fun onPlaybackStateChanged(playbackState: Int) {
+                            if (playbackState == Player.STATE_READY) lastError = null
+                        }
+                    })
                 }
         }
         return exoPlayer!!
     }
 
-    fun play(context: Context, uriString: String, isVideoFile: Boolean, volume: Float = 1.0f) {
+    fun play(context: Context, uriString: String, isVideoFile: Boolean, volume: Float = 1.0f, mimeType: String? = null) {
         mainHandler.post {
             try {
                 val player = getPlayer(context)
                 currentUri = uriString
                 isVideo = isVideoFile
+                lastError = null
 
                 val uri = Uri.parse(uriString)
-                val mediaItem = MediaItem.fromUri(uri)
+                val builder = MediaItem.Builder().setUri(uri)
+                // content:// URIs carry no file extension, so hint the container
+                // type explicitly; otherwise ExoPlayer has to sniff the stream.
+                val hint = mimeType ?: ""
+                val isMediaMime = hint.startsWith("audio/") || hint.startsWith("video/")
+                if (isMediaMime && uriString.startsWith("content://")) {
+                    builder.setMimeType(hint)
+                }
+                val mediaItem = builder.build()
 
                 player.stop()
                 player.clearMediaItems()

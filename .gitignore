@@ -29,3 +29,11 @@ fastlane/screenshots
 .DS_Store
 Thumbs.db
 
+# Local web-preview harness (dev only, not shipped)
+.chrome-profile/
+dist-web/
+expo-web.log
+shots/
+tools/
+
+

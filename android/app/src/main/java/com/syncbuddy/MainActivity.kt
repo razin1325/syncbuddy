@@ -66,7 +66,7 @@ class MainActivity : ReactActivity() {
                 putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("audio/*", "video/*"))
                 addCategory(Intent.CATEGORY_OPENABLE)
             }
-            startActivityForResult(Intent.createChooser(intent, "অডিও বা ভিডিও ফাইল নির্বাচন করুন"), AUDIO_PICKER_REQUEST)
+            startActivityForResult(Intent.createChooser(intent, "Select an audio or video file"), AUDIO_PICKER_REQUEST)
         } catch (e: Exception) {
             promise.reject("ERR_PICKER", e.message)
         }
@@ -95,7 +95,7 @@ class MainActivity : ReactActivity() {
                 map.putString("name", fileName)
                 promise?.resolve(map)
             } else {
-                promise?.reject("CANCELLED", "কোনো গান নির্বাচন করা হয়নি")
+                promise?.reject("CANCELLED", "No file was selected")
             }
             return
         }
@@ -125,7 +125,7 @@ class MainActivity : ReactActivity() {
                     promise?.reject("ERR_START_SERVICE", e.message)
                 }
             } else {
-                promise?.reject("DENIED", "ইউজার অডিও ক্যাপচার অনুমতি দেননি")
+                promise?.reject("DENIED", "The user did not grant audio capture permission")
             }
         }
     }

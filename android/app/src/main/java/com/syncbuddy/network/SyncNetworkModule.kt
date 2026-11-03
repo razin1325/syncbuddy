@@ -65,6 +65,23 @@ class SyncNetworkModule(
 
     override fun getName(): String = "SyncNetworkModule"
 
+    override fun initialize() {
+        super.initialize()
+        try {
+            // Surface Media3 decode/container failures to the React layer so the
+            // UI can offer "open in another player" instead of failing silently.
+            com.syncbuddy.media.Media3Manager.onPlaybackError = { code, message, uri ->
+                val event = Arguments.createMap()
+                event.putInt("errorCode", code)
+                event.putString("message", message)
+                event.putString("uri", uri ?: "")
+                sendEvent(EVENT_MEDIA_ERROR, event)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     companion object {
         const val DEFAULT_HTTP_PORT = 8942
         const val DISCOVERY_PORT = 8943
@@ -78,6 +95,7 @@ class SyncNetworkModule(
         const val EVENT_PTT_MESSAGE = "ON_PTT_MESSAGE"
         const val EVENT_ROOM_DISCOVERED = "ON_ROOM_DISCOVERED"
         const val EVENT_BROADCAST_STATE = "ON_BROADCAST_STATE"
+        const val EVENT_MEDIA_ERROR = "ON_MEDIA_ERROR"
 
         const val STATUS_NOTIFICATION_CHANNEL_ID = "syncbuddy_status_channel"
         const val STATUS_NOTIFICATION_NAME = "SyncBuddy Service Status"
@@ -610,7 +628,7 @@ class SyncNetworkModule(
                         val errResp = JSONObject()
                         errResp.put("success", false)
                         errResp.put("reason", "ROOM_CODE_MISMATCH")
-                        errResp.put("message", "রুম কোডটি সঠিক নয়। হোস্টের ৪-ডিজিটের কোডটি চেক করুন।")
+                        errResp.put("message", "Incorrect room code. Check the 4-digit code shown on the host.")
                         sendHttpResponse(output, 200, errResp.toString())
                         return
                     }
@@ -1188,107 +1206,181 @@ class SyncNetworkModule(
             try {
                 val list = Arguments.createArray()
                 val resolver = reactApplicationContext.contentResolver
+                val seen = HashSet<String>()
+                val maxAudio = 2000
+                val maxVideo = 1500
 
-                // 1. Scan Audio Files (MP3, M4A, FLAC, WAV, AAC, OGG)
+                fun extOf(displayName: String?, mime: String?): String {
+                    val fromName = (displayName ?: "").substringAfterLast('.', "").trim().uppercase()
+                    if (fromName.isNotEmpty() && fromName.length <= 5) return fromName
+                    val fromMime = (mime ?: "").substringAfter('/', "").substringBefore(';').trim().uppercase()
+                    return fromMime.ifEmpty { "FILE" }
+                }
+
+                // 1. Audio — every audio row on the device: music, voice notes,
+                //    WhatsApp / SendAnywhere / SnapTube downloads, call recordings.
+                //    IS_MUSIC is deliberately NOT filtered: it is 0 for voice notes
+                //    and most messaging-app audio, which is exactly why those files
+                //    used to be invisible in the player.
                 if (filter == "all" || filter == "audio") {
                     val audioUri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-                    val audioProjection = arrayOf(
+                    val projection = arrayOf(
                         MediaStore.Audio.Media._ID,
                         MediaStore.Audio.Media.TITLE,
                         MediaStore.Audio.Media.ARTIST,
+                        MediaStore.Audio.Media.ALBUM,
+                        MediaStore.Audio.Media.ALBUM_ID,
                         MediaStore.Audio.Media.DURATION,
-                        MediaStore.Audio.Media.DATA,
-                        MediaStore.Audio.Media.SIZE
+                        MediaStore.Audio.Media.SIZE,
+                        MediaStore.Audio.Media.DATE_ADDED,
+                        MediaStore.Audio.Media.MIME_TYPE,
+                        MediaStore.Audio.Media.DISPLAY_NAME
                     )
-                    resolver.query(
-                        audioUri,
-                        audioProjection,
-                        "${MediaStore.Audio.Media.IS_MUSIC} != 0",
-                        null,
-                        "${MediaStore.Audio.Media.TITLE} ASC"
-                    )?.use { cursor ->
-                        val idCol = cursor.getColumnIndex(MediaStore.Audio.Media._ID)
-                        val titleCol = cursor.getColumnIndex(MediaStore.Audio.Media.TITLE)
-                        val artistCol = cursor.getColumnIndex(MediaStore.Audio.Media.ARTIST)
-                        val durCol = cursor.getColumnIndex(MediaStore.Audio.Media.DURATION)
-                        val dataCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
-                        val sizeCol = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
+                    try {
+                        resolver.query(
+                            audioUri,
+                            projection,
+                            null,
+                            null,
+                            "${MediaStore.Audio.Media.DATE_ADDED} DESC"
+                        )?.use { cursor ->
+                            val idCol = cursor.getColumnIndex(MediaStore.Audio.Media._ID)
+                            val titleCol = cursor.getColumnIndex(MediaStore.Audio.Media.TITLE)
+                            val artistCol = cursor.getColumnIndex(MediaStore.Audio.Media.ARTIST)
+                            val albumCol = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM)
+                            val albumIdCol = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM_ID)
+                            val durCol = cursor.getColumnIndex(MediaStore.Audio.Media.DURATION)
+                            val sizeCol = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
+                            val dateCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATE_ADDED)
+                            val mimeCol = cursor.getColumnIndex(MediaStore.Audio.Media.MIME_TYPE)
+                            val nameCol = cursor.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME)
 
-                        var count = 0
-                        while (cursor.moveToNext() && count < 100) {
-                            val id = if (idCol != -1) cursor.getLong(idCol) else 0L
-                            val title = if (titleCol != -1) cursor.getString(titleCol) ?: "Audio Track" else "Audio Track"
-                            val artist = if (artistCol != -1) cursor.getString(artistCol) ?: "Music" else "Music"
-                            val duration = if (durCol != -1) cursor.getLong(durCol) else 0L
-                            val path = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
-                            val size = if (sizeCol != -1) cursor.getLong(sizeCol) else 0L
+                            var count = 0
+                            while (count < maxAudio && cursor.moveToNext()) {
+                                val id = if (idCol >= 0) cursor.getLong(idCol) else 0L
+                                val uri = ContentUris.withAppendedId(audioUri, id).toString()
+                                if (!seen.add(uri)) continue
 
-                            val contentUri = ContentUris.withAppendedId(audioUri, id).toString()
-                            val finalUri = if (path.isNotEmpty() && java.io.File(path).exists()) "file://$path" else contentUri
+                                val displayName = if (nameCol >= 0) cursor.getString(nameCol) else null
+                                val mime = if (mimeCol >= 0) cursor.getString(mimeCol) else null
+                                val title = (if (titleCol >= 0) cursor.getString(titleCol) else null)
+                                    ?.takeIf { it.isNotBlank() }
+                                    ?: (displayName ?: "Audio Track")
+                                val artist = (if (artistCol >= 0) cursor.getString(artistCol) else null)
+                                    ?.takeIf { it.isNotBlank() && it != "<unknown>" }
+                                    ?: "Unknown artist"
+                                val album = (if (albumCol >= 0) cursor.getString(albumCol) else null) ?: ""
+                                val albumId = if (albumIdCol >= 0) cursor.getLong(albumIdCol) else 0L
+                                val duration = if (durCol >= 0) cursor.getLong(durCol) else 0L
+                                val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
+                                val dateAdded = if (dateCol >= 0) cursor.getLong(dateCol) else 0L
+                                val albumArt = if (albumId > 0) {
+                                    ContentUris.withAppendedId(
+                                        Uri.parse("content://media/external/audio/albumart"),
+                                        albumId
+                                    ).toString()
+                                } else ""
 
-                            val ext = if (path.contains(".")) path.substringAfterLast(".").uppercase() else "MP3"
-                            val map = Arguments.createMap()
-                            map.putString("id", "audio_$id")
-                            map.putString("title", title)
-                            map.putString("artist", if (artist == "<unknown>") "Local Audio" else artist)
-                            map.putDouble("duration", duration.toDouble())
-                            map.putString("uri", finalUri)
-                            map.putString("type", "audio")
-                            map.putString("format", ext)
-                            map.putString("size", formatFileSize(size))
-                            list.pushMap(map)
-                            count++
+                                val map = Arguments.createMap()
+                                map.putString("id", "audio_$id")
+                                map.putString("title", title)
+                                map.putString("artist", artist)
+                                map.putString("album", album)
+                                map.putDouble("duration", duration.toDouble())
+                                map.putString("uri", uri)
+                                map.putString("type", "audio")
+                                map.putString("format", extOf(displayName, mime))
+                                map.putString("size", formatFileSize(size))
+                                map.putDouble("sizeBytes", size.toDouble())
+                                map.putDouble("dateAdded", (dateAdded * 1000L).toDouble())
+                                map.putString("albumArt", albumArt)
+                                map.putString("mimeType", mime ?: "")
+                                list.pushMap(map)
+                                count++
+                            }
                         }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
                     }
                 }
 
-                // 2. Scan Video Files (MP4, MKV, WebM, 3GP)
+                // 2. Video — MP4, MKV, WebM, 3GP, MOV... with a cached poster frame
+                //    so the library looks like a real gallery instead of a text list.
                 if (filter == "all" || filter == "video") {
                     val videoUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                    val videoProjection = arrayOf(
+                    val projection = arrayOf(
                         MediaStore.Video.Media._ID,
                         MediaStore.Video.Media.TITLE,
                         MediaStore.Video.Media.DURATION,
-                        MediaStore.Video.Media.DATA,
-                        MediaStore.Video.Media.SIZE
+                        MediaStore.Video.Media.SIZE,
+                        MediaStore.Video.Media.DATE_ADDED,
+                        MediaStore.Video.Media.MIME_TYPE,
+                        MediaStore.Video.Media.DISPLAY_NAME,
+                        MediaStore.Video.Media.BUCKET_DISPLAY_NAME
                     )
-                    resolver.query(
-                        videoUri,
-                        videoProjection,
-                        null,
-                        null,
-                        "${MediaStore.Video.Media.DATE_ADDED} DESC"
-                    )?.use { cursor ->
-                        val idCol = cursor.getColumnIndex(MediaStore.Video.Media._ID)
-                        val titleCol = cursor.getColumnIndex(MediaStore.Video.Media.TITLE)
-                        val durCol = cursor.getColumnIndex(MediaStore.Video.Media.DURATION)
-                        val dataCol = cursor.getColumnIndex(MediaStore.Video.Media.DATA)
-                        val sizeCol = cursor.getColumnIndex(MediaStore.Video.Media.SIZE)
+                    try {
+                        resolver.query(
+                            videoUri,
+                            projection,
+                            null,
+                            null,
+                            "${MediaStore.Video.Media.DATE_ADDED} DESC"
+                        )?.use { cursor ->
+                            val idCol = cursor.getColumnIndex(MediaStore.Video.Media._ID)
+                            val titleCol = cursor.getColumnIndex(MediaStore.Video.Media.TITLE)
+                            val durCol = cursor.getColumnIndex(MediaStore.Video.Media.DURATION)
+                            val sizeCol = cursor.getColumnIndex(MediaStore.Video.Media.SIZE)
+                            val dateCol = cursor.getColumnIndex(MediaStore.Video.Media.DATE_ADDED)
+                            val mimeCol = cursor.getColumnIndex(MediaStore.Video.Media.MIME_TYPE)
+                            val nameCol = cursor.getColumnIndex(MediaStore.Video.Media.DISPLAY_NAME)
+                            val bucketCol = cursor.getColumnIndex(MediaStore.Video.Media.BUCKET_DISPLAY_NAME)
 
-                        var count = 0
-                        while (cursor.moveToNext() && count < 100) {
-                            val id = if (idCol != -1) cursor.getLong(idCol) else 0L
-                            val title = if (titleCol != -1) cursor.getString(titleCol) ?: "Video File" else "Video File"
-                            val duration = if (durCol != -1) cursor.getLong(durCol) else 0L
-                            val path = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
-                            val size = if (sizeCol != -1) cursor.getLong(sizeCol) else 0L
+                            var count = 0
+                            var thumbAttempts = 0
+                            while (count < maxVideo && cursor.moveToNext()) {
+                                val id = if (idCol >= 0) cursor.getLong(idCol) else 0L
+                                val uri = ContentUris.withAppendedId(videoUri, id).toString()
+                                if (!seen.add(uri)) continue
 
-                            val contentUri = ContentUris.withAppendedId(videoUri, id).toString()
-                            val finalUri = if (path.isNotEmpty() && java.io.File(path).exists()) "file://$path" else contentUri
+                                val displayName = if (nameCol >= 0) cursor.getString(nameCol) else null
+                                val mime = if (mimeCol >= 0) cursor.getString(mimeCol) else null
+                                val title = (if (titleCol >= 0) cursor.getString(titleCol) else null)
+                                    ?.takeIf { it.isNotBlank() }
+                                    ?: (displayName ?: "Video File")
+                                val bucket = (if (bucketCol >= 0) cursor.getString(bucketCol) else null) ?: ""
+                                val duration = if (durCol >= 0) cursor.getLong(durCol) else 0L
+                                val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
+                                val dateAdded = if (dateCol >= 0) cursor.getLong(dateCol) else 0L
 
-                            val ext = if (path.contains(".")) path.substringAfterLast(".").uppercase() else "MP4"
-                            val map = Arguments.createMap()
-                            map.putString("id", "video_$id")
-                            map.putString("title", title)
-                            map.putString("artist", "Video Audio ($ext)")
-                            map.putDouble("duration", duration.toDouble())
-                            map.putString("uri", finalUri)
-                            map.putString("type", "video")
-                            map.putString("format", ext)
-                            map.putString("size", formatFileSize(size))
-                            list.pushMap(map)
-                            count++
+                                // Bounded attempts (not successes) so a library full of
+                                // undecodable files cannot stall the first scan.
+                                val poster =
+                                    if (thumbAttempts < 80) {
+                                        thumbAttempts++
+                                        buildVideoThumbnail(uri, id)
+                                    } else ""
+
+                                val map = Arguments.createMap()
+                                map.putString("id", "video_$id")
+                                map.putString("title", title)
+                                map.putString("artist", "Video")
+                                map.putString("album", bucket)
+                                map.putDouble("duration", duration.toDouble())
+                                map.putString("uri", uri)
+                                map.putString("type", "video")
+                                map.putString("format", extOf(displayName, mime))
+                                map.putString("size", formatFileSize(size))
+                                map.putDouble("sizeBytes", size.toDouble())
+                                map.putDouble("dateAdded", (dateAdded * 1000L).toDouble())
+                                map.putString("albumArt", poster)
+                                map.putString("folder", bucket)
+                                map.putString("mimeType", mime ?: "")
+                                list.pushMap(map)
+                                count++
+                            }
                         }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
                     }
                 }
 
@@ -1298,6 +1390,43 @@ class SyncNetworkModule(
             }
         }
     }
+
+    /**
+     * Cached 256px poster frame for a video, used as the library thumbnail.
+     * Returns "" when the platform cannot decode a frame (still playable).
+     */
+    private fun buildVideoThumbnail(uriString: String, id: Long): String {
+        try {
+            val ctx = reactApplicationContext
+            val dir = java.io.File(ctx.cacheDir, "sb_thumbs")
+            if (!dir.exists() && !dir.mkdirs()) return ""
+            val file = java.io.File(dir, "v_" + id + ".jpg")
+            if (file.exists() && file.length() > 0L) return "file://${file.absolutePath}"
+
+            val uri = Uri.parse(uriString)
+            val bitmap: android.graphics.Bitmap? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ctx.contentResolver.loadThumbnail(uri, android.util.Size(256, 256), null)
+            } else {
+                val retriever = android.media.MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(ctx, uri)
+                    retriever.getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                } finally {
+                    try { retriever.release() } catch (e: Exception) {}
+                }
+            }
+            if (bitmap == null) return ""
+
+            java.io.FileOutputStream(file).use { out ->
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, out)
+            }
+            try { bitmap.recycle() } catch (e: Exception) {}
+            return "file://${file.absolutePath}"
+        } catch (e: Exception) {
+            return ""
+        }
+    }
+
 
     @ReactMethod
     fun getDeviceAudioFiles(promise: Promise) {
@@ -1323,25 +1452,27 @@ class SyncNetworkModule(
     // ─────────────────────────────────────────────────────────────────────────
 
     @ReactMethod
-    fun playMediaFile(uriString: String, isVideo: Boolean, broadcastToRoom: Boolean, promise: Promise) {
+    fun playMediaFile(uriString: String, isVideo: Boolean, broadcastToRoom: Boolean, mimeType: String, promise: Promise) {
         try {
             stopAudioFileInternal()
             stopAudioBroadcasterInternal()
             acquireMulticastLock()
 
             if (isVideo) {
-                // If broadcasting to room, mute ExoPlayer so localTrack outputs the audio
-                // in perfect lockstep with the UDP stream sent to all listeners!
+                // Video surface is driven by Media3; when we also broadcast, ExoPlayer is
+                // muted and the UDP decode loop drives the audio so the room stays in
+                // lockstep and the same audio never plays twice on the host.
                 val exoVolume = if (broadcastToRoom) 0.0f else 1.0f
-                com.syncbuddy.media.Media3Manager.play(reactApplicationContext, uriString, true, exoVolume)
+                com.syncbuddy.media.Media3Manager.play(reactApplicationContext, uriString, true, exoVolume, mimeType)
+            } else {
+                // Audio always plays locally through Media3 (widest container/codec
+                // support); the room stream, when enabled, runs alongside it muted-locally.
+                com.syncbuddy.media.Media3Manager.play(reactApplicationContext, uriString, false, 1.0f, mimeType)
             }
 
             if (broadcastToRoom) {
-                startFileBroadcastStreamer(uriString, promise)
+                startFileBroadcastStreamer(uriString, isVideo, promise)
             } else {
-                if (!isVideo) {
-                    com.syncbuddy.media.Media3Manager.play(reactApplicationContext, uriString, false, 1.0f)
-                }
                 promise.resolve(true)
             }
         } catch (e: Exception) {
@@ -1349,7 +1480,7 @@ class SyncNetworkModule(
         }
     }
 
-    private fun startFileBroadcastStreamer(uriString: String, promise: Promise) {
+    private fun startFileBroadcastStreamer(uriString: String, playLocally: Boolean, promise: Promise) {
         try {
             acquireMulticastLock()
             isFileBroadcasting = true
@@ -1398,15 +1529,19 @@ class SyncNetworkModule(
                     }
                     currentFilePositionSec = 0.0
 
-                    val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                    localTrack = AudioTrack.Builder()
-                        .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-                        .setAudioFormat(AudioFormat.Builder().setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                        .setBufferSizeInBytes(Math.max(minBuf * 2, 4800 * 2))
-                        .setTransferMode(AudioTrack.MODE_STREAM)
-                        .build()
-                    activeFileAudioTrack = localTrack
-                    localTrack.play()
+                    // Local monitoring is only needed for video (media3 is muted then).
+                    // For audio, Media3 already plays on this phone, so we stream only.
+                    if (playLocally) {
+                        val minBuf = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                        localTrack = AudioTrack.Builder()
+                            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                            .setAudioFormat(AudioFormat.Builder().setSampleRate(SAMPLE_RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                            .setBufferSizeInBytes(Math.max(minBuf * 2, 4800 * 2))
+                            .setTransferMode(AudioTrack.MODE_STREAM)
+                            .build()
+                        activeFileAudioTrack = localTrack
+                        localTrack?.play()
+                    }
 
                     val packetBuf = ByteArray(968) // 8 byte header + 960 bytes pcm (480 samples = 10ms at 48kHz)
                     packetBuf[0] = 'S'.code.toByte()
@@ -1439,15 +1574,15 @@ class SyncNetworkModule(
                                     leftoverShorts = ShortArray(0)
                                     totalSamplesSent = ((targetUs / 1_000_000.0) * SAMPLE_RATE).toLong()
                                     streamStartTimeNs = System.nanoTime() - ((totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong())
-                                    localTrack.flush()
+                                    localTrack?.flush()
                                 } catch (e: Exception) {}
                             }
 
                             while (isFilePaused && isFileBroadcasting) {
-                                try { localTrack.pause() } catch (e: Exception) {}
+                                try { localTrack?.pause() } catch (e: Exception) {}
                                 Thread.sleep(30)
                                 if (!isFilePaused) {
-                                    try { localTrack.play() } catch (e: Exception) {}
+                                    try { localTrack?.play() } catch (e: Exception) {}
                                     streamStartTimeNs = System.nanoTime() - ((totalSamplesSent * 1_000_000_000L) / SAMPLE_RATE.toLong())
                                 }
                             }
@@ -1540,7 +1675,7 @@ class SyncNetworkModule(
                                         }
 
                                         try {
-                                            localTrack.write(chunkBytes, 0, chunkBytes.size, AudioTrack.WRITE_NON_BLOCKING)
+                                            localTrack?.write(chunkBytes, 0, chunkBytes.size, AudioTrack.WRITE_NON_BLOCKING)
                                         } catch (e: Exception) {}
 
                                         packetBuf[4] = ((seq shr 8) and 0xFF).toByte()
@@ -1682,10 +1817,33 @@ class SyncNetworkModule(
         }
     }
 
+    /**
+     * Hand a file over to any installed video/audio player. Used for containers
+     * Media3 cannot demux (AVI, MPEG-TS, WMV, RM...) so that every file on the
+     * device remains playable — in-app when possible, externally otherwise.
+     */
+    @ReactMethod
+    fun openWithExternalPlayer(uriString: String, mimeType: String, promise: Promise) {
+        try {
+            val ctx: Context = currentActivity ?: reactApplicationContext
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(Uri.parse(uriString), if (mimeType.isNotEmpty()) mimeType else "*/*")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            val chooser = Intent.createChooser(intent, "Choose an app to play this file")
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(chooser)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_EXTERNAL_PLAYER", e.message)
+        }
+    }
+
     // Backward-compatible delegates
     @ReactMethod
     fun playAudioFile(uriString: String, promise: Promise) {
-        playMediaFile(uriString, false, true, promise)
+        playMediaFile(uriString, false, true, "", promise)
     }
 
     @ReactMethod
@@ -1945,7 +2103,7 @@ class SyncNetworkModule(
                     STATUS_NOTIFICATION_NAME,
                     NotificationManager.IMPORTANCE_LOW
                 ).apply {
-                    description = "SyncBuddy ব্যাকগ্রাউন্ড রানিং স্ট্যাটাস"
+                    description = "SyncBuddy background running status"
                     setShowBadge(false)
                     enableLights(false)
                     enableVibration(false)

@@ -360,7 +360,7 @@ class AudioCaptureService : Service() {
                     "SyncBuddy Audio Broadcast",
                     NotificationManager.IMPORTANCE_LOW
                 ).apply {
-                    description = "লাইভ অডিও ব্রডকাস্ট চলছে"
+                    description = "Live audio broadcast in progress"
                     setShowBadge(false)
                 }
                 val manager = getSystemService(NotificationManager::class.java)
@@ -375,8 +375,8 @@ class AudioCaptureService : Service() {
         // Guaranteed valid small icon from applicationInfo to prevent BadForegroundServiceNotificationException
         val iconRes = applicationInfo.icon.takeIf { it != 0 } ?: android.R.drawable.sym_def_app_icon
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("SyncBuddy • লাইভ অডিও ব্রডকাস্ট")
-            .setContentText("আপনার ফোনের মিউজিক সবার হেডফোনে স্ট্রিম হচ্ছে")
+            .setContentTitle("SyncBuddy • Live audio broadcast")
+            .setContentText("Your phone's audio is streaming to every listener")
             .setSmallIcon(iconRes)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
