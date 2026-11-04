@@ -145,7 +145,7 @@ interface Props {
   muted?: boolean;
   eqPreset?: string;
   fxPreset?: string;
-  resizeMode?: 'contain' | 'cover' | 'fill';
+  resizeMode?: 'contain' | 'cover' | 'fill' | 'zoom' | 'fit' | 'stretch';
   /** Fires once real duration is known (WebM often reports Infinity). */
   onDuration?: (seconds: number) => void;
   onProgress?: (seconds: number, duration: number) => void;
@@ -472,7 +472,12 @@ export default function VideoPlayer(p: Props) {
             onError: () => p.onError?.('This file cannot be decoded by the browser'),
             style: {
               ...brightnessStyle,
-              objectFit: p.resizeMode || 'contain',
+              objectFit:
+                p.resizeMode === 'zoom' || p.resizeMode === 'cover'
+                  ? 'cover'
+                  : p.resizeMode === 'fill' || p.resizeMode === 'stretch'
+                  ? 'fill'
+                  : 'contain',
               backgroundColor: '#000',
             },
           })}
@@ -491,7 +496,13 @@ export default function VideoPlayer(p: Props) {
           style={StyleSheet.absoluteFill}
           uri={p.uri}
           isPlaying={p.isPlaying}
-          resizeMode={p.resizeMode === 'cover' ? 'zoom' : 'fit'}
+          resizeMode={
+            p.resizeMode === 'cover' || p.resizeMode === 'zoom'
+              ? 'zoom'
+              : p.resizeMode === 'fill' || p.resizeMode === 'stretch'
+              ? 'fill'
+              : 'fit'
+          }
           useController={false}
         />
       )}

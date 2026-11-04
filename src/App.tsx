@@ -25,6 +25,7 @@ import {
   Image,
   PanResponder,
   PermissionsAndroid,
+  useWindowDimensions,
 } from 'react-native';
 import VideoPlayer, { EQ_PRESETS, FX_PRESETS } from './VideoPlayer';
 import FullscreenPlayer from './FullscreenPlayer';
@@ -446,6 +447,15 @@ const NowPlayingSheet: React.FC<{
 }> = p => {
   const item = p.item;
   const forward = p.duration > 0 ? Math.min(p.duration, p.position + 10) : p.position + 10;
+  const { width: sheetWinW, height: sheetWinH } = useWindowDimensions();
+  const isSheetLandscape = sheetWinW > sheetWinH;
+
+  // Auto-switch to true fullscreen video if phone is rotated sideways
+  useEffect(() => {
+    if (p.visible && item?.type === 'video' && isSheetLandscape) {
+      p.onOpenFullscreen();
+    }
+  }, [p.visible, item?.type, isSheetLandscape, p.onOpenFullscreen]);
   return (
     <Modal visible={p.visible && !!item} transparent animationType="slide" onRequestClose={p.onClose}>
       <View style={styles.sheetBackdrop}>
@@ -1606,7 +1616,13 @@ function MainApp(): React.JSX.Element {
       setPlaybackPos(0);
       setPlaybackDur(item.duration > 0 ? item.duration / 1000 : 0);
       setIsMediaPlaying(true);
-      if (item.type === 'video') setShowPlayer(true);
+      if (item.type === 'video') {
+        setShowFullscreen(true);
+        setShowPlayer(false);
+      } else {
+        setShowPlayer(true);
+        setShowFullscreen(false);
+      }
 
       // Containers Media3 cannot demux (AVI, MPEG-TS, WMV, RM...) are handed to a
       // real external player instead of failing silently inside the app.
@@ -2941,11 +2957,18 @@ function MainApp(): React.JSX.Element {
       </Modal>
 
       {/* ── Floating mini player (visible on every page while media is loaded) ── */}
-      {currentMedia && !showPlayer && (
+      {currentMedia && !showPlayer && !showFullscreen && (
         <TouchableOpacity
           style={styles.miniPlayer}
           activeOpacity={0.92}
-          onPress={() => setShowPlayer(true)}>
+          onPress={() => {
+            if (currentMedia.type === 'video') {
+              setShowFullscreen(true);
+              setShowPlayer(false);
+            } else {
+              setShowPlayer(true);
+            }
+          }}>
           <MediaArt uri={currentMedia.albumArt} type={currentMedia.type} size={40} radius={8} />
           <View style={{ flex: 1, marginLeft: 10, marginRight: 8 }}>
             <Text style={styles.miniTitle} numberOfLines={1}>
@@ -3014,9 +3037,10 @@ function MainApp(): React.JSX.Element {
       <Modal
         visible={showFullscreen && !!currentMedia && currentMedia.type === 'video'}
         transparent={false}
+        statusBarTranslucent={true}
         animationType="fade"
         presentationStyle="fullScreen"
-        supportedOrientations={['portrait', 'landscape']}
+        supportedOrientations={['portrait', 'portrait-upside-down', 'landscape', 'landscape-left', 'landscape-right']}
         onRequestClose={() => setShowFullscreen(false)}>
         <FullscreenPlayer
           visible={showFullscreen && !!currentMedia && currentMedia.type === 'video'}
@@ -3033,8 +3057,6 @@ function MainApp(): React.JSX.Element {
           duration={playbackDur}
           onClose={() => {
             setShowFullscreen(false);
-            // Return to the sheet so the user is not dropped on a bare list.
-            if (currentMedia) setShowPlayer(true);
           }}
           onTogglePlay={handleTogglePlayPause}
           onSeek={handleSeek}

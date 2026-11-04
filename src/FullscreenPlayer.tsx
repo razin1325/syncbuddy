@@ -1,19 +1,16 @@
 /**
- * FullscreenPlayer — an immersive, real media-app fullscreen experience.
+ * FullscreenPlayer — True Immersive Edge-to-Edge Video Player
  *
- * Replaces the old one-line "⛶ Fullscreen" pill, which on web did nothing at all
- * (the native bridge returned false immediately off-Android) and on Android
- * jumped to a separate Activity with no brightness or audio control.
- *
- * Everything a real player has:
- *   • edge-to-edge video with tap-to-show controls
- *   • auto-hiding chrome (3 s) while playing
- *   • scrubber with live position, elapsed / remaining
- *   • play/pause, ±10 s, next / previous
- *   • brightness slider (also supports drag-to-adjust gestures)
- *   • volume slider with mute
- *   • equaliser + spatial sound-effect pickers
- *   • fullscreen API request on web so the browser chrome really disappears
+ * User-first UX:
+ *   • Pure 100% video display with zero UI clutter by default
+ *   • Single screen tap toggles controls (Tap -> Show, Tap again -> Hide)
+ *   • Auto-hides controls after 3.5s of inactivity while playing
+ *   • Double-tap left/right for quick ±10s seeking with visual feedback
+ *   • Full landscape & portrait auto-orientation adaptation
+ *   • Clean top bar (Back button, Title, Aspect ratio switch: Fit / Zoom / Stretch)
+ *   • Center overlay (⏪ 10s, Large Play/Pause, 10s ⏩)
+ *   • Bottom bar (Time, Smooth Interactive Scrubber, Duration, Prev/Next)
+ *   • Auto-hiding Android StatusBar for true cinematic immersion
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -21,9 +18,12 @@ import {
   Animated,
   PanResponder,
   Platform,
+  StatusBar,
   StyleSheet,
   Text,
   TouchableOpacity,
+  TouchableWithoutFeedback,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import VideoPlayer, {
@@ -35,22 +35,24 @@ import VideoPlayer, {
 const C = {
   bg: '#000000',
   surf: '#0A0A0E',
-  surf2: '#101017',
-  surf3: '#17171F',
-  line: 'rgba(255,255,255,0.10)',
-  text: '#FAFAFA',
-  textDim: '#A1A1AA',
-  textMute: '#6B6B76',
-  accent: '#22D3EE',
-  green: '#34D399',
-  red: '#F87171',
-  amber: '#FBBF24',
+  surf2: '#12121A',
+  line: 'rgba(255,255,255,0.12)',
+  text: '#FFFFFF',
+  textDim: '#CBD5E1',
+  textMute: '#94A3B8',
+  accent: '#06B6D4',
+  accentGlow: 'rgba(6, 182, 212, 0.35)',
+  scrim: 'rgba(0, 0, 0, 0.75)',
 };
 
 const fmt = (s: number) => {
   if (!Number.isFinite(s) || s < 0) s = 0;
-  const m = Math.floor(s / 60);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
   const sec = Math.floor(s % 60);
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+  }
   return `${m}:${String(sec).padStart(2, '0')}`;
 };
 
@@ -74,36 +76,115 @@ export interface FullscreenPlayerProps {
 }
 
 export default function FullscreenPlayer(p: FullscreenPlayerProps) {
+  const { width: winWidth, height: winHeight } = useWindowDimensions();
+  const isLandscape = winWidth > winHeight;
+
   const playerRef = useRef<VideoPlayerHandle | null>(null);
-  const [brightness, setBrightness] = useState(1);
-  const [volume, setVolume] = useState(0.85);
-  const [muted, setMuted] = useState(false);
+  const [chromeVisible, setChromeVisible] = useState(true);
+  const [resizeMode, setResizeMode] = useState<'fit' | 'zoom' | 'fill'>('fit');
+  const [panel, setPanel] = useState<'none' | 'sound'>('none');
   const [eqPreset, setEqPreset] = useState('flat');
   const [fxPreset, setFxPreset] = useState('off');
-  const [panel, setPanel] = useState<'none' | 'display' | 'sound'>('none');
-  const [chromeVisible, setChromeVisible] = useState(true);
+  const [volume, setVolume] = useState(1.0);
+  const [muted, setMuted] = useState(false);
+
   const [livePos, setLivePos] = useState(0);
   const [liveDur, setLiveDur] = useState(0);
   const [dragging, setDragging] = useState(false);
 
+  // Quick visual feedback on double-tap seek
+  const [seekFeedback, setSeekFeedback] = useState<{ text: string; side: 'left' | 'right' } | null>(null);
+  const seekFeedbackTimer = useRef<any>(null);
+  const lastTapRef = useRef<number>(0);
+  const tapTimeoutRef = useRef<any>(null);
+
   const hideTimer = useRef<any>(null);
   const fade = useRef(new Animated.Value(1)).current;
 
-  // Prefer real player time once it starts reporting; fall back to the sheet's.
   const pos = livePos > 0 ? livePos : p.position;
   const dur = liveDur > 0 ? liveDur : p.duration;
-  const pct = dur > 0 ? Math.min(1, pos / dur) : 0;
+  const pct = dur > 0 ? Math.min(1, Math.max(0, pos / dur)) : 0;
 
-  // Reset transient UI whenever a new file is opened.
+  // Clear hide timer
+  const clearHideTimer = useCallback(() => {
+    if (hideTimer.current) {
+      clearTimeout(hideTimer.current);
+      hideTimer.current = null;
+    }
+  }, []);
+
+  // Schedule auto-hide of controls after 3.5s
+  const scheduleHide = useCallback(() => {
+    clearHideTimer();
+    hideTimer.current = setTimeout(() => {
+      setChromeVisible(false);
+      setPanel('none');
+    }, 3500);
+  }, [clearHideTimer]);
+
+  // Show chrome and start auto-hide timer if playing
+  const showControls = useCallback(() => {
+    setChromeVisible(true);
+    if (p.isPlaying) {
+      scheduleHide();
+    } else {
+      clearHideTimer();
+    }
+  }, [p.isPlaying, scheduleHide, clearHideTimer]);
+
+  // Hide chrome immediately
+  const hideControls = useCallback(() => {
+    clearHideTimer();
+    setChromeVisible(false);
+    setPanel('none');
+  }, [clearHideTimer]);
+
+  // Toggle controls on single screen tap
+  const toggleControls = useCallback(() => {
+    if (panel !== 'none') {
+      setPanel('none');
+      return;
+    }
+    if (chromeVisible) {
+      hideControls();
+    } else {
+      showControls();
+    }
+  }, [chromeVisible, panel, hideControls, showControls]);
+
+  // Sync animation fade with chromeVisible
+  useEffect(() => {
+    Animated.timing(fade, {
+      toValue: chromeVisible ? 1 : 0,
+      duration: 220,
+      useNativeDriver: Platform.OS !== 'web',
+    }).start();
+  }, [chromeVisible, fade]);
+
+  // Manage auto-hide on playback state changes
+  useEffect(() => {
+    if (!p.visible) {
+      clearHideTimer();
+      return;
+    }
+    if (p.isPlaying && chromeVisible && panel === 'none') {
+      scheduleHide();
+    } else if (!p.isPlaying) {
+      clearHideTimer();
+      setChromeVisible(true);
+    }
+    return () => clearHideTimer();
+  }, [p.visible, p.isPlaying, chromeVisible, panel, scheduleHide, clearHideTimer]);
+
+  // Reset state when opening a new video
   useEffect(() => {
     if (p.visible) {
-      setPanel('none');
       setChromeVisible(true);
+      setPanel('none');
       setLivePos(0);
       setLiveDur(0);
 
-      // Ask the browser for TRUE fullscreen, so the address bar and taskbar
-      // really go away rather than being covered by an overlay.
+      // Web: enter true fullscreen mode
       if (Platform.OS === 'web' && typeof document !== 'undefined') {
         const el: any = document.documentElement;
         const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen;
@@ -118,60 +199,95 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
     }
   }, [p.visible, p.uri]);
 
-  const scheduleHide = useCallback(() => {
-    if (hideTimer.current) clearTimeout(hideTimer.current);
-    hideTimer.current = setTimeout(() => {
-      setChromeVisible(false);
-      setPanel('none');
-    }, 3200);
-  }, []);
+  // Relative seek (±10s)
+  const seekRelative = useCallback((delta: number) => {
+    const target = Math.max(0, Math.min(dur || 1e9, pos + delta));
+    setLivePos(target);
+    playerRef.current?.seek(target);
+    p.onSeek(Math.floor(target));
+    showControls();
+  }, [dur, pos, p, showControls]);
 
-  useEffect(() => {
-    if (!p.visible) {
-      if (hideTimer.current) clearTimeout(hideTimer.current);
-      return;
+  // Screen touch handler: detects single tap (toggle controls) and double tap (seek ±10s)
+  const handleTouch = useCallback((evt: any) => {
+    const x = evt.nativeEvent.locationX;
+    const screenWidth = winWidth;
+    const now = Date.now();
+    const timeDelta = now - lastTapRef.current;
+    lastTapRef.current = now;
+
+    if (timeDelta < 300) {
+      // Double tap detected!
+      if (tapTimeoutRef.current) {
+        clearTimeout(tapTimeoutRef.current);
+        tapTimeoutRef.current = null;
+      }
+      if (x < screenWidth * 0.4) {
+        // Double tap LEFT -> Rewind 10s
+        seekRelative(-10);
+        showSeekFeedback('-10s ⏪', 'left');
+      } else if (x > screenWidth * 0.6) {
+        // Double tap RIGHT -> Forward 10s
+        seekRelative(10);
+        showSeekFeedback('⏩ +10s', 'right');
+      } else {
+        // Double tap center -> toggle Play/Pause
+        p.onTogglePlay();
+        showControls();
+      }
+    } else {
+      // Single tap candidate: wait 280ms before toggling controls to allow double-tap
+      tapTimeoutRef.current = setTimeout(() => {
+        toggleControls();
+      }, 280);
     }
-    if (!p.isPlaying) {
-      if (hideTimer.current) clearTimeout(hideTimer.current);
-      setChromeVisible(true);
-      return;
-    }
-    scheduleHide();
-    return () => {
-      if (hideTimer.current) clearTimeout(hideTimer.current);
-    };
-  }, [p.visible, p.isPlaying, scheduleHide]);
+  }, [winWidth, seekRelative, p, showControls, toggleControls]);
 
-  useEffect(() => {
-    Animated.timing(fade, {
-      toValue: chromeVisible ? 1 : 0,
-      duration: 200,
-      useNativeDriver: Platform.OS !== 'web',
-    }).start();
-  }, [chromeVisible, fade]);
+  const showSeekFeedback = (text: string, side: 'left' | 'right') => {
+    if (seekFeedbackTimer.current) clearTimeout(seekFeedbackTimer.current);
+    setSeekFeedback({ text, side });
+    seekFeedbackTimer.current = setTimeout(() => {
+      setSeekFeedback(null);
+    }, 800);
+  };
 
-  const revealChrome = useCallback(() => {
-    setChromeVisible(true);
-    if (p.isPlaying) scheduleHide();
-  }, [p.isPlaying, scheduleHide]);
+  // Cycle aspect ratio
+  const cycleResizeMode = () => {
+    setResizeMode(curr => {
+      if (curr === 'fit') return 'zoom';
+      if (curr === 'zoom') return 'fill';
+      return 'fit';
+    });
+    showControls();
+  };
+
+  const resizeModeLabel = resizeMode === 'fit' ? '🔲 Fit' : resizeMode === 'zoom' ? '🔳 Zoom' : '↔️ Fill';
 
   if (!p.visible) return null;
 
   return (
     <View style={styles.root}>
-      {/* ── Video surface ─────────────────────────────────────────────────── */}
+      {/* Auto-hide Status Bar when controls are hidden for true edge-to-edge experience */}
+      <StatusBar
+        hidden={!chromeVisible}
+        translucent
+        backgroundColor="transparent"
+        barStyle="light-content"
+      />
+
+      {/* ── 1. Video Canvas (Always 100% full screen) ───────────────────────── */}
       <View style={StyleSheet.absoluteFill}>
         <VideoPlayer
           handleRef={playerRef}
           uri={p.uri}
           audioUri={p.audioUri}
           isPlaying={p.isPlaying}
-          brightness={brightness}
+          brightness={1.0}
           volume={volume}
           muted={muted}
           eqPreset={eqPreset}
           fxPreset={fxPreset}
-          resizeMode="contain"
+          resizeMode={resizeMode}
           onDuration={d => setLiveDur(d)}
           onProgress={(t, d) => {
             if (!dragging) setLivePos(t);
@@ -184,231 +300,218 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
         />
       </View>
 
-      {/*
-        Tap layer: toggles the chrome. It sits UNDER the control layer (declared
-        first), and collapses when the chrome is hidden so it cannot swallow
-        taps meant for buttons. Chrome uses box-none so only the actual buttons
-        capture presses.
-      */}
-      <TouchableOpacity
-        activeOpacity={1}
-        style={StyleSheet.absoluteFill}
-        onPress={() => {
-          if (panel !== 'none') {
-            setPanel('none');
-            return;
-          }
-          if (chromeVisible) setChromeVisible(false);
-          else revealChrome();
-        }}
-      />
+      {/* ── 2. Full-surface Tap Detector ───────────────────────────────────── */}
+      {/* Tapping anywhere toggles controls, double-tap seeks ±10s */}
+      <TouchableWithoutFeedback onPress={handleTouch}>
+        <View style={StyleSheet.absoluteFill}>
+          {/* Double-tap visual indicator badge */}
+          {seekFeedback && (
+            <View
+              style={[
+                styles.seekFeedbackBox,
+                seekFeedback.side === 'left' ? styles.seekFeedbackLeft : styles.seekFeedbackRight,
+              ]}>
+              <Text style={styles.seekFeedbackText}>{seekFeedback.text}</Text>
+            </View>
+          )}
+        </View>
+      </TouchableWithoutFeedback>
 
-      <Animated.View
-        pointerEvents={chromeVisible ? 'box-none' : 'none'}
-        style={[StyleSheet.absoluteFill, { opacity: fade }]}>
-        {/* Top region: box-none so video taps fall through to the layer below */}
-        <View style={{ flex: 1 }} pointerEvents="box-none">
-          {/* ── Top bar ────────────────────────────────────────────────────── */}
-          <View style={styles.topBar}>
-            <TouchableOpacity style={styles.roundBtn} onPress={p.onClose}>
-              <Text style={styles.roundBtnText}>✕</Text>
+      {/* ── 3. Floating Overlay Controls ───────────────────────────────────── */}
+      {chromeVisible && (
+        <Animated.View
+          style={[StyleSheet.absoluteFill, { opacity: fade }]}
+          pointerEvents="box-none">
+
+          {/* ── Top Bar Scrim ── */}
+          <View
+            style={[
+              styles.topBar,
+              {
+                paddingTop: isLandscape ? 14 : (Platform.OS === 'android' ? 36 : 46),
+                paddingHorizontal: isLandscape ? 28 : 16,
+              },
+            ]}>
+            <TouchableOpacity
+              style={styles.backBtn}
+              onPress={p.onClose}
+              hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
+              <Text style={styles.backBtnText}>←</Text>
             </TouchableOpacity>
-            <View style={{ flex: 1, marginHorizontal: 12 }}>
-              <Text style={styles.title} numberOfLines={1}>{p.title}</Text>
+
+            <View style={styles.titleArea}>
+              <Text style={styles.titleText} numberOfLines={1}>
+                {p.title}
+              </Text>
               {p.subtitle ? (
-                <Text style={styles.subtitle} numberOfLines={1}>{p.subtitle}</Text>
+                <Text style={styles.subtitleText} numberOfLines={1}>
+                  {p.subtitle}
+                </Text>
               ) : null}
             </View>
+
+            {/* Aspect Ratio Toggle (Fit / Zoom / Stretch) */}
             <TouchableOpacity
-              style={[styles.roundBtn, panel === 'display' && styles.roundBtnOn]}
-              onPress={() => {
-                setPanel(panel === 'display' ? 'none' : 'display');
-                revealChrome();
-              }}>
-              <Text style={styles.roundBtnText}>☀</Text>
+              style={styles.chipBtn}
+              onPress={cycleResizeMode}
+              hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}>
+              <Text style={styles.chipBtnText}>{resizeModeLabel}</Text>
             </TouchableOpacity>
+
+            {/* Sound FX Toggle */}
             <TouchableOpacity
-              style={[styles.roundBtn, { marginLeft: 8 }, panel === 'sound' && styles.roundBtnOn]}
+              style={[styles.iconBtn, panel === 'sound' && styles.iconBtnOn]}
               onPress={() => {
-                setPanel(panel === 'sound' ? 'none' : 'sound');
-                revealChrome();
-              }}>
-              <Text style={styles.roundBtnText}>🎚</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        <View style={{ flex: 1 }} />
-
-        {/* ── Panels ───────────────────────────────────────────────────────── */}
-        {panel === 'display' ? (
-          <View style={styles.panel}>
-            <View style={styles.panelHead}>
-              <Text style={styles.panelTitle}>Display</Text>
-              <Text style={styles.panelVal}>{Math.round(brightness * 100)}%</Text>
-            </View>
-            <View style={styles.sliderRow}>
-              <Text style={styles.sliderIcon}>🌑</Text>
-              <Slider
-                value={brightness}
-                min={0.2}
-                max={1.4}
-                onChange={v => setBrightness(v)}
-              />
-              <Text style={styles.sliderIcon}>☀️</Text>
-            </View>
-            <View style={styles.presetRow}>
-              {[
-                { v: 0.45, l: 'Dim' },
-                { v: 0.75, l: 'Soft' },
-                { v: 1.0, l: 'Normal' },
-                { v: 1.3, l: 'Bright' },
-              ].map(x => (
-                <TouchableOpacity
-                  key={x.l}
-                  style={[styles.preset, Math.abs(brightness - x.v) < 0.12 && styles.presetOn]}
-                  onPress={() => setBrightness(x.v)}>
-                  <Text
-                    style={[styles.presetText, Math.abs(brightness - x.v) < 0.12 && styles.presetTextOn]}>
-                    {x.l}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          </View>
-        ) : null}
-
-        {panel === 'sound' ? (
-          <View style={styles.panel}>
-            <View style={styles.panelHead}>
-              <Text style={styles.panelTitle}>Sound</Text>
-              <Text style={styles.panelVal}>{muted ? 'Muted' : `${Math.round(volume * 100)}%`}</Text>
-            </View>
-
-            <View style={styles.sliderRow}>
-              <TouchableOpacity onPress={() => setMuted(m => !m)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-                <Text style={styles.sliderIcon}>{muted || volume === 0 ? '🔇' : '🔊'}</Text>
-              </TouchableOpacity>
-              <Slider
-                value={muted ? 0 : volume}
-                min={0}
-                max={1}
-                onChange={v => {
-                  setVolume(v);
-                  if (v > 0) setMuted(false);
-                }}
-              />
-              <Text style={styles.sliderIcon}>🔈</Text>
-            </View>
-
-            <Text style={styles.groupLabel}>EQUALISER</Text>
-            <View style={styles.chipRow}>
-              {EQ_PRESETS.map(x => (
-                <TouchableOpacity
-                  key={x.key}
-                  style={[styles.chip, eqPreset === x.key && styles.chipOn]}
-                  onPress={() => setEqPreset(x.key)}>
-                  <Text style={[styles.chipText, eqPreset === x.key && styles.chipTextOn]}>
-                    {x.icon} {x.label}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            <Text style={styles.groupLabel}>SOUND EFFECTS</Text>
-            <View style={styles.chipRow}>
-              {FX_PRESETS.map(x => (
-                <TouchableOpacity
-                  key={x.key}
-                  style={[styles.chip, fxPreset === x.key && styles.chipOn]}
-                  onPress={() => setFxPreset(x.key)}>
-                  <Text style={[styles.chipText, fxPreset === x.key && styles.chipTextOn]}>
-                    {x.icon} {x.label}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          </View>
-        ) : null}
-
-        {/* ── Bottom controls ──────────────────────────────────────────────── */}
-        <View style={styles.bottomBar}>
-          <View style={styles.scrubRow}>
-            <Text style={styles.time}>{fmt(pos)}</Text>
-            <Slider
-              value={pct}
-              min={0}
-              max={1}
-              onStart={() => setDragging(true)}
-              onChange={v => {
-                setLivePos(v * dur);
-                playerRef.current?.seek(v * dur);
+                setPanel(curr => (curr === 'sound' ? 'none' : 'sound'));
+                showControls();
               }}
-              onEnd={() => {
-                setDragging(false);
-                p.onSeek(Math.floor(livePos));
-              }}
-            />
-            <Text style={styles.time}>-{fmt(Math.max(0, dur - pos))}</Text>
+              hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}>
+              <Text style={styles.iconBtnText}>🎚</Text>
+            </TouchableOpacity>
           </View>
 
-          <View style={styles.controlsRow}>
+          {/* Sound / Equalizer Drawer (when open) */}
+          {panel === 'sound' && (
+            <View
+              style={[
+                styles.soundDrawer,
+                { marginHorizontal: isLandscape ? 60 : 16 },
+              ]}>
+              <View style={styles.drawerHeader}>
+                <Text style={styles.drawerTitle}>Sound Effects & EQ</Text>
+                <TouchableOpacity onPress={() => setMuted(m => !m)}>
+                  <Text style={styles.muteBtnText}>{muted ? '🔇 Unmute' : '🔊 Mute'}</Text>
+                </TouchableOpacity>
+              </View>
+
+              <Text style={styles.drawerSectionLabel}>PRESETS</Text>
+              <View style={styles.eqRow}>
+                {EQ_PRESETS.map(x => (
+                  <TouchableOpacity
+                    key={x.key}
+                    style={[styles.eqChip, eqPreset === x.key && styles.eqChipActive]}
+                    onPress={() => {
+                      setEqPreset(x.key);
+                      showControls();
+                    }}>
+                    <Text style={[styles.eqChipText, eqPreset === x.key && styles.eqChipTextActive]}>
+                      {x.icon} {x.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+          )}
+
+          {/* ── Center Quick Controls (⏪ 10s, Play/Pause, 10s ⏩) ── */}
+          <View style={styles.centerRow} pointerEvents="box-none">
             <TouchableOpacity
-              style={[styles.ctrlBtn, !p.hasPrev && styles.ctrlDisabled]}
-              disabled={!p.hasPrev}
-              onPress={p.onPrev}>
-              <Text style={styles.ctrlText}>⏮</Text>
+              style={styles.centerSkipBtn}
+              onPress={() => seekRelative(-10)}
+              activeOpacity={0.75}
+              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+              <Text style={styles.centerSkipIcon}>⏪</Text>
+              <Text style={styles.centerSkipText}>-10s</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={styles.ctrlBtn}
-              onPress={() => {
-                const t = Math.max(0, pos - 10);
-                setLivePos(t);
-                playerRef.current?.seek(t);
-                p.onSeek(Math.floor(t));
-                revealChrome();
-              }}>
-              <Text style={styles.skipText}>-10</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.playBtn}
+              style={styles.centerPlayBtn}
               onPress={() => {
                 p.onTogglePlay();
-                revealChrome();
-              }}>
-              <Text style={styles.playText}>{p.isPlaying ? '⏸' : '▶'}</Text>
+                showControls();
+              }}
+              activeOpacity={0.85}
+              hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
+              <Text style={styles.centerPlayIcon}>{p.isPlaying ? '⏸' : '▶'}</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={styles.ctrlBtn}
-              onPress={() => {
-                const t = Math.min(dur || 1e9, pos + 10);
-                setLivePos(t);
-                playerRef.current?.seek(t);
-                p.onSeek(Math.floor(t));
-                revealChrome();
-              }}>
-              <Text style={styles.skipText}>+10</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.ctrlBtn, !p.hasNext && styles.ctrlDisabled]}
-              disabled={!p.hasNext}
-              onPress={p.onNext}>
-              <Text style={styles.ctrlText}>⏭</Text>
+              style={styles.centerSkipBtn}
+              onPress={() => seekRelative(10)}
+              activeOpacity={0.75}
+              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+              <Text style={styles.centerSkipIcon}>⏩</Text>
+              <Text style={styles.centerSkipText}>+10s</Text>
             </TouchableOpacity>
           </View>
-        </View>
-      </Animated.View>
+
+          {/* ── Bottom Bar Scrim (Scrubber, Timestamps, Playlist Nav) ── */}
+          <View
+            style={[
+              styles.bottomBar,
+              {
+                paddingBottom: isLandscape ? 16 : 28,
+                paddingHorizontal: isLandscape ? 28 : 16,
+              },
+            ]}>
+            {/* Scrubber row with live elapsed and total duration */}
+            <View style={styles.scrubberRow}>
+              <Text style={styles.timeLabel}>{fmt(pos)}</Text>
+              <View style={styles.sliderFlex}>
+                <Slider
+                  value={pct}
+                  min={0}
+                  max={1}
+                  onStart={() => {
+                    setDragging(true);
+                    clearHideTimer();
+                  }}
+                  onChange={v => {
+                    setLivePos(v * dur);
+                  }}
+                  onEnd={() => {
+                    setDragging(false);
+                    p.onSeek(Math.floor(livePos));
+                    showControls();
+                  }}
+                />
+              </View>
+              <Text style={styles.timeLabel}>{fmt(dur)}</Text>
+            </View>
+
+            {/* Bottom buttons row */}
+            <View style={styles.bottomButtonsRow}>
+              <View style={styles.bottomNavLeft}>
+                {p.hasPrev ? (
+                  <TouchableOpacity
+                    style={styles.navBtn}
+                    onPress={() => {
+                      p.onPrev?.();
+                      showControls();
+                    }}>
+                    <Text style={styles.navBtnText}>⏮ Prev</Text>
+                  </TouchableOpacity>
+                ) : null}
+
+                {p.hasNext ? (
+                  <TouchableOpacity
+                    style={[styles.navBtn, { marginLeft: 8 }]}
+                    onPress={() => {
+                      p.onNext?.();
+                      showControls();
+                    }}>
+                    <Text style={styles.navBtnText}>Next ⏭</Text>
+                  </TouchableOpacity>
+                ) : null}
+              </View>
+
+              <View style={styles.bottomNavRight}>
+                <TouchableOpacity
+                  style={styles.navBtn}
+                  onPress={cycleResizeMode}>
+                  <Text style={styles.navBtnText}>{resizeModeLabel}</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Animated.View>
+      )}
     </View>
   );
 }
 
 /**
- * Minimal drag slider. Built from View + PanResponder rather than a native
- * slider dependency, so it works identically on web and native.
+ * High-performance, cross-platform touch scrubber built with PanResponder.
  */
 function Slider({
   value,
@@ -425,7 +528,6 @@ function Slider({
   onStart?: () => void;
   onEnd?: () => void;
 }) {
-  const [width, setWidth] = useState(0);
   const widthRef = useRef(0);
   const range = max - min || 1;
   const norm = Math.max(0, Math.min(1, (value - min) / range));
@@ -459,16 +561,14 @@ function Slider({
 
   return (
     <View
-      style={styles.sliderTrack}
+      style={styles.sliderHitBox}
       onLayout={e => {
-        const w = e.nativeEvent.layout.width;
-        widthRef.current = w;
-        setWidth(w);
+        widthRef.current = e.nativeEvent.layout.width;
       }}
       {...responder.panHandlers}>
       <View style={styles.sliderRail} />
       <View style={[styles.sliderFill, { width: `${norm * 100}%` }]} />
-      <View style={[styles.sliderKnob, { left: `${norm * 100}%` }]} />
+      <View style={[styles.sliderThumb, { left: `${norm * 100}%` }]} />
     </View>
   );
 }
@@ -477,227 +577,298 @@ const styles = StyleSheet.create({
   root: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: '#000000',
-    zIndex: 9999,
+    overflow: 'hidden',
   },
+
+  // ── Top Bar ────────────────────────────────────────────────────────────────
   topBar: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 14,
-    paddingTop: Platform.OS === 'web' ? 16 : 40,
-    paddingBottom: 12,
+    backgroundColor: 'rgba(0, 0, 0, 0.65)',
+    paddingBottom: 14,
+    zIndex: 20,
   },
-  roundBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
-    backgroundColor: 'rgba(10,10,14,0.72)',
-    borderWidth: 1,
-    borderColor: C.line,
+  backBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  roundBtnOn: {
-    backgroundColor: 'rgba(34,211,238,0.20)',
-    borderColor: 'rgba(34,211,238,0.6)',
+  backBtnText: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: 'bold',
+    lineHeight: 24,
   },
-  roundBtnText: {
-    color: C.text,
+  titleArea: {
+    flex: 1,
+    marginHorizontal: 12,
+  },
+  titleText: {
+    color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '700',
+    letterSpacing: 0.2,
   },
-  title: {
-    color: C.text,
-    fontSize: 13.5,
-    fontWeight: '800',
-  },
-  subtitle: {
+  subtitleText: {
     color: C.textMute,
-    fontSize: 10,
+    fontSize: 11,
     marginTop: 2,
   },
-  panel: {
-    marginHorizontal: 14,
-    marginBottom: 10,
-    backgroundColor: 'rgba(10,10,14,0.94)',
+  chipBtn: {
+    backgroundColor: 'rgba(255, 255, 255, 0.14)',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: C.line,
-    padding: 14,
+    borderColor: 'rgba(255, 255, 255, 0.16)',
+    marginRight: 8,
   },
-  panelHead: {
+  chipBtnText: {
+    color: C.accent,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  iconBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  iconBtnOn: {
+    backgroundColor: C.accent,
+  },
+  iconBtnText: {
+    fontSize: 16,
+  },
+
+  // ── Center Controls ────────────────────────────────────────────────────────
+  centerRow: {
+    ...StyleSheet.absoluteFillObject,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 10,
+  },
+  centerPlayBtn: {
+    width: 76,
+    height: 76,
+    borderRadius: 38,
+    backgroundColor: C.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginHorizontal: 36,
+    shadowColor: C.accent,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.6,
+    shadowRadius: 16,
+    elevation: 8,
+  },
+  centerPlayIcon: {
+    color: '#050811',
+    fontSize: 34,
+    fontWeight: '900',
+    marginLeft: 3,
+  },
+  centerSkipBtn: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: 'rgba(0, 0, 0, 0.60)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.18)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  centerSkipIcon: {
+    fontSize: 18,
+    color: '#FFFFFF',
+  },
+  centerSkipText: {
+    color: '#CBD5E1',
+    fontSize: 10,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+
+  // ── Double-tap Feedback ────────────────────────────────────────────────────
+  seekFeedbackBox: {
+    position: 'absolute',
+    top: '38%',
+    backgroundColor: 'rgba(0, 0, 0, 0.75)',
+    paddingHorizontal: 22,
+    paddingVertical: 14,
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: C.accent,
+  },
+  seekFeedbackLeft: {
+    left: '12%',
+  },
+  seekFeedbackRight: {
+    right: '12%',
+  },
+  seekFeedbackText: {
+    color: C.accent,
+    fontSize: 16,
+    fontWeight: '800',
+  },
+
+  // ── Bottom Bar ─────────────────────────────────────────────────────────────
+  bottomBar: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.70)',
+    paddingTop: 12,
+    zIndex: 20,
+  },
+  scrubberRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  sliderFlex: {
+    flex: 1,
+    marginHorizontal: 10,
+  },
+  timeLabel: {
+    color: '#E2E8F0',
+    fontSize: 12,
+    fontWeight: '600',
+    fontVariant: ['tabular-nums'],
+    minWidth: 46,
+    textAlign: 'center',
+  },
+  bottomButtonsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  bottomNavLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  bottomNavRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  navBtn: {
+    backgroundColor: 'rgba(255, 255, 255, 0.10)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 14,
+  },
+  navBtnText: {
+    color: '#F1F5F9',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+
+  // ── Slider ─────────────────────────────────────────────────────────────────
+  sliderHitBox: {
+    height: 36,
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  sliderRail: {
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'rgba(255, 255, 255, 0.22)',
+    width: '100%',
+  },
+  sliderFill: {
+    position: 'absolute',
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: C.accent,
+    top: 16,
+    left: 0,
+  },
+  sliderThumb: {
+    position: 'absolute',
+    top: 10,
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 2,
+    borderColor: C.accent,
+    marginLeft: -8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.5,
+    shadowRadius: 2,
+    elevation: 4,
+  },
+
+  // ── Sound Drawer ───────────────────────────────────────────────────────────
+  soundDrawer: {
+    position: 'absolute',
+    top: 90,
+    backgroundColor: 'rgba(15, 23, 42, 0.95)',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.15)',
+    padding: 16,
+    zIndex: 25,
+  },
+  drawerHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 10,
   },
-  panelTitle: {
-    color: C.text,
-    fontSize: 12,
-    fontWeight: '800',
-    letterSpacing: 0.4,
+  drawerTitle: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
   },
-  panelVal: {
+  muteBtnText: {
     color: C.accent,
-    fontSize: 11.5,
-    fontWeight: '800',
-    fontFamily: 'monospace',
+    fontSize: 12,
+    fontWeight: '600',
   },
-  sliderRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-  },
-  sliderIcon: {
-    fontSize: 13,
-    width: 20,
-    textAlign: 'center',
-  },
-  presetRow: {
-    flexDirection: 'row',
-    gap: 7,
-    marginTop: 12,
-  },
-  preset: {
-    flex: 1,
-    paddingVertical: 7,
-    borderRadius: 9,
-    backgroundColor: C.surf3,
-    borderWidth: 1,
-    borderColor: C.line,
-    alignItems: 'center',
-  },
-  presetOn: {
-    backgroundColor: 'rgba(34,211,238,0.16)',
-    borderColor: 'rgba(34,211,238,0.55)',
-  },
-  presetText: {
+  drawerSectionLabel: {
     color: C.textMute,
     fontSize: 10,
-    fontWeight: '700',
-  },
-  presetTextOn: {
-    color: C.accent,
-  },
-  groupLabel: {
-    color: C.textMute,
-    fontSize: 8.5,
     fontWeight: '800',
-    letterSpacing: 1.4,
-    marginTop: 14,
-    marginBottom: 7,
-  },
-  chipRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-  },
-  chip: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 8,
-    backgroundColor: C.surf3,
-    borderWidth: 1,
-    borderColor: C.line,
-  },
-  chipOn: {
-    backgroundColor: 'rgba(52,211,153,0.16)',
-    borderColor: 'rgba(52,211,153,0.55)',
-  },
-  chipText: {
-    color: C.textMute,
-    fontSize: 9.5,
-    fontWeight: '700',
-  },
-  chipTextOn: {
-    color: C.green,
-  },
-  bottomBar: {
-    paddingHorizontal: 14,
-    paddingBottom: Platform.OS === 'web' ? 16 : 34,
-    paddingTop: 8,
-  },
-  scrubRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
+    letterSpacing: 1,
     marginBottom: 8,
   },
-  time: {
-    color: C.textDim,
-    fontSize: 10.5,
-    fontFamily: 'monospace',
-    fontWeight: '700',
-    minWidth: 42,
-    textAlign: 'center',
-  },
-  controlsRow: {
+  eqRow: {
     flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 16,
+    flexWrap: 'wrap',
+    gap: 8,
   },
-  ctrlBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(23,23,31,0.85)',
+  eqChip: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: C.line,
+    borderColor: 'rgba(255, 255, 255, 0.10)',
   },
-  ctrlDisabled: {
-    opacity: 0.32,
+  eqChipActive: {
+    backgroundColor: 'rgba(6, 182, 212, 0.25)',
+    borderColor: C.accent,
   },
-  ctrlText: {
-    color: C.text,
-    fontSize: 15,
-  },
-  skipText: {
+  eqChipText: {
     color: C.textDim,
-    fontSize: 10.5,
-    fontWeight: '800',
+    fontSize: 11,
+    fontWeight: '600',
   },
-  playBtn: {
-    width: 58,
-    height: 58,
-    borderRadius: 29,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: C.accent,
-  },
-  playText: {
-    color: '#00151A',
-    fontSize: 22,
-    fontWeight: '900',
-    marginLeft: 2,
-  },
-  sliderTrack: {
-    flex: 1,
-    height: 26,
-    justifyContent: 'center',
-  },
-  sliderRail: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: 'rgba(255,255,255,0.16)',
-  },
-  sliderFill: {
-    position: 'absolute',
-    left: 0,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: C.accent,
-  },
-  sliderKnob: {
-    position: 'absolute',
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    backgroundColor: C.text,
-    marginLeft: -7,
+  eqChipTextActive: {
+    color: C.accent,
   },
 });
