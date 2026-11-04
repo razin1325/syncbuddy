@@ -405,8 +405,7 @@ class Media3FullscreenActivity : Activity() {
 
     private fun audioSessionId(): Int =
         try {
-            val player = playerView?.player ?: Media3Manager.getPlayer(this)
-            player.audioSessionId
+            Media3Manager.getPlayer(this).audioSessionId
         } catch (e: Exception) {
             0
         }
