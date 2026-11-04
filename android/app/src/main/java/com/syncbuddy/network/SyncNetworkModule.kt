@@ -1868,6 +1868,37 @@ class SyncNetworkModule(
         }
     }
 
+    /**
+     * Programmatically force screen orientation between Landscape and Portrait.
+     * Overrides system auto-rotate lock so users can rotate videos even when phone
+     * auto-rotate is toggled off in Android quick settings.
+     */
+    @ReactMethod
+    fun setScreenOrientation(orientation: String, promise: Promise) {
+        try {
+            val activity = currentActivity
+            if (activity != null) {
+                activity.runOnUiThread {
+                    try {
+                        when (orientation.lowercase()) {
+                            "landscape" -> activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                            "portrait" -> activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                            "sensor" -> activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR
+                            else -> activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                        }
+                        promise.resolve(true)
+                    } catch (e: Exception) {
+                        promise.reject("ERR_ORIENTATION", e.message)
+                    }
+                }
+            } else {
+                promise.reject("ERR_NO_ACTIVITY", "Current activity is null")
+            }
+        } catch (e: Exception) {
+            promise.reject("ERR_ORIENTATION_INIT", e.message)
+        }
+    }
+
     // Backward-compatible delegates
     @ReactMethod
     fun playAudioFile(uriString: String, promise: Promise) {

@@ -611,6 +611,36 @@ export const NativeNetwork = {
   },
 
   /**
+   * Programmatically force screen orientation between Landscape and Portrait.
+   */
+  async setScreenOrientation(
+    orientation: 'landscape' | 'portrait' | 'sensor' | 'unspecified'
+  ): Promise<boolean> {
+    if (Platform.OS === 'android' && SyncNetworkModule?.setScreenOrientation) {
+      try {
+        return await SyncNetworkModule.setScreenOrientation(orientation);
+      } catch {
+        return false;
+      }
+    }
+    if (Platform.OS === 'web' && typeof screen !== 'undefined' && screen.orientation) {
+      try {
+        if (orientation === 'landscape') {
+          await (screen.orientation as any).lock?.('landscape').catch(() => {});
+        } else if (orientation === 'portrait') {
+          await (screen.orientation as any).lock?.('portrait').catch(() => {});
+        } else {
+          (screen.orientation as any).unlock?.();
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  },
+
+  /**
    * Play an offline audio file and stream its decoded PCM frames to all listeners
    */
   async playAudioFile(uri: string): Promise<boolean> {

@@ -485,8 +485,13 @@ const NowPlayingSheet: React.FC<{
                     isPlaying={p.isPlaying}
                     resizeMode="contain"
                   />
-                  <View style={styles.fullscreenPill} pointerEvents="none">
-                    <Text style={styles.fullscreenPillText}>⛶ Fullscreen</Text>
+                  <View style={styles.fullscreenPillRow} pointerEvents="none">
+                    <View style={[styles.fullscreenPill, { backgroundColor: 'rgba(6, 182, 212, 0.40)', borderColor: '#06B6D4' }]}>
+                      <Text style={[styles.fullscreenPillText, { color: '#FFFFFF' }]}>🔄 Rotate</Text>
+                    </View>
+                    <View style={[styles.fullscreenPill, { marginLeft: 6 }]}>
+                      <Text style={styles.fullscreenPillText}>⛶ Fullscreen</Text>
+                    </View>
                   </View>
                 </TouchableOpacity>
               ) : (
@@ -4671,10 +4676,15 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.line,
   },
-  fullscreenPill: {
+  fullscreenPillRow: {
     position: 'absolute',
     top: 10,
     right: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    zIndex: 10,
+  },
+  fullscreenPill: {
     backgroundColor: 'rgba(0,0,0,0.72)',
     borderColor: 'rgba(34,211,238,0.5)',
     borderWidth: 1,

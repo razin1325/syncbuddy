@@ -5,11 +5,12 @@
  *   • Pure 100% video display with zero UI clutter by default
  *   • Single screen tap toggles controls (Tap -> Show, Tap again -> Hide)
  *   • Auto-hides controls after 3.5s of inactivity while playing
+ *   • Dedicated Rotate button (🔄 Rotate) to effortlessly switch between Portrait and Landscape
  *   • Double-tap left/right for quick ±10s seeking with visual feedback
  *   • Full landscape & portrait auto-orientation adaptation
- *   • Clean top bar (Back button, Title, Aspect ratio switch: Fit / Zoom / Stretch)
+ *   • Clean top bar (Back button, Title, 🔄 Rotate button, Aspect ratio switch: Fit / Zoom / Stretch)
  *   • Center overlay (⏪ 10s, Large Play/Pause, 10s ⏩)
- *   • Bottom bar (Time, Smooth Interactive Scrubber, Duration, Prev/Next)
+ *   • Bottom bar (Time, Smooth Interactive Scrubber, Duration, Prev/Next, 🔄 Rotate)
  *   • Auto-hiding Android StatusBar for true cinematic immersion
  */
 
@@ -31,6 +32,7 @@ import VideoPlayer, {
   FX_PRESETS,
   VideoPlayerHandle,
 } from './VideoPlayer';
+import { NativeNetwork } from './NativeNetwork';
 
 const C = {
   bg: '#000000',
@@ -92,8 +94,11 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   const [liveDur, setLiveDur] = useState(0);
   const [dragging, setDragging] = useState(false);
 
-  // Quick visual feedback on double-tap seek
-  const [seekFeedback, setSeekFeedback] = useState<{ text: string; side: 'left' | 'right' } | null>(null);
+  // Quick visual feedback on double-tap seek or rotation
+  const [seekFeedback, setSeekFeedback] = useState<{
+    text: string;
+    side: 'left' | 'right' | 'center';
+  } | null>(null);
   const seekFeedbackTimer = useRef<any>(null);
   const lastTapRef = useRef<number>(0);
   const tapTimeoutRef = useRef<any>(null);
@@ -152,6 +157,31 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
     }
   }, [chromeVisible, panel, hideControls, showControls]);
 
+  // Visual feedback popup helper
+  const showSeekFeedback = useCallback((text: string, side: 'left' | 'right' | 'center') => {
+    if (seekFeedbackTimer.current) clearTimeout(seekFeedbackTimer.current);
+    setSeekFeedback({ text, side });
+    seekFeedbackTimer.current = setTimeout(() => {
+      setSeekFeedback(null);
+    }, 900);
+  }, []);
+
+  // Toggle Screen Orientation between Landscape and Portrait
+  const toggleOrientation = useCallback(async () => {
+    const next = isLandscape ? 'portrait' : 'landscape';
+    await NativeNetwork.setScreenOrientation(next);
+    showSeekFeedback(next === 'landscape' ? '🔄 Landscape Mode' : '🔄 Portrait Mode', 'center');
+    showControls();
+  }, [isLandscape, showSeekFeedback, showControls]);
+
+  // Close player and restore sensor orientation
+  const handleClose = useCallback(async () => {
+    try {
+      await NativeNetwork.setScreenOrientation('unspecified');
+    } catch {}
+    p.onClose();
+  }, [p]);
+
   // Sync animation fade with chromeVisible
   useEffect(() => {
     Animated.timing(fade, {
@@ -192,12 +222,22 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
           try { req.call(el).catch?.(() => {}); } catch {}
         }
       }
-    } else if (Platform.OS === 'web' && typeof document !== 'undefined') {
-      if (document.fullscreenElement) {
-        try { (document as any).exitFullscreen?.(); } catch {}
+    } else {
+      NativeNetwork.setScreenOrientation('unspecified').catch(() => {});
+      if (Platform.OS === 'web' && typeof document !== 'undefined') {
+        if (document.fullscreenElement) {
+          try { (document as any).exitFullscreen?.(); } catch {}
+        }
       }
     }
   }, [p.visible, p.uri]);
+
+  // Restore sensor orientation on unmount
+  useEffect(() => {
+    return () => {
+      NativeNetwork.setScreenOrientation('unspecified').catch(() => {});
+    };
+  }, []);
 
   // Relative seek (±10s)
   const seekRelative = useCallback((delta: number) => {
@@ -241,15 +281,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
         toggleControls();
       }, 280);
     }
-  }, [winWidth, seekRelative, p, showControls, toggleControls]);
-
-  const showSeekFeedback = (text: string, side: 'left' | 'right') => {
-    if (seekFeedbackTimer.current) clearTimeout(seekFeedbackTimer.current);
-    setSeekFeedback({ text, side });
-    seekFeedbackTimer.current = setTimeout(() => {
-      setSeekFeedback(null);
-    }, 800);
-  };
+  }, [winWidth, seekRelative, p, showControls, toggleControls, showSeekFeedback]);
 
   // Cycle aspect ratio
   const cycleResizeMode = () => {
@@ -304,12 +336,16 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
       {/* Tapping anywhere toggles controls, double-tap seeks ±10s */}
       <TouchableWithoutFeedback onPress={handleTouch}>
         <View style={StyleSheet.absoluteFill}>
-          {/* Double-tap visual indicator badge */}
+          {/* Double-tap or rotate visual indicator badge */}
           {seekFeedback && (
             <View
               style={[
                 styles.seekFeedbackBox,
-                seekFeedback.side === 'left' ? styles.seekFeedbackLeft : styles.seekFeedbackRight,
+                seekFeedback.side === 'left'
+                  ? styles.seekFeedbackLeft
+                  : seekFeedback.side === 'right'
+                  ? styles.seekFeedbackRight
+                  : styles.seekFeedbackCenter,
               ]}>
               <Text style={styles.seekFeedbackText}>{seekFeedback.text}</Text>
             </View>
@@ -334,7 +370,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
             ]}>
             <TouchableOpacity
               style={styles.backBtn}
-              onPress={p.onClose}
+              onPress={handleClose}
               hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
               <Text style={styles.backBtnText}>←</Text>
             </TouchableOpacity>
@@ -349,6 +385,16 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
                 </Text>
               ) : null}
             </View>
+
+            {/* 🔄 Rotate Screen Button (Portrait ⇄ Landscape) */}
+            <TouchableOpacity
+              style={[styles.chipBtn, styles.rotateChipBtn]}
+              onPress={toggleOrientation}
+              hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}>
+              <Text style={styles.rotateChipText}>
+                🔄 {isLandscape ? 'Portrait' : 'Rotate'}
+              </Text>
+            </TouchableOpacity>
 
             {/* Aspect Ratio Toggle (Fit / Zoom / Stretch) */}
             <TouchableOpacity
@@ -435,7 +481,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
             </TouchableOpacity>
           </View>
 
-          {/* ── Bottom Bar Scrim (Scrubber, Timestamps, Playlist Nav) ── */}
+          {/* ── Bottom Bar Scrim (Scrubber, Timestamps, Playlist Nav, Rotate) ── */}
           <View
             style={[
               styles.bottomBar,
@@ -496,6 +542,15 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
               </View>
 
               <View style={styles.bottomNavRight}>
+                {/* Bottom 🔄 Rotate Button */}
+                <TouchableOpacity
+                  style={[styles.navBtn, styles.bottomRotateBtn]}
+                  onPress={toggleOrientation}>
+                  <Text style={styles.bottomRotateText}>
+                    🔄 {isLandscape ? 'Portrait' : 'Rotate'}
+                  </Text>
+                </TouchableOpacity>
+
                 <TouchableOpacity
                   style={styles.navBtn}
                   onPress={cycleResizeMode}>
@@ -635,6 +690,15 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
+  rotateChipBtn: {
+    backgroundColor: 'rgba(6, 182, 212, 0.22)',
+    borderColor: C.accent,
+  },
+  rotateChipText: {
+    color: C.accent,
+    fontSize: 12,
+    fontWeight: '700',
+  },
   iconBtn: {
     width: 38,
     height: 38,
@@ -699,16 +763,18 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
 
-  // ── Double-tap Feedback ────────────────────────────────────────────────────
+  // ── Double-tap & Rotate Feedback ───────────────────────────────────────────
   seekFeedbackBox: {
     position: 'absolute',
     top: '38%',
-    backgroundColor: 'rgba(0, 0, 0, 0.75)',
+    backgroundColor: 'rgba(0, 0, 0, 0.85)',
     paddingHorizontal: 22,
     paddingVertical: 14,
     borderRadius: 24,
-    borderWidth: 1,
+    borderWidth: 1.5,
     borderColor: C.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   seekFeedbackLeft: {
     left: '12%',
@@ -716,10 +782,15 @@ const styles = StyleSheet.create({
   seekFeedbackRight: {
     right: '12%',
   },
+  seekFeedbackCenter: {
+    left: '28%',
+    right: '28%',
+  },
   seekFeedbackText: {
     color: C.accent,
     fontSize: 16,
     fontWeight: '800',
+    textAlign: 'center',
   },
 
   // ── Bottom Bar ─────────────────────────────────────────────────────────────
@@ -773,6 +844,17 @@ const styles = StyleSheet.create({
     color: '#F1F5F9',
     fontSize: 12,
     fontWeight: '600',
+  },
+  bottomRotateBtn: {
+    backgroundColor: 'rgba(6, 182, 212, 0.20)',
+    borderColor: C.accent,
+    borderWidth: 1,
+    marginRight: 8,
+  },
+  bottomRotateText: {
+    color: C.accent,
+    fontSize: 12,
+    fontWeight: '700',
   },
 
   // ── Slider ─────────────────────────────────────────────────────────────────
