@@ -168,6 +168,32 @@ export interface PlaybackState {
   duration: number;
 }
 
+/** Noise-cancellation configuration for the walkie-talkie voice path. */
+export interface NoiseSuppressionConfig {
+  enabled: boolean;
+  /** 0..1 — how aggressively the spectral stage removes noise. */
+  strength: number;
+}
+
+/** Live measurements from the native voice enhancer. */
+export interface NoiseSuppressionStats extends NoiseSuppressionConfig {
+  /** Mean attenuation applied by the spectral stage, in dB (positive = cut). */
+  reductionDb: number;
+  /** Pre-processing RMS level, 0..1. */
+  inputLevel: number;
+  /** Post-processing RMS level, 0..1. */
+  outputLevel: number;
+  /** Current automatic-gain multiplier. */
+  gain: number;
+  /** 0..1 value suitable for a progress meter. */
+  reductionRatio: number;
+}
+
+// Remembered on the JS side too, so the setting survives across screens and is
+// re-applied the next time a transmission starts.
+let noiseSuppressionEnabled = true;
+let noiseSuppressionStrength = 0.75;
+
 /**
  * Web-preview transport.
  *
@@ -402,6 +428,65 @@ export const NativeNetwork = {
   async stopSystemAudioCapture(): Promise<boolean> {
     if (Platform.OS !== 'android' || !SyncNetworkModule?.stopSystemAudioCapture) return true;
     return await SyncNetworkModule.stopSystemAudioCapture();
+  },
+
+  /**
+   * Enable/disable walkie-talkie voice noise cancellation.
+   * @param enabled  true = clean the mic signal.
+   * @param strength 0..1, how aggressively to remove noise.
+   */
+  async setNoiseSuppression(enabled: boolean, strength = 0.75): Promise<boolean> {
+    noiseSuppressionEnabled = enabled;
+    noiseSuppressionStrength = strength;
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.setNoiseSuppression) return true;
+    try {
+      return await SyncNetworkModule.setNoiseSuppression(enabled, strength);
+    } catch {
+      return false;
+    }
+  },
+
+  /** Read back the current noise-suppression configuration. */
+  async getNoiseSuppression(): Promise<NoiseSuppressionConfig> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.getNoiseSuppression) {
+      return { enabled: noiseSuppressionEnabled, strength: noiseSuppressionStrength };
+    }
+    try {
+      return await SyncNetworkModule.getNoiseSuppression();
+    } catch {
+      return { enabled: noiseSuppressionEnabled, strength: noiseSuppressionStrength };
+    }
+  },
+
+  /**
+   * Live noise-reduction measurements from the native voice enhancer.
+   * On web there is no DSP, so it reports a plausible idle shape.
+   */
+  async getNoiseSuppressionStats(): Promise<NoiseSuppressionStats> {
+    if (Platform.OS !== 'android' || !SyncNetworkModule?.getNoiseSuppressionStats) {
+      return {
+        enabled: noiseSuppressionEnabled,
+        strength: noiseSuppressionStrength,
+        reductionDb: 0,
+        inputLevel: 0,
+        outputLevel: 0,
+        gain: 1,
+        reductionRatio: 0,
+      };
+    }
+    try {
+      return await SyncNetworkModule.getNoiseSuppressionStats();
+    } catch {
+      return {
+        enabled: noiseSuppressionEnabled,
+        strength: noiseSuppressionStrength,
+        reductionDb: 0,
+        inputLevel: 0,
+        outputLevel: 0,
+        gain: 1,
+        reductionRatio: 0,
+      };
+    }
   },
 
   /**

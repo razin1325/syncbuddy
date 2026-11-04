@@ -27,8 +27,9 @@ import {
   PermissionsAndroid,
   requireNativeComponent,
 } from 'react-native';
-
 const Media3PlayerView = Platform.OS === 'android' ? requireNativeComponent<any>('Media3PlayerView') : View;
+import VideoPlayer, { EQ_PRESETS, FX_PRESETS } from './VideoPlayer';
+import FullscreenPlayer from './FullscreenPlayer';
 import {
   NativeBluetooth,
   NativeAuracast,
@@ -203,6 +204,36 @@ function needsExternalPlayer(item: DeviceMediaItem): boolean {
   return list.indexOf(fmt) >= 0;
 }
 
+/**
+ * In the browser there is no MediaStore, so the demo list uses placeholder
+ * `web-demo://` URIs. Map those to the real bundled clip we generate offline
+ * (see tools/make-demo-video.js) so video actually plays and can be scrubbed.
+ *
+ * These live in /public and are served from the site root. A Metro `require()`
+ * would return a numeric asset id rather than a usable URL in the web export,
+ * which left <video> pointing at "http://host/1" and therefore at nothing.
+ * Android always keeps the genuine content:// URI.
+ */
+const DEMO_VIDEO_URL = 'demo-video.webm';
+const DEMO_AUDIO_URL = 'demo-tone.wav';
+
+function webMediaUri(uri: string): string {
+  if (Platform.OS !== 'web') return uri;
+  if (uri.indexOf('web-demo://') === 0) return DEMO_VIDEO_URL;
+  return uri;
+}
+
+/**
+ * The recorded demo clip is video-only because headless Chrome cannot mux an
+ * audio track. Attach a generated WAV so volume / EQ / effects are audible.
+ * Real device files return undefined and use their own audio stream.
+ */
+function webMediaAudio(uri: string): string | undefined {
+  if (Platform.OS !== 'web') return undefined;
+  if (uri.indexOf('web-demo://') === 0) return DEMO_AUDIO_URL;
+  return undefined;
+}
+
 /** 3:07 or 1:02:44 — input is milliseconds. */
 function formatDurationMs(ms: number): string {
   if (!ms || ms <= 0 || !isFinite(ms)) return '--:--';
@@ -327,7 +358,9 @@ const MediaRow: React.FC<{
       <View style={{ alignItems: 'center', marginLeft: 8 }}>
         <Text style={styles.mediaRowDuration}>{formatDurationMs(item.duration)}</Text>
         <View style={[styles.mediaPlayPill, active && styles.mediaPlayPillActive]}>
-          <Text style={styles.mediaPlayPillText}>{active && playing ? '❚❚' : '▶'}</Text>
+          <Text style={[styles.mediaPlayPillText, active && styles.mediaPlayPillTextActive]}>
+            {active && playing ? '❚❚' : '▶'}
+          </Text>
         </View>
       </View>
     </TouchableOpacity>
@@ -411,6 +444,7 @@ const NowPlayingSheet: React.FC<{
   onToggleBroadcast: () => void;
   onToggleShuffle: () => void;
   onOpenExternal: () => void;
+  onOpenFullscreen: () => void;
 }> = p => {
   const item = p.item;
   const forward = p.duration > 0 ? Math.min(p.duration, p.position + 10) : p.position + 10;
@@ -433,34 +467,20 @@ const NowPlayingSheet: React.FC<{
               </View>
 
               {item.type === 'video' ? (
-                <View style={styles.videoSurface}>
-                  {Platform.OS === 'android' ? (
-                    <Media3PlayerView
-                      style={{ width: '100%', height: '100%' }}
-                      uri={item.uri}
-                      isPlaying={p.isPlaying}
-                      resizeMode="fit"
-                      useController={false}
-                    />
-                  ) : (
-                    // Browser preview has no Media3 surface, so show the poster
-                    // instead of an unexplained black rectangle.
-                    <View style={styles.videoPoster}>
-                      <Text style={styles.videoPosterIcon}>🎬</Text>
-                      <Text style={styles.videoPosterTitle} numberOfLines={2}>
-                        {item.title}
-                      </Text>
-                      <Text style={styles.videoPosterHint}>
-                        {item.format} video — plays on device with Media3
-                      </Text>
-                    </View>
-                  )}
-                  <TouchableOpacity
-                    style={styles.fullscreenPill}
-                    onPress={() => NativeNetwork.launchFullscreenVideo()}>
+                <TouchableOpacity
+                  activeOpacity={0.9}
+                  style={styles.videoSurface}
+                  onPress={p.onOpenFullscreen}>
+                  <VideoPlayer
+                    uri={webMediaUri(item.uri)}
+                    audioUri={webMediaAudio(item.uri)}
+                    isPlaying={p.isPlaying}
+                    resizeMode="contain"
+                  />
+                  <View style={styles.fullscreenPill} pointerEvents="none">
                     <Text style={styles.fullscreenPillText}>⛶ Fullscreen</Text>
-                  </TouchableOpacity>
-                </View>
+                  </View>
+                </TouchableOpacity>
               ) : (
                 <MediaArt uri={item.albumArt} type="audio" size={196} radius={18} />
               )}
@@ -589,6 +609,8 @@ export default function App(): React.JSX.Element {
   const [showPlayer, setShowPlayer] = useState<boolean>(false);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [isShuffle, setIsShuffle] = useState<boolean>(false);
+  // Immersive fullscreen player (replaces the old no-op fullscreen pill).
+  const [showFullscreen, setShowFullscreen] = useState<boolean>(false);
 
   // Join Room State (Listener)
   const [inputRoomCode, setInputRoomCode] = useState<string>('');
@@ -606,6 +628,18 @@ export default function App(): React.JSX.Element {
   // Walkie-Talkie (PTT) State (Unified Room Voice, No Channels)
   const [isTalking, setIsTalking] = useState<boolean>(false);
   const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
+
+  // Voice noise cancellation. The heavy lifting happens in Kotlin; these mirror
+  // its state so the UI can show a real meter and let the user tune it.
+  const [noiseCancelOn, setNoiseCancelOn] = useState<boolean>(true);
+  const [noiseStrength, setNoiseStrength] = useState<number>(0.75);
+  const [noiseStats, setNoiseStats] = useState<{
+    reductionDb: number;
+    inputLevel: number;
+    outputLevel: number;
+    gain: number;
+    reductionRatio: number;
+  } | null>(null);
 
   // Refs & Timers
   const toastTimer = useRef<any>(null);
@@ -1383,7 +1417,16 @@ export default function App(): React.JSX.Element {
       setIsTalking(true);
       const myName = networkInfo?.deviceName || 'This Phone';
       setActiveSpeaker(`${myName} (You)`);
-      showToast('🎙️ You are live — everyone can hear you!', 'info');
+      showToast(
+        noiseCancelOn
+          ? '🎙️ You are live — noise cancellation on'
+          : '🎙️ You are live (noise cancellation off)',
+        'info'
+      );
+
+      // Push the current noise-cancellation settings down before the stream
+      // starts, so the very first packet is already cleaned.
+      NativeNetwork.setNoiseSuppression(noiseCancelOn, noiseStrength).catch(() => {});
 
       // 1. Start real low-latency microphone voice stream over UDP
       await NativeNetwork.startAudioBroadcaster('mic');
@@ -1419,6 +1462,42 @@ export default function App(): React.JSX.Element {
       }
     } catch {}
   };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Noise-cancellation controls
+  // ─────────────────────────────────────────────────────────────────────────────
+  const toggleNoiseCancellation = async () => {
+    const next = !noiseCancelOn;
+    setNoiseCancelOn(next);
+    await NativeNetwork.setNoiseSuppression(next, noiseStrength).catch(() => {});
+    showToast(next ? '🔇 Noise cancellation on' : 'Noise cancellation off', 'info');
+  };
+
+  const changeNoiseStrength = async (value: number) => {
+    const clamped = Math.max(0.2, Math.min(1, value));
+    setNoiseStrength(clamped);
+    await NativeNetwork.setNoiseSuppression(noiseCancelOn, clamped).catch(() => {});
+  };
+
+  // Poll live DSP measurements while the user is talking, so the meter shows
+  // how much noise is actually being removed rather than a fake animation.
+  useEffect(() => {
+    if (!isTalking) {
+      setNoiseStats(null);
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      const s = await NativeNetwork.getNoiseSuppressionStats().catch(() => null);
+      if (!cancelled) setNoiseStats(s);
+    };
+    tick();
+    const id = setInterval(tick, 200);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [isTalking]);
 
   // Helpers
   const connectedCount = hostParticipants.length + 1; // +1 for host itself
@@ -2345,7 +2424,11 @@ export default function App(): React.JSX.Element {
                 <TouchableOpacity
                   style={[styles.mediaSyncToggle, broadcastToRoom && styles.mediaSyncToggleOn]}
                   onPress={toggleBroadcastToRoom}>
-                  <Text style={[styles.mediaSyncToggleText, broadcastToRoom && { color: '#00212B' }]}>
+                  <Text
+                    style={[
+                      styles.mediaSyncToggleText,
+                      broadcastToRoom && styles.mediaSyncToggleTextOn,
+                    ]}>
                     {broadcastToRoom ? '📡 ROOM SYNC ON' : '🔕 ROOM SYNC OFF'}
                   </Text>
                 </TouchableOpacity>
@@ -2468,6 +2551,86 @@ export default function App(): React.JSX.Element {
                   </Text>
                 </View>
               </View>
+            </View>
+
+            {/* Noise cancellation panel */}
+            <View style={styles.card}>
+              <View style={styles.cardHeaderRow}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 9 }}>
+                  <Text style={{ fontSize: 17 }}>{noiseCancelOn ? '🔇' : '🔊'}</Text>
+                  <View>
+                    <Text style={styles.sectionTitle}>Voice clarity</Text>
+                    <Text style={styles.noiseSubtitle}>
+                      {noiseCancelOn
+                        ? 'Background noise is removed before it is sent'
+                        : 'Raw microphone — background noise is passed through'}
+                    </Text>
+                  </View>
+                </View>
+                <TouchableOpacity
+                  style={[styles.noiseToggle, noiseCancelOn && styles.noiseToggleOn]}
+                  onPress={toggleNoiseCancellation}>
+                  <Text style={[styles.noiseToggleText, noiseCancelOn && styles.noiseToggleTextOn]}>
+                    {noiseCancelOn ? 'ON' : 'OFF'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              {noiseCancelOn && (
+                <>
+                  <View style={styles.noiseLevelRow}>
+                    <Text style={styles.volLabel}>Strength</Text>
+                    <Text style={styles.volValue}>
+                      {noiseStrength < 0.5 ? 'Light' : noiseStrength < 0.85 ? 'Balanced' : 'Aggressive'}
+                    </Text>
+                  </View>
+                  <View style={styles.noisePresetRow}>
+                    {[
+                      { key: 0.4, label: 'Light' },
+                      { key: 0.75, label: 'Balanced' },
+                      { key: 1.0, label: 'Max' },
+                    ].map(p => (
+                      <TouchableOpacity
+                        key={p.key}
+                        style={[styles.noisePreset, Math.abs(noiseStrength - p.key) < 0.01 && styles.noisePresetActive]}
+                        onPress={() => changeNoiseStrength(p.key)}>
+                        <Text
+                          style={[
+                            styles.noisePresetText,
+                            Math.abs(noiseStrength - p.key) < 0.01 && styles.noisePresetTextActive,
+                          ]}>
+                          {p.label}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+
+                  {/* Live suppression meter, fed by the native DSP */}
+                  <View style={styles.noiseMeterBox}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
+                      <Text style={styles.noiseMeterLabel}>Noise removed</Text>
+                      <Text style={styles.noiseMeterValue}>
+                        {noiseStats && isTalking
+                          ? `${Math.abs(noiseStats.reductionDb).toFixed(1)} dB`
+                          : '—'}
+                      </Text>
+                    </View>
+                    <View style={styles.noiseMeterTrack}>
+                      <View
+                        style={[
+                          styles.noiseMeterFill,
+                          { width: `${Math.round((noiseStats?.reductionRatio ?? 0) * 100)}%` },
+                        ]}
+                      />
+                    </View>
+                    <Text style={styles.noiseMeterHint}>
+                      {isTalking
+                        ? 'Listening — figures update live while you hold the button'
+                        : 'Hold the talk button to see live noise reduction'}
+                    </Text>
+                  </View>
+                </>
+              )}
             </View>
 
             {/* Giant Push-To-Talk Button */}
@@ -2796,7 +2959,49 @@ export default function App(): React.JSX.Element {
         onToggleBroadcast={toggleBroadcastToRoom}
         onToggleShuffle={() => setIsShuffle(v => !v)}
         onOpenExternal={handleOpenExternal}
+        onOpenFullscreen={() => {
+          // Hide the bottom sheet first: it is a Modal, so it renders in a
+          // portal ABOVE anything inside #root, and its <video> would keep
+          // playing audio underneath the fullscreen player.
+          setShowPlayer(false);
+          setShowFullscreen(true);
+        }}
       />
+
+      <Modal
+        visible={showFullscreen && !!currentMedia && currentMedia.type === 'video'}
+        transparent={false}
+        animationType="fade"
+        presentationStyle="fullScreen"
+        supportedOrientations={['portrait', 'landscape']}
+        onRequestClose={() => setShowFullscreen(false)}>
+        <FullscreenPlayer
+          visible={showFullscreen && !!currentMedia && currentMedia.type === 'video'}
+          title={currentMedia?.title || ''}
+          subtitle={
+            currentMedia
+              ? `${currentMedia.format}${currentMedia.size ? ' • ' + currentMedia.size : ''}`
+              : undefined
+          }
+          uri={currentMedia ? webMediaUri(currentMedia.uri) : ''}
+          audioUri={currentMedia ? webMediaAudio(currentMedia.uri) : undefined}
+          isPlaying={isMediaPlaying}
+          position={playbackPos}
+          duration={playbackDur}
+          onClose={() => {
+            setShowFullscreen(false);
+            // Return to the sheet so the user is not dropped on a bare list.
+            if (currentMedia) setShowPlayer(true);
+          }}
+          onTogglePlay={handleTogglePlayPause}
+          onSeek={handleSeek}
+          onNext={() => handleNextMedia(1)}
+          onPrev={() => handleNextMedia(-1)}
+          onEnded={() => handleNextMedia(1)}
+          hasNext={sortedMedia.length > 1}
+          hasPrev={sortedMedia.length > 1}
+        />
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -3610,6 +3815,105 @@ const styles = StyleSheet.create({
     lineHeight: 19,
   },
 
+  // ── Noise cancellation ─────────────────────────────────────────────────────
+  noiseSubtitle: {
+    color: C.textMute,
+    fontSize: 10.5,
+    marginTop: 3,
+    lineHeight: 14,
+    maxWidth: 210,
+  },
+  noiseToggle: {
+    paddingHorizontal: 13,
+    paddingVertical: 7,
+    borderRadius: 9,
+    backgroundColor: C.surf3,
+    borderWidth: 1,
+    borderColor: C.line,
+  },
+  noiseToggleOn: {
+    backgroundColor: 'rgba(52,211,153,0.14)',
+    borderColor: 'rgba(52,211,153,0.5)',
+  },
+  noiseToggleText: {
+    color: C.textMute,
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+  },
+  noiseToggleTextOn: {
+    color: C.green,
+  },
+  noiseLevelRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  noisePresetRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  noisePreset: {
+    flex: 1,
+    paddingVertical: 9,
+    borderRadius: 10,
+    backgroundColor: C.surf2,
+    borderWidth: 1,
+    borderColor: C.line,
+    alignItems: 'center',
+  },
+  noisePresetActive: {
+    backgroundColor: 'rgba(34,211,238,0.12)',
+    borderColor: 'rgba(34,211,238,0.55)',
+  },
+  noisePresetText: {
+    color: C.textMute,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  noisePresetTextActive: {
+    color: C.accent,
+    fontWeight: '800',
+  },
+  noiseMeterBox: {
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: C.surf2,
+    borderWidth: 1,
+    borderColor: C.line,
+  },
+  noiseMeterLabel: {
+    color: C.textDim,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  noiseMeterValue: {
+    color: C.green,
+    fontSize: 11.5,
+    fontWeight: '800',
+    fontFamily: 'monospace',
+  },
+  noiseMeterTrack: {
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: C.surf3,
+    overflow: 'hidden',
+  },
+  noiseMeterFill: {
+    height: '100%',
+    borderRadius: 3,
+    backgroundColor: C.green,
+  },
+  noiseMeterHint: {
+    color: C.textMute,
+    fontSize: 9.5,
+    marginTop: 7,
+    lineHeight: 13,
+  },
+
   // ── Walkie-talkie ──────────────────────────────────────────────────────────
   roomVoiceTitle: {
     color: C.text,
@@ -4054,22 +4358,37 @@ const styles = StyleSheet.create({
   },
   mediaSyncToggle: {
     flex: 1,
-    paddingVertical: 10,
+    minHeight: 40,
+    paddingHorizontal: 12,
     borderRadius: 12,
     backgroundColor: C.surf2,
     borderWidth: 1,
-    borderColor: C.line,
+    // C.line is 7% white, which disappears on the true-black canvas — the button
+    // read as an unlabelled dark slab. A visible outline makes it obviously a
+    // control, and the ON state then shifts hue rather than just brightening.
+    borderColor: 'rgba(255,255,255,0.16)',
     alignItems: 'center',
+    justifyContent: 'center',
   },
   mediaSyncToggleOn: {
-    backgroundColor: 'rgba(52,211,153,0.14)',
-    borderColor: 'rgba(52,211,153,0.5)',
+    backgroundColor: 'rgba(52,211,153,0.16)',
+    borderColor: 'rgba(52,211,153,0.62)',
   },
   mediaSyncToggleText: {
-    color: C.textMute,
+    // Was C.textMute (#6B6B76, 3.60:1) which read as a blank dark block. The
+    // OFF state is the default, so it has to be legible without being read as
+    // "disabled"; body-text contrast is the floor.
+    color: C.textDim,
     fontSize: 10.5,
     fontWeight: '800',
     letterSpacing: 0.4,
+  },
+  mediaSyncToggleTextOn: {
+    // The previous inline override used #00212B (dark ink) on a 16% green tint,
+    // which measured 1.13:1 — effectively invisible. Dark ink only works on a
+    // FILLED accent button (see mediaOpenBtn); on a tinted one it must be the
+    // accent colour itself.
+    color: C.green,
   },
   mediaOpenBtn: {
     paddingHorizontal: 15,
@@ -4196,9 +4515,9 @@ const styles = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: 'rgba(34,211,238,0.1)',
+    backgroundColor: 'rgba(34,211,238,0.14)',
     borderWidth: 1,
-    borderColor: 'rgba(34,211,238,0.4)',
+    borderColor: 'rgba(34,211,238,0.55)',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -4206,10 +4525,17 @@ const styles = StyleSheet.create({
     backgroundColor: C.green,
     borderColor: C.green,
   },
+  // The glyph must flip with the background. On the idle pill the background is
+  // a 14% cyan tint over the dark row, so a dark glyph was invisible (1.02:1
+  // contrast). Idle therefore uses the bright accent, and only the filled green
+  // state uses dark ink.
   mediaPlayPillText: {
-    color: '#00212B',
+    color: C.accent,
     fontSize: 11,
     fontWeight: '900',
+  },
+  mediaPlayPillTextActive: {
+    color: '#00212B',
   },
   mediaMoreBtn: {
     marginTop: 10,

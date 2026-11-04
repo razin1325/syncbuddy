@@ -15,6 +15,9 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -203,6 +206,31 @@ class SyncNetworkModule(
     private var audioRecord: AudioRecord? = null
     private var isAudioBroadcasting = false
     private var audioBroadcasterThread: Thread? = null
+
+    // Walkie-talkie voice enhancement. Only the mic (voice) path is processed;
+    // music/system audio is passed through untouched so songs stay hi-fi.
+    private val voiceProcessor = com.syncbuddy.audio.WalkieTalkieNoiseProcessor(
+        sampleRate = SAMPLE_RATE,
+        frameSize = 512
+    )
+    @Volatile
+    private var voiceNoiseSuppressionEnabled = true
+    @Volatile
+    private var voiceNoiseSuppressionStrength = 0.75f
+
+    // Live measurement of how much noise the last frame removed, exposed to the UI.
+    @Volatile
+    private var lastNoiseReductionDb = 0f
+    @Volatile
+    private var lastVoiceInputRms = 0f
+    @Volatile
+    private var lastVoiceOutputRms = 0f
+    @Volatile
+    private var lastVoiceGain = 1f
+
+    // Platform audio effects, held so they are not garbage-collected mid-call.
+    private var platformAec: AcousticEchoCanceler? = null
+    private var platformNs: NoiseSuppressor? = null
 
     // Server State
     private var serverSocket: ServerSocket? = null
@@ -1972,17 +2000,59 @@ class SyncNetworkModule(
                     AudioFormat.ENCODING_PCM_16BIT
                 )
                 audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
                     Math.max(minBuf, 480 * 2 * 4)
                 )
 
+                // Some vendor ROMs refuse VOICE_COMMUNICATION when another app owns
+                // the voice call path, so fall back to the plain MIC source.
+                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                    try { audioRecord?.release() } catch (e: Exception) {}
+                    audioRecord = AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        SAMPLE_RATE,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        Math.max(minBuf, 480 * 2 * 4)
+                    )
+                }
+
                 if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                     promise.reject("ERR_MIC", "Microphone not initialized. Check permissions.")
                     return
                 }
+
+                // Configure the device's own AEC/NS where the hardware offers it.
+                // Our DSP still runs on top (vendors implement these weakly), but this
+                // catches speaker echo before it ever reaches our filters.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+                    audioRecord?.audioSource == MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                ) {
+                    val sessionId = audioRecord?.audioSessionId ?: 0
+                    if (sessionId != 0) {
+                        // Effects must be kept referenced or they are garbage collected.
+                        try {
+                            platformAec = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
+                        } catch (e: Exception) { platformAec = null }
+                        try {
+                            platformNs = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
+                        } catch (e: Exception) { platformNs = null }
+                        // We run our own AGC: the platform one fights the limiter.
+                        try {
+                            AutomaticGainControl.create(sessionId)?.enabled = false
+                        } catch (e: Exception) {}
+                    }
+                }
+
+                // Fresh transmission -> clear any state from the previous one.
+                try {
+                    voiceProcessor.enabled = voiceNoiseSuppressionEnabled
+                    voiceProcessor.strength = voiceNoiseSuppressionStrength
+                    voiceProcessor.reset()
+                } catch (e: Exception) {}
 
                 audioRecord?.startRecording()
 
@@ -2007,6 +2077,25 @@ class SyncNetworkModule(
                                     Thread.sleep(10)
                                     continue
                                 }
+
+                                // ── Walkie-talkie noise cancellation ──────────────
+                                // Runs on the raw mic PCM before it is packetised, so
+                                // the hiss/rumble never reaches the network at all.
+                                // Always call this (even when disabled) to keep the
+                                // sample count and stream timing consistent.
+                                try {
+                                    voiceProcessor.enabled = voiceNoiseSuppressionEnabled
+                                    voiceProcessor.strength = voiceNoiseSuppressionStrength
+                                    voiceProcessor.process(pcm, read)
+                                    lastNoiseReductionDb = voiceProcessor.lastSuppressionDb
+                                    lastVoiceInputRms = voiceProcessor.inputRms
+                                    lastVoiceOutputRms = voiceProcessor.outputRms
+                                    lastVoiceGain = voiceProcessor.currentGain
+                                } catch (e: Exception) {
+                                    // A DSP failure must never break the transmission.
+                                    android.util.Log.e("SyncNetwork", "Noise processor error: ${e.message}")
+                                }
+
                                 packetBuf[4] = ((seq shr 8) and 0xFF).toByte()
                                 packetBuf[5] = (seq and 0xFF).toByte()
                                 System.arraycopy(pcm, 0, packetBuf, 8, read)
@@ -2080,6 +2169,17 @@ class SyncNetworkModule(
         } catch (e: Exception) {}
         audioRecord = null
 
+        // Release the platform AEC/NS effects and clear DSP state for next time.
+        try { platformAec?.enabled = false; platformAec?.release() } catch (e: Exception) {}
+        try { platformNs?.enabled = false; platformNs?.release() } catch (e: Exception) {}
+        platformAec = null
+        platformNs = null
+        try { voiceProcessor.reset() } catch (e: Exception) {}
+        lastNoiseReductionDb = 0f
+        lastVoiceInputRms = 0f
+        lastVoiceOutputRms = 0f
+        lastVoiceGain = 1f
+
         // Also stop system audio capture service if running
         try {
             val context = reactApplicationContext
@@ -2093,6 +2193,64 @@ class SyncNetworkModule(
     fun stopAudioBroadcaster(promise: Promise) {
         stopAudioBroadcasterInternal()
         promise.resolve(true)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Walkie-Talkie noise cancellation controls
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Enables or disables voice noise cancellation.
+     * @param enabled  true = clean the mic signal (default).
+     * @param strength 0.0..1.0, how aggressively to remove noise (default 0.75).
+     */
+    @ReactMethod
+    fun setNoiseSuppression(enabled: Boolean, strength: Double, promise: Promise) {
+        try {
+            voiceNoiseSuppressionEnabled = enabled
+            voiceNoiseSuppressionStrength = strength.toFloat().coerceIn(0f, 1f)
+            voiceProcessor.enabled = enabled
+            voiceProcessor.strength = voiceNoiseSuppressionStrength
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_NS_CONFIG", e.message)
+        }
+    }
+
+    /** Current noise-suppression configuration. */
+    @ReactMethod
+    fun getNoiseSuppression(promise: Promise) {
+        try {
+            val map = Arguments.createMap()
+            map.putBoolean("enabled", voiceNoiseSuppressionEnabled)
+            map.putDouble("strength", voiceNoiseSuppressionStrength.toDouble())
+            promise.resolve(map)
+        } catch (e: Exception) {
+            promise.reject("ERR_NS_READ", e.message)
+        }
+    }
+
+    /**
+     * Live measurements from the voice enhancer, so the walkie-talkie UI can show
+     * a real noise-reduction meter instead of a fake animation.
+     */
+    @ReactMethod
+    fun getNoiseSuppressionStats(promise: Promise) {
+        try {
+            val map = Arguments.createMap()
+            map.putBoolean("enabled", voiceNoiseSuppressionEnabled)
+            map.putDouble("strength", voiceNoiseSuppressionStrength.toDouble())
+            map.putDouble("reductionDb", lastNoiseReductionDb.toDouble())
+            map.putDouble("inputLevel", lastVoiceInputRms.toDouble())
+            map.putDouble("outputLevel", lastVoiceOutputRms.toDouble())
+            map.putDouble("gain", lastVoiceGain.toDouble())
+            // 0..1 scale for a UI meter, derived from how much was removed.
+            val reduction = (lastNoiseReductionDb / 20.0).coerceIn(0.0, 1.0)
+            map.putDouble("reductionRatio", reduction)
+            promise.resolve(map)
+        } catch (e: Exception) {
+            promise.reject("ERR_NS_STATS", e.message)
+        }
     }
 
     private fun createStatusNotificationChannel() {
