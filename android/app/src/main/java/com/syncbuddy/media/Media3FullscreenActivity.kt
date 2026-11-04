@@ -492,10 +492,10 @@ class Media3FullscreenActivity : Activity() {
     }
 
     private fun releaseEffects() {
-        try { equalizer?.release() } catch (_: Exception) {}
-        try { bassBoost?.release() } catch (_: Exception) {}
-        try { virtualizer?.release() } catch (_: Exception) {}
-        try { reverb?.release() } catch (_: Exception) {}
+        try { equalizer?.release() } catch (e: Exception) {}
+        try { bassBoost?.release() } catch (e: Exception) {}
+        try { virtualizer?.release() } catch (e: Exception) {}
+        try { reverb?.release() } catch (e: Exception) {}
         equalizer = null
         bassBoost = null
         virtualizer = null
@@ -536,7 +536,7 @@ class Media3FullscreenActivity : Activity() {
                 val attrs = window.attributes
                 attrs.screenBrightness = previousBrightness
                 window.attributes = attrs
-            } catch (_: Exception) {}
+            } catch (e: Exception) {}
         }
         releaseEffects()
         playerView?.player = null
