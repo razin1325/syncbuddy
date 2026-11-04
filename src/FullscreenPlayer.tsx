@@ -19,6 +19,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
+  PanResponder,
   Platform,
   StyleSheet,
   Text,
@@ -438,7 +439,6 @@ function Slider({
     [min, range, onChange],
   );
 
-  const { PanResponder } = require('react-native');
   const responder = useMemo(
     () =>
       PanResponder.create({

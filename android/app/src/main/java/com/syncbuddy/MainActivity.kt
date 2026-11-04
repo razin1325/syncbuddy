@@ -33,13 +33,17 @@ class MainActivity : ReactActivity() {
         DefaultReactActivityDelegate(this, mainComponentName, fabricEnabled)
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+        super.onCreate(null)
         instance = this
     }
 
     override fun onDestroy() {
-        com.syncbuddy.network.SyncNetworkModule.dismissAllNotifications(this)
-        com.syncbuddy.media.Media3Manager.release()
+        try {
+            com.syncbuddy.network.SyncNetworkModule.dismissAllNotifications(this)
+            com.syncbuddy.media.Media3Manager.release()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
         instance = null
         super.onDestroy()
     }

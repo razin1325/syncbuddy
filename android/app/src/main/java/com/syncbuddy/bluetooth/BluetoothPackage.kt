@@ -19,16 +19,30 @@ class BluetoothPackage : ReactPackage {
 
     override fun createNativeModules(
         reactContext: ReactApplicationContext
-    ): List<NativeModule> = listOf(
-        BluetoothStateModule(reactContext),
-        AuracastModule(reactContext),
-        com.syncbuddy.network.SyncNetworkModule(reactContext)
-    )
+    ): List<NativeModule> {
+        return try {
+            listOf(
+                BluetoothStateModule(reactContext),
+                AuracastModule(reactContext),
+                com.syncbuddy.network.SyncNetworkModule(reactContext)
+            )
+        } catch (t: Throwable) {
+            android.util.Log.e("BluetoothPackage", "Error initializing native modules", t)
+            emptyList()
+        }
+    }
 
     override fun createViewManagers(
         reactContext: ReactApplicationContext
-    ): List<ViewManager<*, *>> = listOf(
-        com.syncbuddy.media.Media3PlayerViewManager()
-    )
+    ): List<ViewManager<*, *>> {
+        return try {
+            listOf(
+                com.syncbuddy.media.Media3PlayerViewManager()
+            )
+        } catch (t: Throwable) {
+            android.util.Log.e("BluetoothPackage", "Error initializing view managers", t)
+            emptyList()
+        }
+    }
 }
 

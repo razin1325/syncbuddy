@@ -29,8 +29,27 @@
 import React, { useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { Platform, StyleSheet, View, requireNativeComponent } from 'react-native';
 
-const NativeMedia3View: any =
-  Platform.OS === 'android' ? requireNativeComponent<any>('Media3PlayerView') : null;
+let _cachedMedia3View: any = null;
+function getNativeMedia3View(): any {
+  if (_cachedMedia3View === null) {
+    if (Platform.OS === 'android') {
+      try {
+        _cachedMedia3View = requireNativeComponent('Media3PlayerView');
+      } catch (err) {
+        console.warn('Could not load native Media3PlayerView:', err);
+        _cachedMedia3View = View;
+      }
+    } else {
+      _cachedMedia3View = View;
+    }
+  }
+  return _cachedMedia3View;
+}
+
+const SafeNativeMedia3View: React.FC<any> = (props) => {
+  const Comp = getNativeMedia3View();
+  return <Comp {...props} />;
+};
 
 /** Equaliser presets, in dB, applied per frequency band. */
 export interface EqPreset {
@@ -468,7 +487,7 @@ export default function VideoPlayer(p: Props) {
             : null}
         </>
       ) : (
-        <NativeMedia3View
+        <SafeNativeMedia3View
           style={StyleSheet.absoluteFill}
           uri={p.uri}
           isPlaying={p.isPlaying}

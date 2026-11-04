@@ -25,9 +25,7 @@ import {
   Image,
   PanResponder,
   PermissionsAndroid,
-  requireNativeComponent,
 } from 'react-native';
-const Media3PlayerView = Platform.OS === 'android' ? requireNativeComponent<any>('Media3PlayerView') : View;
 import VideoPlayer, { EQ_PRESETS, FX_PRESETS } from './VideoPlayer';
 import FullscreenPlayer from './FullscreenPlayer';
 import {
@@ -560,9 +558,54 @@ const NowPlayingSheet: React.FC<{
   );
 };
 
+// ─── Error Boundary ─────────────────────────────────────────────────────────
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error?: Error;
+}
+
+class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, ErrorBoundaryState> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: any) {
+    console.error('RootErrorBoundary caught error:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <SafeAreaView style={{ flex: 1, backgroundColor: '#050811', justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+          <Text style={{ color: '#06B6D4', fontSize: 24, fontWeight: 'bold', marginBottom: 12 }}>SyncBuddy</Text>
+          <Text style={{ color: '#F43F5E', fontSize: 16, textAlign: 'center', marginBottom: 16 }}>
+            Something went wrong while loading the interface.
+          </Text>
+          <Text style={{ color: '#94A3B8', fontSize: 12, textAlign: 'center', marginBottom: 24 }}>
+            {this.state.error?.message || 'Unknown initialization error'}
+          </Text>
+          <TouchableOpacity
+            style={{ backgroundColor: '#06B6D4', paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8 }}
+            onPress={() => this.setState({ hasError: false })}
+          >
+            <Text style={{ color: '#050811', fontWeight: 'bold' }}>Try Again</Text>
+          </TouchableOpacity>
+        </SafeAreaView>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // ─── Main Application ─────────────────────────────────────────────────────────
 
-export default function App(): React.JSX.Element {
+function MainApp(): React.JSX.Element {
   // Navigation State
   const [activePage, setActivePage] = useState<NavigationPage>('host');
 
@@ -4855,3 +4898,11 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
 });
+
+export default function App(): React.JSX.Element {
+  return (
+    <RootErrorBoundary>
+      <MainApp />
+    </RootErrorBoundary>
+  );
+}
