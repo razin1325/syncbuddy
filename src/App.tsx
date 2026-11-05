@@ -3013,7 +3013,7 @@ function MainApp(): React.JSX.Element {
       )}
 
       <NowPlayingSheet
-        visible={showPlayer}
+        visible={showPlayer && currentMedia?.type !== 'video'}
         item={currentMedia}
         isPlaying={isMediaPlaying}
         position={playbackPos}

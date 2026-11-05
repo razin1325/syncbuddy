@@ -3,6 +3,13 @@
  *
  * Professional Media Player Capabilities:
  *   • True 100% Immersive Fullscreen (Hides system status bar & navigation pill via IMMERSIVE_STICKY)
+ *   • Auto-Rotate Support (Phone sensor dynamically flips between Portrait and Landscape)
+ *   • Portrait Layout matches VLC Mobile:
+ *       - Clean pure black canvas (#000000)
+ *       - Centered video in natural aspect ratio (RESIZE_MODE_FIT)
+ *       - Top centered title
+ *       - Bottom scrubber with elapsed (0:06) & remaining (- 2:27:25) time
+ *       - Bottom icon row: [🔲 Aspect] [📱🔄 Auto-Rotate] ( ⏸ / ▶ ) [⛶ Fullscreen] [••• More]
  *   • VLC-style Gestures:
  *       - Swipe UP/DOWN on RIGHT half: Controls Screen Brightness (0% to 100%) with real-time HUD
  *       - Swipe UP/DOWN on LEFT half: Controls Media Volume (0% to 100%) with real-time HUD
@@ -11,12 +18,9 @@
  *   • Double Tap Left/Right: Fast ±10s seeking with visual indicator
  *   • Auto-hide controls after 3.5s of inactivity while playing
  *   • Aspect Ratio Modes:
- *       - 🔳 Zoom (Fill Screen): Fills 100% of phone display without letterbox black bars
- *       - 🔲 Fit: Original video aspect ratio with clean bars
+ *       - 🔲 Fit: Original video aspect ratio (no cropping, centered)
+ *       - 🔳 Zoom (Fill Screen): Fills 100% of display without letterbox black bars
  *       - ↔️ Stretch: 100% stretch
- *   • Dedicated 🔄 Rotate Button: Effortlessly flips between Portrait and Landscape
- *   • Top Bar: Back button, Title, 🔄 Rotate, 🔳 Fill/Fit, 🎚 Sound FX
- *   • Bottom Bar: Current time, Interactive Scrubber, Duration, Prev/Next, Rotate
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -33,7 +37,6 @@ import {
 } from 'react-native';
 import VideoPlayer, {
   EQ_PRESETS,
-  FX_PRESETS,
   VideoPlayerHandle,
 } from './VideoPlayer';
 import { NativeNetwork } from './NativeNetwork';
@@ -49,6 +52,8 @@ const C = {
   accent: '#06B6D4',
   accentGlow: 'rgba(6, 182, 212, 0.40)',
   amber: '#F59E0B',
+  vlcOrange: '#FF6E00',
+  vlcOrangeGlow: 'rgba(255, 110, 0, 0.45)',
 };
 
 const fmt = (s: number) => {
@@ -88,11 +93,14 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   const playerRef = useRef<VideoPlayerHandle | null>(null);
   const [chromeVisible, setChromeVisible] = useState(true);
 
-  // Default to 'zoom' in landscape for true edge-to-edge fill without black bars
-  const [resizeMode, setResizeMode] = useState<'fit' | 'zoom' | 'fill'>('zoom');
+  // Resize mode: In portrait, default to 'fit' (original centered ratio); in landscape, 'zoom' (fill screen)
+  const [resizeMode, setResizeMode] = useState<'fit' | 'zoom' | 'fill'>('fit');
   const [panel, setPanel] = useState<'none' | 'sound'>('none');
   const [eqPreset, setEqPreset] = useState('flat');
-  const [fxPreset, setFxPreset] = useState('off');
+  const [showRemainingTime, setShowRemainingTime] = useState(true);
+
+  // Orientation mode: 'auto' (phone sensor), 'landscape', 'portrait'
+  const [orientationMode, setOrientationMode] = useState<'auto' | 'landscape' | 'portrait'>('auto');
 
   // VLC Gesture state
   const [volume, setVolume] = useState(0.85);
@@ -101,7 +109,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   const [seekPreviewSec, setSeekPreviewSec] = useState<number>(0);
   const [seekDeltaSec, setSeekDeltaSec] = useState<number>(0);
 
-  // Quick feedback badge (e.g. "+10s" / "🔄 Landscape")
+  // Quick feedback badge (e.g. "+10s" / "📱🔄 Auto-Rotate ON")
   const [quickBadge, setQuickBadge] = useState<{ text: string; side: 'left' | 'right' | 'center' } | null>(null);
 
   const [livePos, setLivePos] = useState(0);
@@ -128,6 +136,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
 
   const pos = livePos > 0 ? livePos : p.position;
   const dur = liveDur > 0 ? liveDur : p.duration;
+  const remainingSec = Math.max(0, dur - pos);
   const pct = dur > 0 ? Math.min(1, Math.max(0, pos / dur)) : 0;
 
   // Clear hide timer
@@ -183,7 +192,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
     setQuickBadge({ text, side });
     badgeTimer.current = setTimeout(() => {
       setQuickBadge(null);
-    }, 900);
+    }, 1100);
   }, []);
 
   // Relative seek (±10s)
@@ -195,11 +204,29 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
     showControls();
   }, [dur, pos, p, showControls]);
 
-  // Toggle Screen Orientation between Landscape and Portrait
-  const toggleOrientation = useCallback(async () => {
+  // Toggle Auto-Rotate vs Manual Lock
+  const toggleAutoRotate = useCallback(async () => {
+    if (orientationMode === 'auto') {
+      // Lock to current orientation
+      const current = isLandscape ? 'landscape' : 'portrait';
+      setOrientationMode(current);
+      await NativeNetwork.setScreenOrientation(current);
+      showQuickBadge(isLandscape ? '🔒 Landscape Locked' : '🔒 Portrait Locked', 'center');
+    } else {
+      // Re-enable phone sensor auto-rotation
+      setOrientationMode('auto');
+      await NativeNetwork.setScreenOrientation('auto');
+      showQuickBadge('📱🔄 Auto-Rotate ON (Phone Sensor)', 'center');
+    }
+    showControls();
+  }, [orientationMode, isLandscape, showQuickBadge, showControls]);
+
+  // Force flip between Landscape and Portrait
+  const toggleFlipOrientation = useCallback(async () => {
     const next = isLandscape ? 'portrait' : 'landscape';
+    setOrientationMode(next);
     await NativeNetwork.setScreenOrientation(next);
-    showQuickBadge(next === 'landscape' ? '🔄 Landscape Mode' : '🔄 Portrait Mode', 'center');
+    showQuickBadge(next === 'landscape' ? '🔄 Landscape Mode' : '📱 Portrait Mode', 'center');
     showControls();
   }, [isLandscape, showQuickBadge, showControls]);
 
@@ -216,15 +243,18 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   useEffect(() => {
     Animated.timing(fade, {
       toValue: chromeVisible ? 1 : 0,
-      duration: 220,
+      duration: 200,
       useNativeDriver: Platform.OS !== 'web',
     }).start();
   }, [chromeVisible, fade]);
 
-  // Enable Android Immersive Sticky Fullscreen on open
+  // Enable Android Immersive Fullscreen and Phone Sensor Auto-Orientation on open
   useEffect(() => {
     if (p.visible) {
       NativeNetwork.setImmersiveFullscreen(true).catch(() => {});
+      // Auto-orient based on phone hardware sensor ("phone gurale roted hobe")
+      NativeNetwork.setScreenOrientation('auto').catch(() => {});
+      setOrientationMode('auto');
       setChromeVisible(true);
       setPanel('none');
       setLivePos(0);
@@ -413,15 +443,16 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   // Cycle aspect ratio
   const cycleResizeMode = () => {
     setResizeMode(curr => {
-      if (curr === 'zoom') return 'fit';
-      if (curr === 'fit') return 'fill';
-      return 'zoom';
+      const next = curr === 'fit' ? 'zoom' : curr === 'zoom' ? 'fill' : 'fit';
+      const label = next === 'fit' ? '🔲 Original (Fit)' : next === 'zoom' ? '🔳 Fill Screen' : '↔️ Stretch';
+      showQuickBadge(label, 'center');
+      return next;
     });
     showControls();
   };
 
   const resizeModeLabel =
-    resizeMode === 'zoom' ? '🔳 Fill Screen' : resizeMode === 'fit' ? '🔲 Original (Fit)' : '↔️ Stretch';
+    resizeMode === 'zoom' ? '🔳 Fill' : resizeMode === 'fit' ? '🔲 Fit' : '↔️ Stretch';
 
   if (!p.visible) return null;
 
@@ -446,7 +477,6 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
           volume={volume}
           muted={false}
           eqPreset={eqPreset}
-          fxPreset={fxPreset}
           resizeMode={resizeMode}
           onDuration={d => setLiveDur(d)}
           onProgress={(t, d) => {
@@ -462,7 +492,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
 
       {/* ── 2. Full-surface VLC Gesture Capture Layer ───────────────────────── */}
       <View style={StyleSheet.absoluteFill} {...panResponder.panHandlers}>
-        {/* Double-tap ripple badge */}
+        {/* Quick feedback badge (e.g. "+10s" / "📱🔄 Auto-Rotate ON") */}
         {quickBadge && (
           <View
             style={[
@@ -519,19 +549,19 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
         )}
       </View>
 
-      {/* ── 4. Floating Overlay Controls ───────────────────────────────────── */}
+      {/* ── 4. Floating Overlay Controls (VLC / MX Player Style) ─────────────── */}
       {chromeVisible && (
         <Animated.View
           style={[StyleSheet.absoluteFill, { opacity: fade }]}
           pointerEvents="box-none">
 
-          {/* ── Top Bar Scrim ── */}
+          {/* ── Top Bar: Back Button & Centered Title (matches screenshot) ── */}
           <View
             style={[
               styles.topBar,
               {
-                paddingTop: isLandscape ? 12 : (Platform.OS === 'android' ? 36 : 46),
-                paddingHorizontal: isLandscape ? 28 : 16,
+                paddingTop: isLandscape ? 14 : (Platform.OS === 'android' ? 36 : 46),
+                paddingHorizontal: isLandscape ? 24 : 16,
               },
             ]}>
             <TouchableOpacity
@@ -545,52 +575,47 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
               <Text style={styles.titleText} numberOfLines={1}>
                 {p.title}
               </Text>
-              <Text style={styles.subtitleText} numberOfLines={1}>
-                {p.subtitle || 'VLC Gesture Player • Left: Vol | Right: Bri'}
-              </Text>
+              {p.subtitle ? (
+                <Text style={styles.subtitleText} numberOfLines={1}>
+                  {p.subtitle}
+                </Text>
+              ) : null}
             </View>
 
-            {/* 🔄 Rotate Screen Button */}
+            {/* Quick Auto-Rotate status badge indicator in top right */}
             <TouchableOpacity
-              style={[styles.chipBtn, styles.rotateChipBtn]}
-              onPress={toggleOrientation}
-              hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}>
-              <Text style={styles.rotateChipText}>
-                🔄 {isLandscape ? 'Portrait' : 'Rotate'}
+              style={[
+                styles.topBadgeBtn,
+                orientationMode === 'auto' && styles.topBadgeBtnActive,
+              ]}
+              onPress={toggleAutoRotate}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+              <Text style={styles.topBadgeText}>
+                {orientationMode === 'auto' ? '📱🔄 Auto' : isLandscape ? '🔄 Land' : '📱 Port'}
               </Text>
-            </TouchableOpacity>
-
-            {/* Aspect Ratio Toggle (Fill Screen / Original Fit) */}
-            <TouchableOpacity
-              style={[styles.chipBtn, resizeMode === 'zoom' && styles.chipBtnActive]}
-              onPress={cycleResizeMode}
-              hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}>
-              <Text style={[styles.chipBtnText, resizeMode === 'zoom' && styles.chipBtnTextActive]}>
-                {resizeModeLabel}
-              </Text>
-            </TouchableOpacity>
-
-            {/* Sound FX Toggle */}
-            <TouchableOpacity
-              style={[styles.iconBtn, panel === 'sound' && styles.iconBtnOn]}
-              onPress={() => {
-                setPanel(curr => (curr === 'sound' ? 'none' : 'sound'));
-                showControls();
-              }}
-              hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}>
-              <Text style={styles.iconBtnText}>🎚</Text>
             </TouchableOpacity>
           </View>
 
-          {/* Sound / Equalizer Drawer (when open) */}
+          {/* Sound / Equalizer Drawer (when opened via •••) */}
           {panel === 'sound' && (
             <View
               style={[
                 styles.soundDrawer,
-                { marginHorizontal: isLandscape ? 60 : 16 },
+                {
+                  left: isLandscape ? '20%' : 16,
+                  right: isLandscape ? '20%' : 16,
+                  bottom: isLandscape ? 90 : 120,
+                },
               ]}>
               <View style={styles.drawerHeader}>
-                <Text style={styles.drawerTitle}>Sound Effects & EQ</Text>
+                <Text style={styles.drawerTitle}>Sound & Audio FX</Text>
+                <TouchableOpacity onPress={() => setPanel('none')}>
+                  <Text style={styles.drawerClose}>✕</Text>
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.drawerRow}>
+                <Text style={styles.drawerLabel}>Volume: {Math.round(volume * 100)}%</Text>
                 <TouchableOpacity onPress={() => setVolume(v => (v > 0 ? 0 : 0.85))}>
                   <Text style={styles.muteBtnText}>{volume === 0 ? '🔇 Unmute' : '🔊 Mute'}</Text>
                 </TouchableOpacity>
@@ -615,50 +640,19 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
             </View>
           )}
 
-          {/* ── Center Quick Controls (⏪ 10s, Play/Pause, 10s ⏩) ── */}
-          <View style={styles.centerRow} pointerEvents="box-none">
-            <TouchableOpacity
-              style={styles.centerSkipBtn}
-              onPress={() => seekRelative(-10)}
-              activeOpacity={0.75}
-              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-              <Text style={styles.centerSkipIcon}>⏪</Text>
-              <Text style={styles.centerSkipText}>-10s</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.centerPlayBtn}
-              onPress={() => {
-                p.onTogglePlay();
-                showControls();
-              }}
-              activeOpacity={0.85}
-              hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}>
-              <Text style={styles.centerPlayIcon}>{p.isPlaying ? '⏸' : '▶'}</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.centerSkipBtn}
-              onPress={() => seekRelative(10)}
-              activeOpacity={0.75}
-              hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-              <Text style={styles.centerSkipIcon}>⏩</Text>
-              <Text style={styles.centerSkipText}>+10s</Text>
-            </TouchableOpacity>
-          </View>
-
-          {/* ── Bottom Bar Scrim (Scrubber, Timestamps, Playlist Nav, Rotate) ── */}
+          {/* ── Bottom Section: Scrubber + VLC Control Buttons ── */}
           <View
             style={[
               styles.bottomBar,
               {
-                paddingBottom: isLandscape ? 14 : 26,
+                paddingBottom: isLandscape ? 14 : (Platform.OS === 'android' ? 24 : 32),
                 paddingHorizontal: isLandscape ? 28 : 16,
               },
             ]}>
-            {/* Scrubber row with live elapsed and total duration */}
+            {/* Scrubber row: Elapsed (0:06) ── [Slider with Orange Knob] ── Remaining (- 2:27:25) */}
             <View style={styles.scrubberRow}>
               <Text style={styles.timeLabel}>{fmt(pos)}</Text>
+
               <View style={styles.sliderFlex}>
                 <Slider
                   value={pct}
@@ -678,53 +672,88 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
                   }}
                 />
               </View>
-              <Text style={styles.timeLabel}>{fmt(dur)}</Text>
+
+              <TouchableOpacity
+                onPress={() => setShowRemainingTime(v => !v)}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <Text style={styles.timeLabel}>
+                  {showRemainingTime ? `- ${fmt(remainingSec)}` : fmt(dur)}
+                </Text>
+              </TouchableOpacity>
             </View>
 
-            {/* Bottom buttons row */}
-            <View style={styles.bottomButtonsRow}>
-              <View style={styles.bottomNavLeft}>
-                {p.hasPrev ? (
-                  <TouchableOpacity
-                    style={styles.navBtn}
-                    onPress={() => {
-                      p.onPrev?.();
-                      showControls();
-                    }}>
-                    <Text style={styles.navBtnText}>⏮ Prev</Text>
-                  </TouchableOpacity>
-                ) : null}
+            {/* VLC 5-Icon Controls Bar (matches media_1793899235471_98a35099.jpg) */}
+            <View style={styles.vlcIconsRow}>
+              {/* 1. Subtitle / Aspect Mode Button */}
+              <TouchableOpacity
+                style={styles.vlcIconBtn}
+                onPress={cycleResizeMode}
+                activeOpacity={0.7}
+                hitSlop={{ top: 12, bottom: 12, left: 10, right: 10 }}>
+                <Text style={styles.vlcIconEmoji}>
+                  {resizeMode === 'zoom' ? '🔳' : resizeMode === 'fill' ? '↔️' : '🔲'}
+                </Text>
+                <Text style={styles.vlcIconSub}>{resizeModeLabel}</Text>
+              </TouchableOpacity>
 
-                {p.hasNext ? (
-                  <TouchableOpacity
-                    style={[styles.navBtn, { marginLeft: 8 }]}
-                    onPress={() => {
-                      p.onNext?.();
-                      showControls();
-                    }}>
-                    <Text style={styles.navBtnText}>Next ⏭</Text>
-                  </TouchableOpacity>
-                ) : null}
-              </View>
+              {/* 2. Auto-Rotate / Lock Button */}
+              <TouchableOpacity
+                style={[
+                  styles.vlcIconBtn,
+                  orientationMode === 'auto' && styles.vlcIconBtnActive,
+                ]}
+                onPress={toggleAutoRotate}
+                activeOpacity={0.7}
+                hitSlop={{ top: 12, bottom: 12, left: 10, right: 10 }}>
+                <Text style={styles.vlcIconEmoji}>
+                  {orientationMode === 'auto' ? '📱🔄' : '🔒'}
+                </Text>
+                <Text style={[styles.vlcIconSub, orientationMode === 'auto' && { color: C.accent }]}>
+                  {orientationMode === 'auto' ? 'Auto' : 'Locked'}
+                </Text>
+              </TouchableOpacity>
 
-              <View style={styles.bottomNavRight}>
-                {/* Bottom 🔄 Rotate Button */}
-                <TouchableOpacity
-                  style={[styles.navBtn, styles.bottomRotateBtn]}
-                  onPress={toggleOrientation}>
-                  <Text style={styles.bottomRotateText}>
-                    🔄 {isLandscape ? 'Portrait' : 'Rotate'}
-                  </Text>
-                </TouchableOpacity>
+              {/* 3. CENTER: Large Circular Play / Pause Button (like VLC) */}
+              <TouchableOpacity
+                style={styles.vlcCenterPlayBtn}
+                onPress={() => {
+                  p.onTogglePlay();
+                  showControls();
+                }}
+                activeOpacity={0.85}
+                hitSlop={{ top: 14, bottom: 14, left: 14, right: 14 }}>
+                <Text style={styles.vlcCenterPlayIcon}>
+                  {p.isPlaying ? '⏸' : '▶'}
+                </Text>
+              </TouchableOpacity>
 
-                <TouchableOpacity
-                  style={[styles.navBtn, resizeMode === 'zoom' && styles.bottomFillBtnActive]}
-                  onPress={cycleResizeMode}>
-                  <Text style={[styles.navBtnText, resizeMode === 'zoom' && { color: C.accent, fontWeight: '700' }]}>
-                    {resizeModeLabel}
-                  </Text>
-                </TouchableOpacity>
-              </View>
+              {/* 4. Fullscreen / Landscape Flip Button */}
+              <TouchableOpacity
+                style={styles.vlcIconBtn}
+                onPress={toggleFlipOrientation}
+                activeOpacity={0.7}
+                hitSlop={{ top: 12, bottom: 12, left: 10, right: 10 }}>
+                <Text style={styles.vlcIconEmoji}>⛶</Text>
+                <Text style={styles.vlcIconSub}>
+                  {isLandscape ? 'Portrait' : 'Landscape'}
+                </Text>
+              </TouchableOpacity>
+
+              {/* 5. More Options Button (Sound FX / EQ) */}
+              <TouchableOpacity
+                style={[
+                  styles.vlcIconBtn,
+                  panel === 'sound' && styles.vlcIconBtnActive,
+                ]}
+                onPress={() => {
+                  setPanel(curr => (curr === 'sound' ? 'none' : 'sound'));
+                  showControls();
+                }}
+                activeOpacity={0.7}
+                hitSlop={{ top: 12, bottom: 12, left: 10, right: 10 }}>
+                <Text style={styles.vlcIconEmoji}>•••</Text>
+                <Text style={styles.vlcIconSub}>Sound</Text>
+              </TouchableOpacity>
             </View>
           </View>
         </Animated.View>
@@ -735,6 +764,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
 
 /**
  * High-performance, cross-platform touch scrubber built with PanResponder.
+ * Features an orange circular knob matching VLC player in user screenshot.
  */
 function Slider({
   value,
@@ -803,7 +833,7 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
 
-  // ── Top Bar ────────────────────────────────────────────────────────────────
+  // ── Top Bar (Clean, centered title matching VLC) ───────────────────────────
   topBar: {
     position: 'absolute',
     top: 0,
@@ -811,15 +841,15 @@ const styles = StyleSheet.create({
     right: 0,
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.70)',
+    backgroundColor: 'rgba(0, 0, 0, 0.65)',
     paddingBottom: 14,
     zIndex: 20,
   },
   backBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: 'rgba(255, 255, 255, 0.12)',
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.14)',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -831,111 +861,38 @@ const styles = StyleSheet.create({
   },
   titleArea: {
     flex: 1,
-    marginHorizontal: 12,
+    marginHorizontal: 14,
+    alignItems: 'center',
   },
   titleText: {
     color: '#FFFFFF',
-    fontSize: 15,
+    fontSize: 16,
     fontWeight: '700',
-    letterSpacing: 0.2,
+    letterSpacing: 0.3,
+    textAlign: 'center',
   },
   subtitleText: {
     color: C.textMute,
     fontSize: 11,
     marginTop: 2,
+    textAlign: 'center',
   },
-  chipBtn: {
-    backgroundColor: 'rgba(255, 255, 255, 0.14)',
-    paddingHorizontal: 12,
-    paddingVertical: 7,
-    borderRadius: 16,
+  topBadgeBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255, 255, 255, 0.12)',
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.16)',
-    marginRight: 8,
+    borderColor: 'rgba(255, 255, 255, 0.18)',
   },
-  chipBtnActive: {
-    backgroundColor: 'rgba(6, 182, 212, 0.25)',
-    borderColor: C.accent,
-  },
-  chipBtnText: {
-    color: '#FFFFFF',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  chipBtnTextActive: {
-    color: C.accent,
-  },
-  rotateChipBtn: {
+  topBadgeBtnActive: {
     backgroundColor: 'rgba(6, 182, 212, 0.22)',
     borderColor: C.accent,
   },
-  rotateChipText: {
-    color: C.accent,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  iconBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
-    backgroundColor: 'rgba(255, 255, 255, 0.12)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  iconBtnOn: {
-    backgroundColor: C.accent,
-  },
-  iconBtnText: {
-    fontSize: 16,
-  },
-
-  // ── Center Controls ────────────────────────────────────────────────────────
-  centerRow: {
-    ...StyleSheet.absoluteFillObject,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 10,
-  },
-  centerPlayBtn: {
-    width: 76,
-    height: 76,
-    borderRadius: 38,
-    backgroundColor: C.accent,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginHorizontal: 36,
-    shadowColor: C.accent,
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.6,
-    shadowRadius: 16,
-    elevation: 8,
-  },
-  centerPlayIcon: {
-    color: '#050811',
-    fontSize: 34,
-    fontWeight: '900',
-    marginLeft: 3,
-  },
-  centerSkipBtn: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: 'rgba(0, 0, 0, 0.65)',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.18)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  centerSkipIcon: {
-    fontSize: 18,
+  topBadgeText: {
     color: '#FFFFFF',
-  },
-  centerSkipText: {
-    color: '#CBD5E1',
-    fontSize: 10,
+    fontSize: 11,
     fontWeight: '700',
-    marginTop: 2,
   },
 
   // ── VLC Gesture Visual HUDs ────────────────────────────────────────────────
@@ -1018,11 +975,11 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
 
-  // Quick Double-tap Badge
+  // Quick Double-tap / Orientation Badge
   quickBadgeBox: {
     position: 'absolute',
     top: '38%',
-    backgroundColor: 'rgba(0, 0, 0, 0.85)',
+    backgroundColor: 'rgba(0, 0, 0, 0.88)',
     paddingHorizontal: 22,
     paddingVertical: 14,
     borderRadius: 24,
@@ -1039,86 +996,94 @@ const styles = StyleSheet.create({
     right: '12%',
   },
   quickBadgeCenter: {
-    left: '28%',
-    right: '28%',
+    left: '20%',
+    right: '20%',
   },
   quickBadgeText: {
-    color: C.accent,
-    fontSize: 16,
+    color: '#FFFFFF',
+    fontSize: 15,
     fontWeight: '800',
     textAlign: 'center',
   },
 
-  // ── Bottom Bar ─────────────────────────────────────────────────────────────
+  // ── Bottom Section (VLC Style) ─────────────────────────────────────────────
   bottomBar: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: 'rgba(0, 0, 0, 0.70)',
+    backgroundColor: 'rgba(0, 0, 0, 0.75)',
     paddingTop: 12,
     zIndex: 20,
   },
   scrubberRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 8,
+    marginBottom: 10,
   },
   sliderFlex: {
     flex: 1,
-    marginHorizontal: 10,
+    marginHorizontal: 12,
   },
   timeLabel: {
-    color: '#E2E8F0',
-    fontSize: 12,
+    color: '#FFFFFF',
+    fontSize: 13,
     fontWeight: '600',
     fontVariant: ['tabular-nums'],
-    minWidth: 46,
+    minWidth: 54,
     textAlign: 'center',
   },
-  bottomButtonsRow: {
+
+  // ── VLC 5-Icon Controls Bar ────────────────────────────────────────────────
+  vlcIconsRow: {
     flexDirection: 'row',
+    alignItems: 'center',
     justifyContent: 'space-between',
-    alignItems: 'center',
-    marginTop: 4,
+    paddingHorizontal: 10,
+    marginTop: 2,
   },
-  bottomNavLeft: {
-    flexDirection: 'row',
+  vlcIconBtn: {
+    width: 60,
     alignItems: 'center',
-  },
-  bottomNavRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  navBtn: {
-    backgroundColor: 'rgba(255, 255, 255, 0.10)',
-    paddingHorizontal: 12,
+    justifyContent: 'center',
     paddingVertical: 6,
-    borderRadius: 14,
+    borderRadius: 12,
   },
-  bottomFillBtnActive: {
-    backgroundColor: 'rgba(6, 182, 212, 0.20)',
-    borderColor: C.accent,
-    borderWidth: 1,
+  vlcIconBtnActive: {
+    backgroundColor: 'rgba(6, 182, 212, 0.16)',
   },
-  navBtnText: {
-    color: '#F1F5F9',
-    fontSize: 12,
+  vlcIconEmoji: {
+    fontSize: 22,
+    color: '#FFFFFF',
+    textAlign: 'center',
+  },
+  vlcIconSub: {
+    color: C.textDim,
+    fontSize: 10,
     fontWeight: '600',
-  },
-  bottomRotateBtn: {
-    backgroundColor: 'rgba(6, 182, 212, 0.20)',
-    borderColor: C.accent,
-    borderWidth: 1,
-    marginRight: 8,
-  },
-  bottomRotateText: {
-    color: C.accent,
-    fontSize: 12,
-    fontWeight: '700',
+    marginTop: 3,
+    textAlign: 'center',
   },
 
-  // ── Slider ─────────────────────────────────────────────────────────────────
+  // Big VLC Center Play/Pause Button
+  vlcCenterPlayBtn: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  vlcCenterPlayIcon: {
+    color: '#FFFFFF',
+    fontSize: 26,
+    fontWeight: '900',
+    lineHeight: 28,
+  },
+
+  // ── Slider with Orange Knob (matching VLC reference) ──────────────────────
   sliderHitBox: {
     height: 36,
     justifyContent: 'center',
@@ -1134,7 +1099,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     height: 4,
     borderRadius: 2,
-    backgroundColor: C.accent,
+    backgroundColor: C.vlcOrange,
     top: 16,
     left: 0,
   },
@@ -1144,47 +1109,61 @@ const styles = StyleSheet.create({
     width: 16,
     height: 16,
     borderRadius: 8,
-    backgroundColor: '#FFFFFF',
-    borderWidth: 2,
-    borderColor: C.accent,
+    backgroundColor: C.vlcOrange,
     marginLeft: -8,
-    shadowColor: '#000',
+    shadowColor: C.vlcOrange,
     shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.5,
-    shadowRadius: 2,
+    shadowOpacity: 0.6,
+    shadowRadius: 3,
     elevation: 4,
   },
 
   // ── Sound Drawer ───────────────────────────────────────────────────────────
   soundDrawer: {
     position: 'absolute',
-    top: 90,
-    backgroundColor: 'rgba(15, 23, 42, 0.95)',
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.15)',
-    padding: 16,
+    backgroundColor: 'rgba(15, 23, 42, 0.96)',
+    borderRadius: 18,
+    borderWidth: 1.5,
+    borderColor: 'rgba(255, 255, 255, 0.18)',
+    padding: 18,
     zIndex: 25,
   },
   drawerHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 10,
+    marginBottom: 12,
   },
   drawerTitle: {
     color: '#FFFFFF',
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: '700',
+  },
+  drawerClose: {
+    color: C.textMute,
+    fontSize: 18,
+    fontWeight: '700',
+    padding: 4,
+  },
+  drawerRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 14,
+  },
+  drawerLabel: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '600',
   },
   muteBtnText: {
     color: C.accent,
     fontSize: 12,
-    fontWeight: '600',
+    fontWeight: '700',
   },
   drawerSectionLabel: {
     color: C.textMute,
-    fontSize: 10,
+    fontSize: 11,
     fontWeight: '800',
     letterSpacing: 1,
     marginBottom: 8,
@@ -1196,8 +1175,8 @@ const styles = StyleSheet.create({
   },
   eqChip: {
     backgroundColor: 'rgba(255, 255, 255, 0.08)',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: 'rgba(255, 255, 255, 0.10)',
@@ -1208,7 +1187,7 @@ const styles = StyleSheet.create({
   },
   eqChipText: {
     color: C.textDim,
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '600',
   },
   eqChipTextActive: {

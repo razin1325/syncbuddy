@@ -1887,7 +1887,7 @@ class SyncNetworkModule(
                         when (orientation.lowercase()) {
                             "landscape" -> activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                             "portrait" -> activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                            "sensor" -> activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR
+                            "sensor", "fullsensor", "auto" -> activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
                             else -> activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                         }
                         promise.resolve(true)

@@ -614,7 +614,7 @@ export const NativeNetwork = {
    * Programmatically force screen orientation between Landscape and Portrait.
    */
   async setScreenOrientation(
-    orientation: 'landscape' | 'portrait' | 'sensor' | 'unspecified'
+    orientation: 'landscape' | 'portrait' | 'sensor' | 'fullsensor' | 'auto' | 'unspecified' | string
   ): Promise<boolean> {
     if (Platform.OS === 'android' && SyncNetworkModule?.setScreenOrientation) {
       try {
