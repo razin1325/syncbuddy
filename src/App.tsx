@@ -380,6 +380,7 @@ const SeekBar: React.FC<{
   durationRef.current = duration;
   const seekRef = useRef(onSeek);
   seekRef.current = onSeek;
+  const currentDragFrac = useRef(0);
   const startFrac = useRef(0);
 
   const responder = useMemo(
@@ -389,19 +390,25 @@ const SeekBar: React.FC<{
         onMoveShouldSetPanResponder: () => true,
         onPanResponderGrant: e => {
           const w = widthRef.current || 1;
-          const f = Math.min(1, Math.max(0, e.nativeEvent.locationX / w));
+          const touchX = Math.max(0, Math.min(w, e.nativeEvent.locationX));
+          const f = w > 0 ? touchX / w : 0;
           startFrac.current = f;
+          currentDragFrac.current = f;
           setDrag(f);
         },
         onPanResponderMove: (_e, g) => {
           const w = widthRef.current || 1;
-          setDrag(Math.min(1, Math.max(0, startFrac.current + g.dx / w)));
-        },
-        onPanResponderRelease: (_e, g) => {
-          const w = widthRef.current || 1;
           const f = Math.min(1, Math.max(0, startFrac.current + g.dx / w));
+          currentDragFrac.current = f;
+          setDrag(f);
+        },
+        onPanResponderRelease: () => {
+          const dur = durationRef.current;
+          const finalFrac = currentDragFrac.current;
           setDrag(null);
-          if (durationRef.current > 0) seekRef.current(f * durationRef.current);
+          if (dur > 0 && Number.isFinite(finalFrac)) {
+            seekRef.current(Math.max(0, Math.min(dur, finalFrac * dur)));
+          }
         },
         onPanResponderTerminate: () => setDrag(null),
       }),
@@ -416,10 +423,10 @@ const SeekBar: React.FC<{
       style={styles.seekBarHit}
       onLayout={e => setWidth(e.nativeEvent.layout.width)}
       {...responder.panHandlers}>
-      <View style={styles.seekTrack}>
-        <View style={[styles.seekFill, { width: `${frac * 100}%` }]} />
+      <View style={styles.seekTrack} pointerEvents="none">
+        <View style={[styles.seekFill, { width: `${frac * 100}%` }]} pointerEvents="none" />
       </View>
-      <View style={[styles.seekKnob, { left: Math.max(0, frac * width - 7) }]} />
+      <View style={[styles.seekKnob, { left: Math.max(0, frac * width - 7) }]} pointerEvents="none" />
     </View>
   );
 };

@@ -115,6 +115,8 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   const [livePos, setLivePos] = useState(0);
   const [liveDur, setLiveDur] = useState(0);
   const [dragging, setDragging] = useState(false);
+  const draggingRef = useRef(false);
+  draggingRef.current = dragging;
 
   const hideTimer = useRef<any>(null);
   const hudTimer = useRef<any>(null);
@@ -480,7 +482,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
           resizeMode={resizeMode}
           onDuration={d => setLiveDur(d)}
           onProgress={(t, d) => {
-            if (!dragging) setLivePos(t);
+            if (!draggingRef.current) setLivePos(t);
             if (d > 0 && Math.abs(d - liveDur) > 0.25) setLiveDur(d);
           }}
           onEnded={() => {
@@ -659,15 +661,22 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
                   min={0}
                   max={1}
                   onStart={() => {
+                    draggingRef.current = true;
                     setDragging(true);
                     clearHideTimer();
                   }}
                   onChange={v => {
                     setLivePos(v * dur);
                   }}
-                  onEnd={() => {
-                    setDragging(false);
-                    p.onSeek(Math.floor(livePos));
+                  onEnd={finalVal => {
+                    const target = Math.max(0, Math.min(dur, finalVal * dur));
+                    setLivePos(target);
+                    playerRef.current?.seek(target);
+                    p.onSeek(Math.floor(target));
+                    setTimeout(() => {
+                      draggingRef.current = false;
+                      setDragging(false);
+                    }, 250);
                     showControls();
                   }}
                 />
@@ -779,20 +788,14 @@ function Slider({
   max: number;
   onChange: (v: number) => void;
   onStart?: () => void;
-  onEnd?: () => void;
+  onEnd?: (finalValue: number) => void;
 }) {
   const widthRef = useRef(0);
   const range = max - min || 1;
   const norm = Math.max(0, Math.min(1, (value - min) / range));
-
-  const applyFromX = useCallback(
-    (x: number) => {
-      const w = widthRef.current || 1;
-      const n = Math.max(0, Math.min(1, x / w));
-      onChange(min + n * range);
-    },
-    [min, range, onChange],
-  );
+  const startFrac = useRef(0);
+  const currentFrac = useRef(norm);
+  currentFrac.current = norm;
 
   const responder = useMemo(
     () =>
@@ -801,15 +804,27 @@ function Slider({
         onMoveShouldSetPanResponder: () => true,
         onPanResponderGrant: (e: any) => {
           onStart?.();
-          applyFromX(e.nativeEvent.locationX);
+          const w = widthRef.current || 1;
+          const touchX = Math.max(0, Math.min(w, e.nativeEvent.locationX));
+          const f = w > 0 ? touchX / w : 0;
+          startFrac.current = f;
+          currentFrac.current = f;
+          onChange(min + f * range);
         },
-        onPanResponderMove: (e: any) => {
-          applyFromX(e.nativeEvent.locationX);
+        onPanResponderMove: (_: any, g: any) => {
+          const w = widthRef.current || 1;
+          const f = Math.max(0, Math.min(1, startFrac.current + g.dx / w));
+          currentFrac.current = f;
+          onChange(min + f * range);
         },
-        onPanResponderRelease: () => onEnd?.(),
-        onPanResponderTerminate: () => onEnd?.(),
+        onPanResponderRelease: () => {
+          onEnd?.(currentFrac.current);
+        },
+        onPanResponderTerminate: () => {
+          onEnd?.(currentFrac.current);
+        },
       }),
-    [applyFromX, onStart, onEnd],
+    [min, range, onChange, onStart, onEnd],
   );
 
   return (
@@ -819,9 +834,9 @@ function Slider({
         widthRef.current = e.nativeEvent.layout.width;
       }}
       {...responder.panHandlers}>
-      <View style={styles.sliderRail} />
-      <View style={[styles.sliderFill, { width: `${norm * 100}%` }]} />
-      <View style={[styles.sliderThumb, { left: `${norm * 100}%` }]} />
+      <View style={styles.sliderRail} pointerEvents="none" />
+      <View style={[styles.sliderFill, { width: `${norm * 100}%` }]} pointerEvents="none" />
+      <View style={[styles.sliderThumb, { left: `${norm * 100}%` }]} pointerEvents="none" />
     </View>
   );
 }
