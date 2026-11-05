@@ -670,6 +670,13 @@ function MainApp(): React.JSX.Element {
   // Immersive fullscreen player (replaces the old no-op fullscreen pill).
   const [showFullscreen, setShowFullscreen] = useState<boolean>(false);
 
+  // Lock the entire app strictly to Portrait whenever fullscreen video is NOT active
+  useEffect(() => {
+    if (!showFullscreen) {
+      NativeNetwork.setScreenOrientation('portrait').catch(() => {});
+    }
+  }, [showFullscreen]);
+
   // Join Room State (Listener)
   const [inputRoomCode, setInputRoomCode] = useState<string>('');
   const [inputHostIp, setInputHostIp] = useState<string>('');

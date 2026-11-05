@@ -230,11 +230,11 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
     showControls();
   }, [isLandscape, showQuickBadge, showControls]);
 
-  // Close player, restore system bars and sensor orientation
+  // Close player, restore system bars and enforce portrait orientation
   const handleClose = useCallback(async () => {
     try {
       await NativeNetwork.setImmersiveFullscreen(false);
-      await NativeNetwork.setScreenOrientation('unspecified');
+      await NativeNetwork.setScreenOrientation('portrait');
     } catch {}
     p.onClose();
   }, [p]);
@@ -248,13 +248,13 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
     }).start();
   }, [chromeVisible, fade]);
 
-  // Enable Android Immersive Fullscreen and Phone Sensor Auto-Orientation on open
+  // Enable Android Immersive Fullscreen and start strictly in Portrait mode (like VLC)
   useEffect(() => {
     if (p.visible) {
       NativeNetwork.setImmersiveFullscreen(true).catch(() => {});
-      // Auto-orient based on phone hardware sensor ("phone gurale roted hobe")
-      NativeNetwork.setScreenOrientation('auto').catch(() => {});
-      setOrientationMode('auto');
+      // Open video strictly in portrait mode — no accidental rotation
+      NativeNetwork.setScreenOrientation('portrait').catch(() => {});
+      setOrientationMode('portrait');
       setChromeVisible(true);
       setPanel('none');
       setLivePos(0);
@@ -270,15 +270,15 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
       }
     } else {
       NativeNetwork.setImmersiveFullscreen(false).catch(() => {});
-      NativeNetwork.setScreenOrientation('unspecified').catch(() => {});
+      NativeNetwork.setScreenOrientation('portrait').catch(() => {});
     }
   }, [p.visible, p.uri]);
 
-  // Cleanup on unmount
+  // Cleanup on unmount — always lock back to portrait
   useEffect(() => {
     return () => {
       NativeNetwork.setImmersiveFullscreen(false).catch(() => {});
-      NativeNetwork.setScreenOrientation('unspecified').catch(() => {});
+      NativeNetwork.setScreenOrientation('portrait').catch(() => {});
     };
   }, []);
 
