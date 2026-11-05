@@ -1,3 +1,9 @@
 {
-  "name": "SyncBuddy"
+  "name": "SyncBuddy",
+  "extra": {
+    "eas": {
+      "projectId": "b705caab-bcce-4c94-b4f1-e844cf2f67f4"
+    }
+  },
+  "owner": "razin_ibn_asad"
 }
