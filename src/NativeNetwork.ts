@@ -641,6 +641,48 @@ export const NativeNetwork = {
   },
 
   /**
+   * Programmatically adjust screen brightness (0.01 to 1.0)
+   */
+  async setScreenBrightness(brightness: number): Promise<boolean> {
+    if (Platform.OS === 'android' && SyncNetworkModule?.setScreenBrightness) {
+      try {
+        return await SyncNetworkModule.setScreenBrightness(brightness);
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  },
+
+  /**
+   * Programmatically adjust music stream volume (0.0 to 1.0)
+   */
+  async setDeviceVolume(volume: number): Promise<boolean> {
+    if (Platform.OS === 'android' && SyncNetworkModule?.setDeviceVolume) {
+      try {
+        return await SyncNetworkModule.setDeviceVolume(volume);
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  },
+
+  /**
+   * Enable/disable true immersive sticky fullscreen (hiding system status & navigation bars)
+   */
+  async setImmersiveFullscreen(enable: boolean): Promise<boolean> {
+    if (Platform.OS === 'android' && SyncNetworkModule?.setImmersiveFullscreen) {
+      try {
+        return await SyncNetworkModule.setImmersiveFullscreen(enable);
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  },
+
+  /**
    * Play an offline audio file and stream its decoded PCM frames to all listeners
    */
   async playAudioFile(uri: string): Promise<boolean> {

@@ -24,6 +24,10 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.Settings
+import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -1896,6 +1900,109 @@ class SyncNetworkModule(
             }
         } catch (e: Exception) {
             promise.reject("ERR_ORIENTATION_INIT", e.message)
+        }
+    }
+
+    /**
+     * Programmatically adjust screen brightness (0.01 to 1.0).
+     */
+    @ReactMethod
+    fun setScreenBrightness(brightness: Double, promise: Promise) {
+        try {
+            val activity = currentActivity
+            if (activity != null) {
+                activity.runOnUiThread {
+                    try {
+                        val lp = activity.window.attributes
+                        lp.screenBrightness = brightness.toFloat().coerceIn(0.01f, 1.0f)
+                        activity.window.attributes = lp
+                        promise.resolve(true)
+                    } catch (e: Exception) {
+                        promise.reject("ERR_BRIGHTNESS", e.message)
+                    }
+                }
+            } else {
+                promise.reject("ERR_NO_ACTIVITY", "Current activity is null")
+            }
+        } catch (e: Exception) {
+            promise.reject("ERR_BRIGHTNESS_INIT", e.message)
+        }
+    }
+
+    /**
+     * Programmatically adjust music stream volume (0.0 to 1.0).
+     */
+    @ReactMethod
+    fun setDeviceVolume(volume: Double, promise: Promise) {
+        try {
+            val context = reactApplicationContext
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val vFloat = volume.toFloat().coerceIn(0f, 1f)
+            if (am != null) {
+                val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                val target = (vFloat * max).toInt()
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+            }
+            com.syncbuddy.media.Media3Manager.getPlayer(context).volume = vFloat
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERR_VOLUME", e.message)
+        }
+    }
+
+    /**
+     * Enable or disable true immersive sticky fullscreen (hiding status bar and navigation pill).
+     */
+    @ReactMethod
+    fun setImmersiveFullscreen(enable: Boolean, promise: Promise) {
+        try {
+            val activity = currentActivity
+            if (activity != null) {
+                activity.runOnUiThread {
+                    try {
+                        val window = activity.window
+                        if (enable) {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                window.setDecorFitsSystemWindows(false)
+                                window.insetsController?.let { controller ->
+                                    controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                                    controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                                }
+                            } else {
+                                @Suppress("DEPRECATION")
+                                window.decorView.systemUiVisibility = (
+                                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                                    or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                    or View.SYSTEM_UI_FLAG_FULLSCREEN
+                                )
+                            }
+                        } else {
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            val lp = window.attributes
+                            lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                            window.attributes = lp
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                window.setDecorFitsSystemWindows(true)
+                                window.insetsController?.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                            } else {
+                                @Suppress("DEPRECATION")
+                                window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+                            }
+                        }
+                        promise.resolve(true)
+                    } catch (e: Exception) {
+                        promise.reject("ERR_IMMERSIVE", e.message)
+                    }
+                }
+            } else {
+                promise.reject("ERR_NO_ACTIVITY", "Current activity is null")
+            }
+        } catch (e: Exception) {
+            promise.reject("ERR_IMMERSIVE_INIT", e.message)
         }
     }
 
