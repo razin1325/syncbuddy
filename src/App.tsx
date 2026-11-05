@@ -3053,14 +3053,7 @@ function MainApp(): React.JSX.Element {
         }}
       />
 
-      <Modal
-        visible={showFullscreen && !!currentMedia && currentMedia.type === 'video'}
-        transparent={false}
-        statusBarTranslucent={true}
-        animationType="fade"
-        presentationStyle="fullScreen"
-        supportedOrientations={['portrait', 'portrait-upside-down', 'landscape', 'landscape-left', 'landscape-right']}
-        onRequestClose={() => setShowFullscreen(false)}>
+      {showFullscreen && !!currentMedia && currentMedia.type === 'video' && (
         <FullscreenPlayer
           visible={showFullscreen && !!currentMedia && currentMedia.type === 'video'}
           title={currentMedia?.title || ''}
@@ -3085,7 +3078,7 @@ function MainApp(): React.JSX.Element {
           hasNext={sortedMedia.length > 1}
           hasPrev={sortedMedia.length > 1}
         />
-      </Modal>
+      )}
     </SafeAreaView>
   );
 }

@@ -1940,10 +1940,10 @@ class SyncNetworkModule(
             val vFloat = volume.toFloat().coerceIn(0f, 1f)
             if (am != null) {
                 val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                val target = (vFloat * max).toInt()
+                val target = Math.round(vFloat * max).toInt().coerceIn(0, max)
                 am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
             }
-            com.syncbuddy.media.Media3Manager.getPlayer(context).volume = vFloat
+            com.syncbuddy.media.Media3Manager.setVolume(vFloat)
             promise.resolve(true)
         } catch (e: Exception) {
             promise.reject("ERR_VOLUME", e.message)

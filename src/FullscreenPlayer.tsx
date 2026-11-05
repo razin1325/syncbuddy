@@ -2,25 +2,13 @@
  * FullscreenPlayer — True VLC / MX Player Style Edge-to-Edge Experience
  *
  * Professional Media Player Capabilities:
- *   • True 100% Immersive Fullscreen (Hides system status bar & navigation pill via IMMERSIVE_STICKY)
- *   • Auto-Rotate Support (Phone sensor dynamically flips between Portrait and Landscape)
- *   • Portrait Layout matches VLC Mobile:
- *       - Clean pure black canvas (#000000)
- *       - Centered video in natural aspect ratio (RESIZE_MODE_FIT)
- *       - Top centered title
- *       - Bottom scrubber with elapsed (0:06) & remaining (- 2:27:25) time
- *       - Bottom icon row: [🔲 Aspect] [📱🔄 Auto-Rotate] ( ⏸ / ▶ ) [⛶ Fullscreen] [••• More]
- *   • VLC-style Gestures:
- *       - Swipe UP/DOWN on RIGHT half: Controls Screen Brightness (0% to 100%) with real-time HUD
- *       - Swipe UP/DOWN on LEFT half: Controls Media Volume (0% to 100%) with real-time HUD
- *       - Swipe LEFT/RIGHT anywhere: Fast-seeks through video with time preview HUD
- *   • Single Tap on screen: Toggles controls overlay (Tap -> Show, Tap again -> Hide)
- *   • Double Tap Left/Right: Fast ±10s seeking with visual indicator
- *   • Auto-hide controls after 3.5s of inactivity while playing
- *   • Aspect Ratio Modes:
- *       - 🔲 Fit: Original video aspect ratio (no cropping, centered)
- *       - 🔳 Zoom (Fill Screen): Fills 100% of display without letterbox black bars
- *       - ↔️ Stretch: 100% stretch
+ *   • True 100% Immersive Fullscreen (Zero margins, hides status bar & navigation pill)
+ *   • Real-time Hardware + Software Brightness swipe on RIGHT half of screen (with visual black-tint overlay)
+ *   • Real-time Volume swipe on LEFT half of screen
+ *   • Completely clean video area: NO annoying popup text or giant seek boxes blocking the subtitles / video
+ *   • Smooth touch & drag scrubber (never resets to 0:00)
+ *   • Landscape auto-fills widescreen (resizeMode="zoom"), portrait centers in natural aspect ratio (resizeMode="fit")
+ *   • Tap anywhere on screen to smoothly show/hide controls (auto-hides after 3.5s of playback)
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -93,24 +81,26 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   const playerRef = useRef<VideoPlayerHandle | null>(null);
   const [chromeVisible, setChromeVisible] = useState(true);
 
-  // Resize mode: In portrait, default to 'fit' (original centered ratio); in landscape, 'zoom' (fill screen)
-  const [resizeMode, setResizeMode] = useState<'fit' | 'zoom' | 'fill'>('fit');
+  // Resize mode: In landscape default to 'zoom' (fill 100% of widescreen without black bars), in portrait 'fit'
+  const [resizeMode, setResizeMode] = useState<'fit' | 'zoom' | 'fill'>(
+    isLandscape ? 'zoom' : 'fit',
+  );
+
+  useEffect(() => {
+    setResizeMode(isLandscape ? 'zoom' : 'fit');
+  }, [isLandscape]);
+
   const [panel, setPanel] = useState<'none' | 'sound'>('none');
   const [eqPreset, setEqPreset] = useState('flat');
   const [showRemainingTime, setShowRemainingTime] = useState(true);
 
-  // Orientation mode: 'auto' (phone sensor), 'landscape', 'portrait'
-  const [orientationMode, setOrientationMode] = useState<'auto' | 'landscape' | 'portrait'>('auto');
+  // Orientation mode: 'portrait' | 'landscape' | 'auto'
+  const [orientationMode, setOrientationMode] = useState<'portrait' | 'landscape' | 'auto'>('portrait');
 
-  // VLC Gesture state
+  // VLC Gesture state: Volume & Brightness (0.0 to 1.0)
   const [volume, setVolume] = useState(0.85);
   const [brightness, setBrightness] = useState(0.85);
-  const [activeHud, setActiveHud] = useState<'none' | 'volume' | 'brightness' | 'seek'>('none');
-  const [seekPreviewSec, setSeekPreviewSec] = useState<number>(0);
-  const [seekDeltaSec, setSeekDeltaSec] = useState<number>(0);
-
-  // Quick feedback badge (e.g. "+10s" / "📱🔄 Auto-Rotate ON")
-  const [quickBadge, setQuickBadge] = useState<{ text: string; side: 'left' | 'right' | 'center' } | null>(null);
+  const [activeHud, setActiveHud] = useState<'none' | 'volume' | 'brightness'>('none');
 
   const [livePos, setLivePos] = useState(0);
   const [liveDur, setLiveDur] = useState(0);
@@ -120,10 +110,9 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
 
   const hideTimer = useRef<any>(null);
   const hudTimer = useRef<any>(null);
-  const badgeTimer = useRef<any>(null);
   const fade = useRef(new Animated.Value(1)).current;
 
-  // Refs for gesture gestureState tracking
+  // Refs for gesture tracking
   const volumeRef = useRef(volume);
   volumeRef.current = volume;
   const brightnessRef = useRef(brightness);
@@ -188,16 +177,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
     }
   }, [chromeVisible, panel, hideControls, showControls]);
 
-  // Visual badge popup
-  const showQuickBadge = useCallback((text: string, side: 'left' | 'right' | 'center') => {
-    if (badgeTimer.current) clearTimeout(badgeTimer.current);
-    setQuickBadge({ text, side });
-    badgeTimer.current = setTimeout(() => {
-      setQuickBadge(null);
-    }, 1100);
-  }, []);
-
-  // Relative seek (±10s)
+  // Relative seek (±10s) — fast and clean without huge screen-blocking popups
   const seekRelative = useCallback((delta: number) => {
     const target = Math.max(0, Math.min(dur || 1e9, pos + delta));
     setLivePos(target);
@@ -209,30 +189,24 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   // Toggle Auto-Rotate vs Manual Lock
   const toggleAutoRotate = useCallback(async () => {
     if (orientationMode === 'auto') {
-      // Lock to current orientation
-      const current = isLandscape ? 'landscape' : 'portrait';
-      setOrientationMode(current);
-      await NativeNetwork.setScreenOrientation(current);
-      showQuickBadge(isLandscape ? '🔒 Landscape Locked' : '🔒 Portrait Locked', 'center');
+      setOrientationMode('portrait');
+      await NativeNetwork.setScreenOrientation('portrait');
     } else {
-      // Re-enable phone sensor auto-rotation
       setOrientationMode('auto');
-      await NativeNetwork.setScreenOrientation('auto');
-      showQuickBadge('📱🔄 Auto-Rotate ON (Phone Sensor)', 'center');
+      await NativeNetwork.setScreenOrientation('sensor');
     }
     showControls();
-  }, [orientationMode, isLandscape, showQuickBadge, showControls]);
+  }, [orientationMode, showControls]);
 
   // Force flip between Landscape and Portrait
   const toggleFlipOrientation = useCallback(async () => {
     const next = isLandscape ? 'portrait' : 'landscape';
     setOrientationMode(next);
     await NativeNetwork.setScreenOrientation(next);
-    showQuickBadge(next === 'landscape' ? '🔄 Landscape Mode' : '📱 Portrait Mode', 'center');
     showControls();
-  }, [isLandscape, showQuickBadge, showControls]);
+  }, [isLandscape, showControls]);
 
-  // Close player, restore system bars and enforce portrait orientation
+  // Close player, restore system bars and enforce portrait orientation for the rest of the app
   const handleClose = useCallback(async () => {
     try {
       await NativeNetwork.setImmersiveFullscreen(false);
@@ -245,7 +219,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   useEffect(() => {
     Animated.timing(fade, {
       toValue: chromeVisible ? 1 : 0,
-      duration: 200,
+      duration: 180,
       useNativeDriver: Platform.OS !== 'web',
     }).start();
   }, [chromeVisible, fade]);
@@ -254,7 +228,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
   useEffect(() => {
     if (p.visible) {
       NativeNetwork.setImmersiveFullscreen(true).catch(() => {});
-      // Open video strictly in portrait mode — no accidental rotation
+      // Open video strictly in portrait mode initially — never glitch or auto-rotate without intent
       NativeNetwork.setScreenOrientation('portrait').catch(() => {});
       setOrientationMode('portrait');
       setChromeVisible(true);
@@ -299,14 +273,13 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
     return () => clearHideTimer();
   }, [p.visible, p.isPlaying, chromeVisible, panel, scheduleHide, clearHideTimer]);
 
-  // ─── VLC Style PanResponder Gesture Engine ─────────────────────────────────
+  // ─── VLC Style PanResponder: Swipe Left = Volume, Swipe Right = Brightness ──
   const gestureStateRef = useRef<{
-    mode: 'none' | 'volume' | 'brightness' | 'seek';
+    mode: 'none' | 'volume' | 'brightness';
     startX: number;
     startY: number;
     initVol: number;
     initBri: number;
-    initPos: number;
     hasMoved: boolean;
   }>({
     mode: 'none',
@@ -314,7 +287,6 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
     startY: 0,
     initVol: 0.85,
     initBri: 0.85,
-    initPos: 0,
     hasMoved: false,
   });
 
@@ -323,47 +295,42 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
       PanResponder.create({
         onStartShouldSetPanResponder: () => true,
         onMoveShouldSetPanResponder: (_, gesture) => {
-          return Math.abs(gesture.dx) > 10 || Math.abs(gesture.dy) > 10;
+          return Math.abs(gesture.dy) > 10;
         },
         onPanResponderGrant: (evt) => {
-          const { locationX, locationY } = evt.nativeEvent;
+          // Use pageX & pageY for true physical screen coordinates
+          const pageX = evt.nativeEvent.pageX ?? evt.nativeEvent.locationX;
+          const pageY = evt.nativeEvent.pageY ?? evt.nativeEvent.locationY;
           gestureStateRef.current = {
             mode: 'none',
-            startX: locationX,
-            startY: locationY,
+            startX: pageX,
+            startY: pageY,
             initVol: volumeRef.current,
             initBri: brightnessRef.current,
-            initPos: posRef.current,
             hasMoved: false,
           };
           if (hudTimer.current) clearTimeout(hudTimer.current);
         },
         onPanResponderMove: (_, gesture) => {
           const gs = gestureStateRef.current;
-          const { dx, dy } = gesture;
-          const distance = Math.sqrt(dx * dx + dy * dy);
+          const { dy } = gesture;
 
-          if (distance > 12) {
+          if (Math.abs(dy) > 10) {
             gs.hasMoved = true;
           }
 
-          // Determine gesture type once threshold is crossed
-          if (gs.mode === 'none' && distance > 14) {
-            if (Math.abs(dy) > Math.abs(dx)) {
-              // Vertical swipe
-              if (gs.startX < winWidth * 0.5) {
-                gs.mode = 'volume'; // LEFT SIDE -> VOLUME
-              } else {
-                gs.mode = 'brightness'; // RIGHT SIDE -> BRIGHTNESS
-              }
-            } else if (Math.abs(dx) > 20) {
-              gs.mode = 'seek'; // HORIZONTAL SWIPE -> SEEK
+          // Determine gesture type once threshold is crossed: Left half = Volume, Right half = Brightness
+          if (gs.mode === 'none' && Math.abs(dy) > 12) {
+            if (gs.startX < winWidth * 0.5) {
+              gs.mode = 'volume'; // LEFT HALF -> VOLUME
+            } else {
+              gs.mode = 'brightness'; // RIGHT HALF -> BRIGHTNESS
             }
           }
 
           // Handle Volume Gesture (Left half vertical swipe)
           if (gs.mode === 'volume') {
-            const delta = -dy / (winHeight * 0.65);
+            const delta = -dy / (winHeight * 0.55);
             const nextVol = Math.max(0, Math.min(1.0, gs.initVol + delta));
             setVolume(nextVol);
             NativeNetwork.setDeviceVolume(nextVol).catch(() => {});
@@ -372,44 +339,25 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
 
           // Handle Brightness Gesture (Right half vertical swipe)
           else if (gs.mode === 'brightness') {
-            const delta = -dy / (winHeight * 0.65);
-            const nextBri = Math.max(0.02, Math.min(1.0, gs.initBri + delta));
+            const delta = -dy / (winHeight * 0.55);
+            const nextBri = Math.max(0.05, Math.min(1.0, gs.initBri + delta));
             setBrightness(nextBri);
             NativeNetwork.setScreenBrightness(nextBri).catch(() => {});
             setActiveHud('brightness');
-          }
-
-          // Handle Horizontal Seek Gesture
-          else if (gs.mode === 'seek') {
-            const totalDuration = durRef.current || 1e9;
-            const deltaSec = (dx / (winWidth * 0.8)) * 90; // swipe across screen moves 90s
-            const target = Math.max(0, Math.min(totalDuration, gs.initPos + deltaSec));
-            setSeekPreviewSec(target);
-            setSeekDeltaSec(deltaSec);
-            setActiveHud('seek');
           }
         },
         onPanResponderRelease: (evt) => {
           const gs = gestureStateRef.current;
 
-          // If it was a swipe seek: commit the seek position now
-          if (gs.mode === 'seek') {
-            setLivePos(seekPreviewSec);
-            playerRef.current?.seek(seekPreviewSec);
-            p.onSeek(Math.floor(seekPreviewSec));
-            hudTimer.current = setTimeout(() => setActiveHud('none'), 600);
-            return;
-          }
-
-          // Fade out volume or brightness HUD after 900ms
+          // Fade out volume or brightness HUD after 800ms
           if (gs.mode === 'volume' || gs.mode === 'brightness') {
-            hudTimer.current = setTimeout(() => setActiveHud('none'), 900);
+            hudTimer.current = setTimeout(() => setActiveHud('none'), 800);
             return;
           }
 
           // If no movement -> this is a TAP or DOUBLE TAP
           if (!gs.hasMoved) {
-            const x = evt.nativeEvent.locationX;
+            const x = evt.nativeEvent.pageX ?? evt.nativeEvent.locationX;
             const now = Date.now();
             const timeDelta = now - lastTapRef.current;
             lastTapRef.current = now;
@@ -422,10 +370,8 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
               }
               if (x < winWidth * 0.38) {
                 seekRelative(-10);
-                showQuickBadge('-10s ⏪', 'left');
               } else if (x > winWidth * 0.62) {
                 seekRelative(10);
-                showQuickBadge('⏩ +10s', 'right');
               } else {
                 p.onTogglePlay();
                 showControls();
@@ -439,22 +385,21 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
           }
         },
       }),
-    [winWidth, winHeight, seekPreviewSec, p, seekRelative, showQuickBadge, showControls, toggleControls],
+    [winWidth, winHeight, p, seekRelative, showControls, toggleControls],
   );
 
   // Cycle aspect ratio
   const cycleResizeMode = () => {
     setResizeMode(curr => {
-      const next = curr === 'fit' ? 'zoom' : curr === 'zoom' ? 'fill' : 'fit';
-      const label = next === 'fit' ? '🔲 Original (Fit)' : next === 'zoom' ? '🔳 Fill Screen' : '↔️ Stretch';
-      showQuickBadge(label, 'center');
-      return next;
+      if (curr === 'zoom') return 'fit';
+      if (curr === 'fit') return 'fill';
+      return 'zoom';
     });
     showControls();
   };
 
   const resizeModeLabel =
-    resizeMode === 'zoom' ? '🔳 Fill' : resizeMode === 'fit' ? '🔲 Fit' : '↔️ Stretch';
+    resizeMode === 'zoom' ? '🔳 Fill Screen' : resizeMode === 'fit' ? '🔲 Original (Fit)' : '↔️ Stretch';
 
   if (!p.visible) return null;
 
@@ -492,28 +437,24 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
         />
       </View>
 
-      {/* ── 2. Full-surface VLC Gesture Capture Layer ───────────────────────── */}
+      {/* ── 2. Real-time Software Brightness Tint Overlay (Guarantees visual dimming) ── */}
+      <View
+        pointerEvents="none"
+        style={[
+          StyleSheet.absoluteFill,
+          {
+            backgroundColor: '#000000',
+            opacity: Math.max(0, Math.min(0.80, (1 - brightness) * 0.75)),
+            zIndex: 4,
+          },
+        ]}
+      />
+
+      {/* ── 3. Full-surface VLC Gesture Capture Layer ───────────────────────── */}
       <View style={StyleSheet.absoluteFill} {...panResponder.panHandlers}>
-        {/* Quick feedback badge (e.g. "+10s" / "📱🔄 Auto-Rotate ON") */}
-        {quickBadge && (
-          <View
-            style={[
-              styles.quickBadgeBox,
-              quickBadge.side === 'left'
-                ? styles.quickBadgeLeft
-                : quickBadge.side === 'right'
-                ? styles.quickBadgeRight
-                : styles.quickBadgeCenter,
-            ]}>
-            <Text style={styles.quickBadgeText}>{quickBadge.text}</Text>
-          </View>
-        )}
-
-        {/* ── 3. VLC-style Visual HUDs ───────────────────────────────────────── */}
-
-        {/* Left Side: Volume HUD */}
+        {/* Left Side: Volume HUD on the edge */}
         {activeHud === 'volume' && (
-          <View style={styles.leftVolumeHud}>
+          <View style={styles.leftVolumeHud} pointerEvents="none">
             <Text style={styles.hudIcon}>{volume === 0 ? '🔇' : volume < 0.5 ? '🔉' : '🔊'}</Text>
             <View style={styles.hudVerticalTrack}>
               <View style={[styles.hudVerticalFill, { height: `${Math.round(volume * 100)}%` }]} />
@@ -522,9 +463,9 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
           </View>
         )}
 
-        {/* Right Side: Brightness HUD */}
+        {/* Right Side: Brightness HUD on the edge */}
         {activeHud === 'brightness' && (
-          <View style={styles.rightBrightnessHud}>
+          <View style={styles.rightBrightnessHud} pointerEvents="none">
             <Text style={styles.hudIcon}>☀️</Text>
             <View style={styles.hudVerticalTrack}>
               <View
@@ -537,24 +478,12 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
             <Text style={[styles.hudValueText, { color: C.amber }]}>{Math.round(brightness * 100)}%</Text>
           </View>
         )}
-
-        {/* Center: Horizontal Seek Preview HUD */}
-        {activeHud === 'seek' && (
-          <View style={styles.centerSeekHud}>
-            <Text style={styles.seekHudDelta}>
-              {seekDeltaSec >= 0 ? `+${Math.round(seekDeltaSec)}s ⏩` : `${Math.round(seekDeltaSec)}s ⏪`}
-            </Text>
-            <Text style={styles.seekHudTime}>
-              {fmt(seekPreviewSec)} <Text style={{ color: C.textMute }}>/ {fmt(dur)}</Text>
-            </Text>
-          </View>
-        )}
       </View>
 
       {/* ── 4. Floating Overlay Controls (VLC / MX Player Style) ─────────────── */}
       {chromeVisible && (
         <Animated.View
-          style={[StyleSheet.absoluteFill, { opacity: fade }]}
+          style={[StyleSheet.absoluteFill, { opacity: fade, zIndex: 20 }]}
           pointerEvents="box-none">
 
           {/* ── Top Bar: Back Button & Centered Title (matches screenshot) ── */}
@@ -584,7 +513,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
               ) : null}
             </View>
 
-            {/* Quick Auto-Rotate status badge indicator in top right */}
+            {/* Quick Auto-Rotate toggle indicator in top right */}
             <TouchableOpacity
               style={[
                 styles.topBadgeBtn,
@@ -604,9 +533,9 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
               style={[
                 styles.soundDrawer,
                 {
-                  left: isLandscape ? '20%' : 16,
-                  right: isLandscape ? '20%' : 16,
-                  bottom: isLandscape ? 90 : 120,
+                  left: isLandscape ? '25%' : 16,
+                  right: isLandscape ? '25%' : 16,
+                  bottom: isLandscape ? 85 : 120,
                 },
               ]}>
               <View style={styles.drawerHeader}>
@@ -774,6 +703,7 @@ export default function FullscreenPlayer(p: FullscreenPlayerProps) {
 /**
  * High-performance, cross-platform touch scrubber built with PanResponder.
  * Features an orange circular knob matching VLC player in user screenshot.
+ * Protected against jump-to-0 bugs via pointerEvents="none" and delta dragging.
  */
 function Slider({
   value,
@@ -843,9 +773,15 @@ function Slider({
 
 const styles = StyleSheet.create({
   root: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
     backgroundColor: '#000000',
     overflow: 'hidden',
+    zIndex: 99999,
+    elevation: 99999,
   },
 
   // ── Top Bar (Clean, centered title matching VLC) ───────────────────────────
@@ -910,15 +846,15 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
 
-  // ── VLC Gesture Visual HUDs ────────────────────────────────────────────────
+  // ── VLC Edge HUDs (Left = Volume, Right = Brightness) ─────────────────────
   leftVolumeHud: {
     position: 'absolute',
-    left: 28,
-    top: '28%',
-    bottom: '28%',
-    width: 50,
+    left: 20,
+    top: '30%',
+    bottom: '30%',
+    width: 44,
     backgroundColor: 'rgba(0, 0, 0, 0.82)',
-    borderRadius: 25,
+    borderRadius: 22,
     borderWidth: 1.5,
     borderColor: C.accent,
     alignItems: 'center',
@@ -927,12 +863,12 @@ const styles = StyleSheet.create({
   },
   rightBrightnessHud: {
     position: 'absolute',
-    right: 28,
-    top: '28%',
-    bottom: '28%',
-    width: 50,
+    right: 20,
+    top: '30%',
+    bottom: '30%',
+    width: 44,
     backgroundColor: 'rgba(0, 0, 0, 0.82)',
-    borderRadius: 25,
+    borderRadius: 22,
     borderWidth: 1.5,
     borderColor: C.amber,
     alignItems: 'center',
@@ -940,85 +876,27 @@ const styles = StyleSheet.create({
     zIndex: 35,
   },
   hudIcon: {
-    fontSize: 20,
+    fontSize: 18,
     marginBottom: 8,
   },
   hudVerticalTrack: {
     flex: 1,
-    width: 8,
+    width: 6,
     backgroundColor: 'rgba(255, 255, 255, 0.20)',
-    borderRadius: 4,
+    borderRadius: 3,
     justifyContent: 'flex-end',
     overflow: 'hidden',
   },
   hudVerticalFill: {
     width: '100%',
     backgroundColor: C.accent,
-    borderRadius: 4,
+    borderRadius: 3,
   },
   hudValueText: {
     color: C.accent,
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '800',
     marginTop: 8,
-  },
-
-  // Center Seek HUD
-  centerSeekHud: {
-    position: 'absolute',
-    top: '40%',
-    left: '25%',
-    right: '25%',
-    backgroundColor: 'rgba(0, 0, 0, 0.88)',
-    paddingVertical: 16,
-    borderRadius: 20,
-    borderWidth: 1.5,
-    borderColor: C.accent,
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 35,
-  },
-  seekHudDelta: {
-    color: C.accent,
-    fontSize: 20,
-    fontWeight: '800',
-    marginBottom: 4,
-  },
-  seekHudTime: {
-    color: '#FFFFFF',
-    fontSize: 15,
-    fontWeight: '700',
-  },
-
-  // Quick Double-tap / Orientation Badge
-  quickBadgeBox: {
-    position: 'absolute',
-    top: '38%',
-    backgroundColor: 'rgba(0, 0, 0, 0.88)',
-    paddingHorizontal: 22,
-    paddingVertical: 14,
-    borderRadius: 24,
-    borderWidth: 1.5,
-    borderColor: C.accent,
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 30,
-  },
-  quickBadgeLeft: {
-    left: '12%',
-  },
-  quickBadgeRight: {
-    right: '12%',
-  },
-  quickBadgeCenter: {
-    left: '20%',
-    right: '20%',
-  },
-  quickBadgeText: {
-    color: '#FFFFFF',
-    fontSize: 15,
-    fontWeight: '800',
-    textAlign: 'center',
   },
 
   // ── Bottom Section (VLC Style) ─────────────────────────────────────────────
